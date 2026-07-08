@@ -3,6 +3,7 @@ package guard
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -64,10 +65,13 @@ var safeSubcommands = map[string]map[string]bool{
 	"auth":    {"can-i": true, "whoami": true},
 }
 
-// knownShortFlags are kubectl flags that take a value.
-var knownShortFlags = map[string]bool{
-	"-n": true, "-l": true, "-f": true, "-o": true, "-c": true,
-	"-s": true, "-p": true, "-k": true, "-R": true,
+// shortTakesValue lists single-letter kubectl flags that consume a value
+// (the rest of the token, or the next argument). f and k are manifest sources
+// handled specially by parseShortCluster. Every other short flag is treated as
+// boolean. This replaces the old exact-match knownShortFlags set, which could
+// not recognize clustered flags like "-Rf" or "-nf" (the G1 gap).
+var shortTakesValue = map[byte]bool{
+	'n': true, 'l': true, 'o': true, 'c': true, 's': true, 'p': true,
 }
 
 // knownLongFlags are kubectl long flags that take a separate value
@@ -146,6 +150,53 @@ func splitLong(arg string) (name, val string, hasInline bool) {
 	return arg, "", false
 }
 
+// addSource records a manifest source: 'f' -> filename, 'k' -> kustomize dir.
+func (p *ParsedArgs) addSource(c byte, val string) {
+	if c == 'f' {
+		p.Filenames = append(p.Filenames, val)
+	} else {
+		p.Kustomize = val
+	}
+}
+
+// parseShortCluster walks a bundled short-flag token (e.g. "-Rf", "-nf",
+// "-fn") the way pflag does, recording any -f/-k source it finds and reporting
+// whether the next argument is consumed as a value. This closes the G1 gap
+// where a clustered source flag (e.g. "apply -Rf dir") was neither recognized
+// nor scanned.
+//
+// Walk semantics: a value-taking flag consumes the rest of the token (or the
+// next argument); a boolean flag (e.g. -R) is skipped and the walk continues.
+// f and k are sources whose value becomes a filename/kustomize target.
+func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext bool) {
+	shorthands := arg[1:] // strip leading "-"
+	for len(shorthands) > 0 {
+		c := shorthands[0]
+		switch {
+		case c == 'f' || c == 'k':
+			if len(shorthands) > 1 {
+				p.addSource(c, strings.TrimPrefix(shorthands[1:], "="))
+				return false
+			}
+			if len(rest) > 0 {
+				p.addSource(c, rest[0])
+				return true
+			}
+			return false
+		case shortTakesValue[c]:
+			// consumes the rest of the token, or the next argument.
+			if len(shorthands) > 1 {
+				return false
+			}
+			return len(rest) > 0
+		default:
+			// boolean short flag (e.g. -R); keep walking.
+			shorthands = shorthands[1:]
+		}
+	}
+	return false
+}
+
 // ParseArgs performs one pass over a kubectl argument list, honoring the "--"
 // separator consistently for every consumer. It stops interpreting flags at
 // "--", so a trailing "--context=dev" can no longer trick context resolution
@@ -202,21 +253,9 @@ func ParseArgs(args []string) ParsedArgs {
 				}
 			}
 		case strings.HasPrefix(arg, "-") && len(arg) > 1:
-			switch arg {
-			case "-f":
-				if i+1 < len(args) {
-					p.Filenames = append(p.Filenames, args[i+1])
-					skipNext = true
-				}
-			case "-k":
-				if i+1 < len(args) {
-					p.Kustomize = args[i+1]
-					skipNext = true
-				}
-			default:
-				if knownShortFlags[arg] {
-					skipNext = true
-				}
+			// Single-dash short flags, possibly clustered (e.g. "-Rf", "-nf").
+			if p.parseShortCluster(arg, args[i+1:]) {
+				skipNext = true
 			}
 		default:
 			p.Positional = append(p.Positional, arg)
@@ -314,8 +353,8 @@ func HasUninspectableSource(args []string) bool {
 }
 
 // MatchesProtectedResource reports whether args target a protected resource,
-// either via an explicit resource token, an inspectable -f file whose kind is
-// protected, or an un-inspectable source (-f -, URL, -k) when resource
+// either via an explicit resource token, an inspectable -f file/dir whose kind
+// is protected, or an un-inspectable source (-f -, URL, -k) when resource
 // protection is active (we cannot prove it is safe, so we block).
 func MatchesProtectedResource(cfg ProtectedResourceChecker, args []string) bool {
 	if cfg == nil || !cfg.HasProtectedResources() {
@@ -323,12 +362,26 @@ func MatchesProtectedResource(cfg ProtectedResourceChecker, args []string) bool 
 	}
 	p := ParseArgs(args)
 	for _, cand := range p.ResourceCandidates() {
-		if cfg.IsResourceProtected(cand) {
-			return true
+		// G5: kubectl accepts comma-separated resource lists like
+		// "secret,configmap"; match each part independently.
+		for _, part := range strings.Split(cand, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// G7: "all" / "*" span every resource type, including protected
+			// ones, so they are blocked when any resource is protected.
+			lc := strings.ToLower(part)
+			if lc == "all" || lc == "*" {
+				return true
+			}
+			if cfg.IsResourceProtected(part) {
+				return true
+			}
 		}
 	}
 	for _, f := range p.InspectableFilenames() {
-		if fileContainsProtectedKind(f, cfg) {
+		if pathContainsProtectedKind(f, cfg) {
 			return true
 		}
 	}
@@ -340,19 +393,41 @@ func MatchesProtectedResource(cfg ProtectedResourceChecker, args []string) bool 
 	return false
 }
 
-// fileContainsProtectedKind reports whether the given file is a regular
-// YAML/JSON manifest (possibly multi-document) whose kind is protected.
+// pathContainsProtectedKind reports whether the given path (a regular file or
+// a directory, the latter covering "-f dir" / "-Rf dir") contains a manifest
+// whose kind is protected. Directories are walked recursively so that a secret
+// nested in an applied directory is caught.
 //
 // NOTE: there is an inherent TOCTOU window between this scan and kubectl's own
 // read (kubectl re-opens the file after we exec it). The threat model is
 // accidental commands, not a determined adversary who swaps a symlink between
 // the two reads; a full fix would require buffering and re-injecting the file
 // contents, which is out of scope.
-func fileContainsProtectedKind(path string, cfg ProtectedResourceChecker) bool {
+func pathContainsProtectedKind(path string, cfg ProtectedResourceChecker) bool {
 	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
+	if err != nil {
 		return false
 	}
+	if info.IsDir() {
+		found := false
+		_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if fileContainsProtectedKind(p, cfg) {
+				found = true
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		return found
+	}
+	return fileContainsProtectedKind(path, cfg)
+}
+
+// fileContainsProtectedKind reports whether a single regular file is a
+// YAML/JSON manifest (possibly multi-document) whose kind is protected.
+func fileContainsProtectedKind(path string, cfg ProtectedResourceChecker) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false

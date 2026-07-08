@@ -219,3 +219,48 @@ func TestCheckResourceProtection(t *testing.T) {
 		}
 	})
 }
+
+// TestCheckResourceProtectionRound2 locks down the second-round fixes at the
+// Check level: G1 (clustered -f), G5 (comma resource lists), G7 (all/*).
+func TestCheckResourceProtectionRound2(t *testing.T) {
+	cleanup := withTempHome(t, &config.Config{
+		ProtectedContexts:  []string{"prod-*"},
+		ProtectedResources: []string{"secret"},
+	})
+	defer cleanup()
+	dev := func(string) (string, error) { return "dev", nil } // unprotected
+
+	t.Run("G5: comma list with secret is blocked", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"get", "secret,configmap"},
+			{"get", "configmap,secret"},
+			{"get", "pods,secret,services"},
+		} {
+			result, _, _, _ := checkWith(args, dev)
+			if result != Blocked {
+				t.Errorf("Check(%v) = %v, want Blocked", args, result)
+			}
+		}
+	})
+
+	t.Run("G7: get all is blocked when a resource is protected", func(t *testing.T) {
+		for _, args := range [][]string{{"get", "all"}, {"get", "*"}, {"delete", "all"}} {
+			result, _, _, _ := checkWith(args, dev)
+			if result != Blocked {
+				t.Errorf("Check(%v) = %v, want Blocked", args, result)
+			}
+		}
+	})
+
+	t.Run("G1: clustered -Rf <dir with secret> is blocked", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "s.yaml"),
+			[]byte("apiVersion: v1\nkind: Secret\nmetadata:\n  name: x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		result, _, _, _ := checkWith([]string{"apply", "-Rf", dir}, dev)
+		if result != Blocked {
+			t.Errorf("result = %v, want Blocked for -Rf <dir with secret>", result)
+		}
+	})
+}

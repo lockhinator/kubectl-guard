@@ -352,6 +352,47 @@ func TestMatchesProtectedResourceShortNames(t *testing.T) {
 	}
 }
 
+// TestMatchesProtectedResourceComma locks down G5: comma-separated resource
+// lists (e.g. "secret,configmap") must match if any part is protected.
+func TestMatchesProtectedResourceComma(t *testing.T) {
+	checker := fakeChecker{match: map[string]bool{"secret": true}}
+	cases := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"get", "secret,configmap"}, true},
+		{[]string{"get", "configmap,secret"}, true},
+		{[]string{"get", "pods,secret,services"}, true},
+		{[]string{"get", "pod,configmap"}, false},
+		{[]string{"get", "secret,"}, true}, // trailing comma ignored
+	}
+	for _, c := range cases {
+		t.Run(strings.Join(c.args, " "), func(t *testing.T) {
+			if got := MatchesProtectedResource(checker, c.args); got != c.want {
+				t.Errorf("MatchesProtectedResource(%v) = %v, want %v", c.args, got, c.want)
+			}
+		})
+	}
+}
+
+// TestMatchesProtectedResourceAll locks down G7: "all" / "*" span every
+// resource type and are blocked when any resource is protected.
+func TestMatchesProtectedResourceAll(t *testing.T) {
+	protected := fakeChecker{match: map[string]bool{"secret": true}}
+	none := fakeChecker{match: map[string]bool{}}
+	for _, args := range [][]string{{"get", "all"}, {"get", "ALL"}, {"get", "*"}, {"delete", "all"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			if !MatchesProtectedResource(protected, args) {
+				t.Errorf("MatchesProtectedResource(%v) = false, want true (all/* with protected resources)", args)
+			}
+		})
+	}
+	// With no protected resources, "all" must not match.
+	if MatchesProtectedResource(none, []string{"get", "all"}) {
+		t.Error(`MatchesProtectedResource(get all) = true with no protected resources`)
+	}
+}
+
 func TestParseArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -402,6 +443,45 @@ func TestParseArgs(t *testing.T) {
 	}
 }
 
+// TestParseArgsShortCluster locks down G1: clustered short flags carrying a
+// manifest source (-f/-k) must be recognized so the file/dir is scanned. Each
+// case below failed before the cluster-aware parser was added.
+func TestParseArgsShortCluster(t *testing.T) {
+	tests := []struct {
+		name            string
+		args            []string
+		wantFilenames   []string
+		wantKustomize   string
+		wantPositional  []string
+	}{
+		// -Rf dir: -R (boolean) then -f dir -> recursive apply of dir.
+		{"-Rf dir", []string{"apply", "-Rf", "dir"}, []string{"dir"}, "", []string{"apply"}},
+		// -fR is -f with attached value "R" (pflag: rest of token is the value).
+		{"-fR attached", []string{"apply", "-fR"}, []string{"R"}, "", []string{"apply"}},
+		// -nf x: -n takes value "f" (namespace), x is positional; no source.
+		{"-nf consumes namespace", []string{"apply", "-nf", "x"}, nil, "", []string{"apply", "x"}},
+		// -k bundled: -Rk dir.
+		{"-Rk dir", []string{"apply", "-Rk", "dir"}, nil, "dir", []string{"apply"}},
+		// standalone still works.
+		{"-f dir", []string{"apply", "-f", "dir"}, []string{"dir"}, "", []string{"apply"}},
+		{"-k dir", []string{"apply", "-k", "dir"}, nil, "dir", []string{"apply"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseArgs(tt.args)
+			if !equalStrings(got.Filenames, tt.wantFilenames) {
+				t.Errorf("Filenames = %v, want %v", got.Filenames, tt.wantFilenames)
+			}
+			if got.Kustomize != tt.wantKustomize {
+				t.Errorf("Kustomize = %q, want %q", got.Kustomize, tt.wantKustomize)
+			}
+			if !equalStrings(got.Positional, tt.wantPositional) {
+				t.Errorf("Positional = %v, want %v", got.Positional, tt.wantPositional)
+			}
+		})
+	}
+}
+
 func TestMatchesProtectedResourceFile(t *testing.T) {
 	checker := fakeChecker{match: map[string]bool{"secret": true}}
 
@@ -447,6 +527,35 @@ func TestMatchesProtectedResourceFile(t *testing.T) {
 	}
 	if MatchesProtectedResource(checker, []string{"apply", "-f", string(files["deploy.yaml"])}) {
 		t.Error("apply -f deploy.yaml should not match")
+	}
+
+	// G1 (directory aspect): -f dir and -Rf dir must be scanned recursively.
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A secret nested in a subdirectory.
+	if err := os.WriteFile(filepath.Join(sub, "secret.yaml"), secretManifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A clean file at the top level.
+	if err := os.WriteFile(filepath.Join(dir, "deploy.yaml"), deployManifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !MatchesProtectedResource(checker, []string{"apply", "-f", dir}) {
+		t.Error("apply -f <dir with nested secret> should match")
+	}
+	if !MatchesProtectedResource(checker, []string{"apply", "-Rf", dir}) {
+		t.Error("apply -Rf <dir with nested secret> should match")
+	}
+	// A clean directory must not match.
+	clean := t.TempDir()
+	if err := os.WriteFile(filepath.Join(clean, "deploy.yaml"), deployManifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if MatchesProtectedResource(checker, []string{"apply", "-f", clean}) {
+		t.Error("apply -f <clean dir> should not match")
 	}
 }
 

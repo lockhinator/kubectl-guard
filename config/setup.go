@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cameronlockhart/kubectl-guard/ui"
+	"github.com/lockhinator/kubectl-guard/ui"
 )
 
 // RunSetup runs the first-time setup wizard with the given context names.

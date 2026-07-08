@@ -6,7 +6,7 @@ import (
 	"os/user"
 	"time"
 
-	"github.com/cameronlockhart/kubectl-guard/config"
+	"github.com/lockhinator/kubectl-guard/config"
 )
 
 // AuditEntry is a single line in the audit log.

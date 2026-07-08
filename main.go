@@ -5,9 +5,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/cameronlockhart/kubectl-guard/config"
-	"github.com/cameronlockhart/kubectl-guard/guard"
-	"github.com/cameronlockhart/kubectl-guard/ui"
+	"github.com/lockhinator/kubectl-guard/config"
+	"github.com/lockhinator/kubectl-guard/guard"
+	"github.com/lockhinator/kubectl-guard/ui"
 	"github.com/spf13/cobra"
 )
 

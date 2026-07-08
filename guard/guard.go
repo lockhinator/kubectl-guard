@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"syscall"
 
-	"github.com/cameronlockhart/kubectl-guard/config"
+	"github.com/lockhinator/kubectl-guard/config"
 )
 
 // Result represents the outcome of checking a command.

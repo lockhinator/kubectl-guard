@@ -73,6 +73,7 @@ $ kubectl-guard config add-resource secret
 
 # Disable: stop blocking secrets
 $ kubectl-guard config remove-resource secret
+✓ Unblocked resource: secret
 ```
 
 Once enabled, every command targeting that resource is refused with exit 1:

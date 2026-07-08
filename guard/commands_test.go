@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cameronlockhart/kubectl-guard/config"
+	"github.com/lockhinator/kubectl-guard/config"
 )
 
 func TestExtractCommand(t *testing.T) {

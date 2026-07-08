@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cameronlockhart/kubectl-guard/config"
+	"github.com/lockhinator/kubectl-guard/config"
 )
 
 // withTempHome points HOME at a fresh temp dir, saves cfg there, and returns a

@@ -1,19 +1,46 @@
-# GoReleaser: builds cross-platform archives + checksums and attaches them to
-# the GitHub Release that release-please created for the tag.
-# Docs: https://goreleaser.com
+# Release pipeline: release-please maintains a release PR from conventional
+# commits; when that PR is merged it tags a version and creates the GitHub
+# Release, then GoReleaser attaches cross-platform binaries.
+#
+# Why a single workflow with a chained job (rather than a separate
+# on: push: tags workflow for GoReleaser)? Tags pushed by the default
+# GITHUB_TOKEN do NOT trigger downstream `push: tags` workflows (GitHub's
+# anti-recursion rule). Chaining GoReleaser as a dependent job on
+# release-please's `releases_created` output sidesteps that entirely and needs
+# no PAT.
 name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  goreleaser:
+  release-please:
     runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release-please.outputs.releases_created }}
+      tag_name: ${{ steps.release-please.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release-please
+        with:
+          release-type: go
+          # While in 0.x, treat `feat:` as a minor bump (0.1.0 -> 0.2.0)
+          # instead of escalating to 1.0.0.
+          bump-minor-pre-major: true
+
+  # Runs only when release-please actually created a release (i.e. the
+  # release PR was merged), not on every push to main.
+  goreleaser:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4

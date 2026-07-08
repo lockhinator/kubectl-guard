@@ -26,6 +26,7 @@ var guardConfigSubcommands = map[string]bool{
 	"add-resource":    true,
 	"remove-resource": true,
 	"confirm-mode":    true,
+	"audit-mode":     true,
 	"audit":           true,
 	"path":            true,
 }
@@ -63,6 +64,7 @@ func run() error {
 
 func runGuard(args []string) error {
 	result, ctx, cfg, err := guard.Check(args)
+	cmdStr := strings.Join(args, " ")
 	switch result {
 	case guard.Deny:
 		msg := "the guard cannot verify this command is safe"
@@ -71,6 +73,14 @@ func runGuard(args []string) error {
 		}
 		ui.PrintWarning("Refusing to run: " + msg)
 		ui.PrintInfo("Fix the issue above, or run kubectl directly if you understand the risk.")
+		// cfg is non-nil when context resolution failed but config loaded; log it.
+		if cfg != nil {
+			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+				Context: ctx,
+				Command: cmdStr,
+				Outcome: guard.OutcomeDenied,
+			})
+		}
 		os.Exit(1)
 
 	case guard.SetupRequired:
@@ -95,8 +105,8 @@ func runGuard(args []string) error {
 		}
 		_ = guard.AppendAudit(cfg, guard.AuditEntry{
 			Context: ctx,
-			Command: strings.Join(args, " "),
-			Outcome: "blocked",
+			Command: cmdStr,
+			Outcome: guard.OutcomeBlocked,
 			Reason:  "protected-resource",
 		})
 		os.Exit(1)
@@ -115,21 +125,28 @@ func runGuard(args []string) error {
 		if confirmed {
 			_ = guard.AppendAudit(cfg, guard.AuditEntry{
 				Context: ctx,
-				Command: strings.Join(args, " "),
-				Outcome: "confirmed",
+				Command: cmdStr,
+				Outcome: guard.OutcomeConfirmed,
 			})
 			return guard.ExecKubectl(args)
 		}
 
 		_ = guard.AppendAudit(cfg, guard.AuditEntry{
 			Context: ctx,
-			Command: strings.Join(args, " "),
-			Outcome: "aborted",
+			Command: cmdStr,
+			Outcome: guard.OutcomeAborted,
 		})
 		fmt.Println("Aborted.")
 		os.Exit(1)
 
 	case guard.Allow:
+		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so
+		// anything after the call never runs.
+		_ = guard.AppendAudit(cfg, guard.AuditEntry{
+			Context: ctx,
+			Command: cmdStr,
+			Outcome: guard.OutcomeAllowed,
+		})
 		return guard.ExecKubectl(args)
 	}
 
@@ -207,6 +224,30 @@ func runConfigCommand() error {
 				return err
 			}
 			ui.PrintSuccess("Confirm mode set: " + cfg.ConfirmMode)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "audit-mode [all|gated|off]",
+		Short: "Show or set what the audit log records",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Audit mode: " + cfg.AuditMode)
+				return nil
+			}
+			if !cfg.SetAuditMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.AuditModeAll, config.AuditModeGated, config.AuditModeOff)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Audit mode set: " + cfg.AuditMode)
 			return nil
 		},
 	})
@@ -335,7 +376,9 @@ func loadOrCreateConfig() (*config.Config, error) {
 		cfg.ApplyDefaults()
 		return cfg, nil
 	}
-	return &config.Config{ProtectedContexts: []string{}}, nil
+	cfg := &config.Config{ProtectedContexts: []string{}}
+	cfg.ApplyDefaults()
+	return cfg, nil
 }
 
 func printHelp() {

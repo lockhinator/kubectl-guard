@@ -17,14 +17,10 @@ type KubectlContext struct {
 	Current   bool
 }
 
-// GetCurrentContext returns the current kubectl context name.
+// GetCurrentContext returns the current kubectl context name, honoring the
+// KUBECONFIG environment variable.
 func GetCurrentContext() (string, error) {
-	cmd := exec.Command("kubectl", "config", "current-context")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	return ResolveContext(nil)
 }
 
 // GetAllContexts returns all available kubectl contexts.
@@ -50,6 +46,53 @@ func GetAllContexts() ([]KubectlContext, error) {
 	}
 
 	return contexts, scanner.Err()
+}
+
+// ResolveContextFromArgs inspects args for --context and --kubeconfig flags
+// via the shared ParseArgs tokenizer. Because ParseArgs stops interpreting
+// flags at "--", a trailing "-- --context=dev" can no longer spoof context
+// resolution (the S1 bypass). Pure and easily tested.
+func ResolveContextFromArgs(args []string) (ctx, kubeconfig string, explicit bool) {
+	p := ParseArgs(args)
+	return p.Context, p.Kubeconfig, p.ExplicitContext
+}
+
+// CurrentContextFunc returns the current kubectl context for a given
+// kubeconfig path ("" = default lookup). The default implementation shells
+// out to kubectl; tests inject a fake so the protection logic can be exercised
+// without kubectl on PATH.
+type CurrentContextFunc func(kubeconfig string) (string, error)
+
+// ResolveContext determines the context a command will actually target, using
+// the default (shelling-out) current-context lookup.
+func ResolveContext(args []string) (string, error) {
+	return resolveContextWith(args, defaultCurrentContext)
+}
+
+// resolveContextWith is the testable core: it honors an explicit --context
+// only when it appears before "--" (ParseArgs enforces this), otherwise it
+// falls back to the current-context lookup. This is the seam that makes the
+// S1 ("--" bypass) and S2 (fail-closed) guarantees unit-testable.
+func resolveContextWith(args []string, current CurrentContextFunc) (string, error) {
+	p := ParseArgs(args)
+	if p.ExplicitContext && p.Context != "" {
+		return p.Context, nil
+	}
+	return current(p.Kubeconfig)
+}
+
+// defaultCurrentContext shells out to `kubectl config current-context`,
+// honoring an explicit --kubeconfig path.
+func defaultCurrentContext(kubeconfig string) (string, error) {
+	base := []string{"config", "current-context"}
+	if kubeconfig != "" {
+		base = append([]string{"--kubeconfig=" + kubeconfig}, base...)
+	}
+	out, err := exec.Command("kubectl", base...).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // parseContextLine parses a line from `kubectl config get-contexts --no-headers`.

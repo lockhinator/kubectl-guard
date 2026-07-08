@@ -4,16 +4,49 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
+// Confirmation modes for protected contexts.
+const (
+	ConfirmModeSimple   = "simple"    // y/N prompt (default)
+	ConfirmModeTypeName = "type-name" // must type the context name exactly
+)
+
+const (
+	configFileName = ".kubectl-guard.yaml"
+	auditFileName  = ".kubectl-guard-audit.log"
+)
+
 // Config represents the kubectl-guard configuration.
 type Config struct {
-	ProtectedContexts []string `yaml:"protected_contexts"`
+	// ProtectedContexts are context name patterns (glob) that require
+	// confirmation for state-altering commands.
+	ProtectedContexts []string `yaml:"protected_contexts,omitempty"`
+
+	// ProtectedResources are resource names (e.g. "secret") whose access is
+	// blocked entirely on every context, regardless of verb. Singular, plural,
+	// and short-name forms ("secret", "secrets", "cm") match the same things.
+	ProtectedResources []string `yaml:"protected_resources,omitempty"`
+
+	// ConfirmMode controls the confirmation prompt for protected contexts.
+	// "simple" (default) is a y/N prompt; "type-name" requires the user to
+	// type the context name exactly.
+	ConfirmMode string `yaml:"confirm_mode,omitempty"`
+
+	// AuditLog is the path to the audit log file. When empty it defaults to
+	// ~/.kubectl-guard-audit.log.
+	AuditLog string `yaml:"audit_log,omitempty"`
 }
 
-const configFileName = ".kubectl-guard.yaml"
+// ApplyDefaults fills in zero-value fields with sensible defaults.
+func (c *Config) ApplyDefaults() {
+	if c.ConfirmMode == "" {
+		c.ConfirmMode = ConfirmModeSimple
+	}
+}
 
 // Path returns the full path to the config file.
 func Path() (string, error) {
@@ -22,6 +55,18 @@ func Path() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, configFileName), nil
+}
+
+// AuditPath returns the configured audit log path, or the default.
+func AuditPath(cfg *Config) (string, error) {
+	if cfg != nil && cfg.AuditLog != "" {
+		return cfg.AuditLog, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, auditFileName), nil
 }
 
 // Exists checks if the config file exists.
@@ -57,6 +102,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	cfg.ApplyDefaults()
 	return &cfg, nil
 }
 
@@ -72,8 +118,8 @@ func Save(cfg *Config) error {
 		return err
 	}
 
-	header := "# kubectl-guard configuration\n# Protect production contexts from accidental commands\n\n"
-	return os.WriteFile(path, []byte(header+string(data)), 0644)
+	header := "# kubectl-guard configuration\n# Protect production contexts and sensitive resources from accidental commands\n\n"
+	return os.WriteFile(path, []byte(header+string(data)), 0600)
 }
 
 // IsContextProtected checks if a context matches any protected pattern.
@@ -104,6 +150,95 @@ func (c *Config) RemoveContext(context string) bool {
 			c.ProtectedContexts = append(c.ProtectedContexts[:i], c.ProtectedContexts[i+1:]...)
 			return true
 		}
+	}
+	return false
+}
+
+// resourceShortNames maps kubectl built-in short names to their canonical
+// singular form, so that protecting "configmap" also blocks "cm". Best-effort:
+// covers the common built-in resources. Secrets intentionally have no short
+// name. CRD short names are not covered.
+var resourceShortNames = map[string]string{
+	"cm": "configmap", "svc": "service", "deploy": "deployment",
+	"rs": "replicaset", "rc": "replicationcontroller", "sts": "statefulset",
+	"ds": "daemonset", "cj": "cronjob", "po": "pod", "no": "node",
+	"ns": "namespace", "pv": "persistentvolume", "pvc": "persistentvolumeclaim",
+	"sa": "serviceaccount", "ing": "ingress", "netpol": "networkpolicy",
+	"pdb": "poddisruptionbudget", "pc": "priorityclass", "sc": "storageclass",
+}
+
+// NormalizeResource canonicalizes a resource name for matching: lower-cased,
+// stripped of any "/name" or ".group" suffix, singularized, and expanded from
+// short name to canonical form. This makes "secret", "secrets", "Secret", and
+// "cm"/"configmap" compare predictably.
+func NormalizeResource(name string) string {
+	if i := strings.IndexAny(name, "/."); i >= 0 {
+		name = name[:i]
+	}
+	name = strings.ToLower(name)
+	if full, ok := resourceShortNames[name]; ok {
+		return full
+	}
+	singular := strings.TrimSuffix(name, "s")
+	if full, ok := resourceShortNames[singular]; ok {
+		return full
+	}
+	return singular
+}
+
+// IsResourceProtected reports whether candidate names a protected resource.
+// Matching is case-insensitive and treats singular/plural/short-name forms as
+// equivalent.
+func (c *Config) IsResourceProtected(candidate string) bool {
+	if candidate == "" || len(c.ProtectedResources) == 0 {
+		return false
+	}
+	nc := NormalizeResource(candidate)
+	for _, p := range c.ProtectedResources {
+		if nc == NormalizeResource(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasProtectedResources reports whether any resource protection is configured.
+func (c *Config) HasProtectedResources() bool {
+	return len(c.ProtectedResources) > 0
+}
+
+// AddResource adds a resource to the protected list if an equivalent entry is
+// not already present. Returns false if it was already protected.
+func (c *Config) AddResource(name string) bool {
+	norm := NormalizeResource(name)
+	for _, r := range c.ProtectedResources {
+		if NormalizeResource(r) == norm {
+			return false
+		}
+	}
+	c.ProtectedResources = append(c.ProtectedResources, name)
+	return true
+}
+
+// RemoveResource removes a resource (or its singular/plural/short-name
+// equivalent) from the protected list. Returns false if it was not present.
+func (c *Config) RemoveResource(name string) bool {
+	norm := NormalizeResource(name)
+	for i, r := range c.ProtectedResources {
+		if NormalizeResource(r) == norm {
+			c.ProtectedResources = append(c.ProtectedResources[:i], c.ProtectedResources[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// SetConfirmMode sets the confirmation mode if the value is valid.
+func (c *Config) SetConfirmMode(mode string) bool {
+	switch mode {
+	case ConfirmModeSimple, ConfirmModeTypeName:
+		c.ConfirmMode = mode
+		return true
 	}
 	return false
 }

@@ -48,6 +48,22 @@ func Confirm(message string) bool {
 	return response == "y" || response == "yes"
 }
 
+// ConfirmWithName requires the user to type name exactly to confirm. This is a
+// stronger gate than Confirm, designed to defeat muscle-memory "y" on
+// production contexts.
+func ConfirmWithName(message, name string) bool {
+	fmt.Print(warningStyle.Render("⚠️  "+message) + "\n")
+	fmt.Printf("Type %q to confirm (anything else aborts): ", name)
+
+	reader := bufio.NewReader(os.Stdin)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+
+	return strings.TrimSpace(response) == name
+}
+
 // MultiSelectItem represents an item in the multi-select list.
 type MultiSelectItem struct {
 	Name     string

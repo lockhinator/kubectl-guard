@@ -44,7 +44,6 @@ checksum:
 changelog:
   disable: true
 
-release:
-  # release-please creates the release for this tag; GoReleaser attaches to it
-  # rather than creating a new one.
-  disable: true
+# GoReleaser attaches archives + checksums to the release-please-created
+# release for this tag. Default behavior: if a release already exists for the
+# tag, GoReleaser uploads assets to it rather than creating a new one.

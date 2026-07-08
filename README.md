@@ -4,13 +4,23 @@ A CLI wrapper for kubectl that protects against accidental commands on productio
 
 ## Installation
 
+**mise** (recommended) — installs the prebuilt binary from GitHub Releases:
+
 ```bash
-# From source
-git clone https://github.com/cameronlockhart/kubectl-guard
+mise use -g github:lockhinator/kubectl-guard
+```
+
+**From source:**
+
+```bash
+git clone https://github.com/lockhinator/kubectl-guard
 cd kubectl-guard
 make install
+```
 
-# Add alias to your shell config (~/.zshrc or ~/.bashrc)
+Then add the alias to your shell config (`~/.zshrc` or `~/.bashrc`):
+
+```bash
 alias kubectl='kubectl-guard'
 ```
 

@@ -43,6 +43,14 @@ func TestResolveContextFromArgs(t *testing.T) {
 			wantKubeconfig: "/tmp/kc.yaml",
 			wantExplicit: true,
 		},
+		{
+			// S1 fix: --context after "--" must NOT be honored (kubectl ignores
+			// flags after --, and so must the guard).
+			name:         "context after -- is ignored",
+			args:         []string{"delete", "pod", "nginx", "--", "--context=dev"},
+			wantCtx:      "",
+			wantExplicit: false,
+		},
 	}
 
 	for _, tt := range tests {

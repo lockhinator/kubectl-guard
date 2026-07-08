@@ -203,6 +203,11 @@ func TestNormalizeResource(t *testing.T) {
 		{"secrets.v1", "secret"},
 		{"configmap", "configmap"},
 		{"configmaps", "configmap"},
+		// short names expand to canonical singular
+		{"cm", "configmap"},
+		{"cms", "configmap"},
+		{"svc", "service"},
+		{"ds", "daemonset"}, // trailing-s short name must not be singularized first
 	}
 	for _, tt := range tests {
 		t.Run(tt.in, func(t *testing.T) {

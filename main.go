@@ -62,13 +62,17 @@ func run() error {
 }
 
 func runGuard(args []string) error {
-	result, ctx, err := guard.Check(args)
-	if err != nil {
-		// On error, still try to run kubectl
-		return guard.ExecKubectl(args)
-	}
-
+	result, ctx, cfg, err := guard.Check(args)
 	switch result {
+	case guard.Deny:
+		msg := "the guard cannot verify this command is safe"
+		if err != nil {
+			msg = err.Error()
+		}
+		ui.PrintWarning("Refusing to run: " + msg)
+		ui.PrintInfo("Fix the issue above, or run kubectl directly if you understand the risk.")
+		os.Exit(1)
+
 	case guard.SetupRequired:
 		contexts, err := guard.GetAllContexts()
 		if err != nil {
@@ -84,9 +88,11 @@ func runGuard(args []string) error {
 		return nil
 
 	case guard.Blocked:
-		cfg, _ := guard.LoadConfig()
 		cmdDesc := guard.GetCommandDescription(args)
 		ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
+		if guard.HasUninspectableSource(args) {
+			ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+		}
 		_ = guard.AppendAudit(cfg, guard.AuditEntry{
 			Context: ctx,
 			Command: strings.Join(args, " "),
@@ -96,7 +102,6 @@ func runGuard(args []string) error {
 		os.Exit(1)
 
 	case guard.RequireConfirmation:
-		cfg, _ := guard.LoadConfig()
 		cmdDesc := guard.GetCommandDescription(args)
 		message := fmt.Sprintf("%s on protected context: %s", cmdDesc, ctx)
 
@@ -162,65 +167,25 @@ func runConfigCommand() error {
 		},
 	})
 
-	// add / add-context
-	addContext := &cobra.Command{
-		Use:   "add-context <pattern>",
-		Short: "Add a context/pattern to the protected list",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return mutateConfig(func(cfg *config.Config) bool { return cfg.AddContext(args[0]) }, "Added context: "+args[0], "Context already protected: "+args[0])
-		},
+	// add-context / add (alias) / remove-context / remove (alias) /
+	// add-resource / remove-resource all share one shape.
+	addCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool) {
+		rootCmd.AddCommand(&cobra.Command{
+			Use:   use,
+			Short: short,
+			Args:  cobra.ExactArgs(1),
+			Hidden: hidden,
+			RunE: func(_ *cobra.Command, a []string) error {
+				return mutateConfig(func(c *config.Config) bool { return fn(c, a[0]) }, fmt.Sprintf(doneTmpl, a[0]), fmt.Sprintf(noopTmpl, a[0]))
+			},
+		})
 	}
-	rootCmd.AddCommand(addContext)
-	// "add" is an alias for add-context (backwards compatible).
-	rootCmd.AddCommand(&cobra.Command{
-		Use:               "add <pattern>",
-		Short:             "Alias for add-context",
-		Args:              cobra.ExactArgs(1),
-		Hidden:            true,
-		DisableFlagParsing: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return mutateConfig(func(cfg *config.Config) bool { return cfg.AddContext(args[0]) }, "Added context: "+args[0], "Context already protected: "+args[0])
-		},
-	})
-
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "remove-context <pattern>",
-		Short: "Remove a context/pattern from the protected list",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return mutateConfig(func(cfg *config.Config) bool { return cfg.RemoveContext(args[0]) }, "Removed context: "+args[0], "Context not in protected list: "+args[0])
-		},
-	})
-	// "remove" alias for remove-context.
-	rootCmd.AddCommand(&cobra.Command{
-		Use:               "remove <pattern>",
-		Short:             "Alias for remove-context",
-		Args:              cobra.ExactArgs(1),
-		Hidden:            true,
-		DisableFlagParsing: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return mutateConfig(func(cfg *config.Config) bool { return cfg.RemoveContext(args[0]) }, "Removed context: "+args[0], "Context not in protected list: "+args[0])
-		},
-	})
-
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "add-resource <name>",
-		Short: "Add a resource to block on every context (e.g. secret)",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return mutateConfig(func(cfg *config.Config) bool { return cfg.AddResource(args[0]) }, "Blocked resource: "+args[0], "Resource already protected: "+args[0])
-		},
-	})
-
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "remove-resource <name>",
-		Short: "Remove a resource from the blocked list",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return mutateConfig(func(cfg *config.Config) bool { return cfg.RemoveResource(args[0]) }, "Unblocked resource: "+args[0], "Resource not in protected list: "+args[0])
-		},
-	})
+	addCmd("add-context <pattern>", "Add a context/pattern to the protected list", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", false)
+	addCmd("add <pattern>", "Alias for add-context", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", true)
+	addCmd("remove-context <pattern>", "Remove a context/pattern from the protected list", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", false)
+	addCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true)
+	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false)
+	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "confirm-mode [simple|type-name]",
@@ -300,7 +265,7 @@ func runConfigCommand() error {
 
 // mutateConfig loads (or creates) the config, applies fn, saves on change, and
 // prints the appropriate message.
-func mutateConfig(fn func(*config.Config) bool, addedMsg, existsMsg string) error {
+func mutateConfig(fn func(*config.Config) bool, done, noop string) error {
 	cfg, err := loadOrCreateConfig()
 	if err != nil {
 		return err
@@ -309,9 +274,9 @@ func mutateConfig(fn func(*config.Config) bool, addedMsg, existsMsg string) erro
 		if err := config.Save(cfg); err != nil {
 			return err
 		}
-		ui.PrintSuccess(addedMsg)
+		ui.PrintSuccess(done)
 	} else {
-		ui.PrintInfo(existsMsg)
+		ui.PrintInfo(noop)
 	}
 	return nil
 }

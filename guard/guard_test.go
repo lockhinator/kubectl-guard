@@ -2,6 +2,7 @@ package guard
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cameronlockhart/kubectl-guard/config"
@@ -21,7 +22,7 @@ func TestCheck(t *testing.T) {
 
 	// Test: No config file -> SetupRequired
 	t.Run("no config requires setup", func(t *testing.T) {
-		result, _, err := Check([]string{"get", "pods"})
+		result, _, _, err := Check([]string{"get", "pods"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -38,9 +39,8 @@ func TestCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Test command classification is integrated correctly
+	// Test result ordinals and the fail-closed posture.
 	t.Run("result types exist", func(t *testing.T) {
-		// Verify the constants are distinct and ordered.
 		if Allow != 0 {
 			t.Error("Allow should be 0")
 		}
@@ -52,6 +52,24 @@ func TestCheck(t *testing.T) {
 		}
 		if SetupRequired != 3 {
 			t.Error("SetupRequired should be 3")
+		}
+		if Deny != 4 {
+			t.Error("Deny should be 4")
+		}
+	})
+
+	// S2: a corrupt config must fail closed (Deny), never pass through.
+	t.Run("corrupt config fails closed", func(t *testing.T) {
+		path := filepath.Join(tmpDir, ".kubectl-guard.yaml")
+		if err := os.WriteFile(path, []byte(":::not valid yaml:::["), 0600); err != nil {
+			t.Fatal(err)
+		}
+		result, _, _, err := Check([]string{"delete", "pod", "nginx"})
+		if result != Deny {
+			t.Errorf("Check() = %v, want Deny on corrupt config", result)
+		}
+		if err == nil {
+			t.Error("expected an error describing the failure")
 		}
 	})
 }

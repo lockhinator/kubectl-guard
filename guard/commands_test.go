@@ -3,6 +3,7 @@ package guard
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cameronlockhart/kubectl-guard/config"
@@ -292,6 +293,8 @@ func (f fakeChecker) IsResourceProtected(candidate string) bool {
 	return f.match[candidate] || f.match[config.NormalizeResource(candidate)]
 }
 
+func (f fakeChecker) HasProtectedResources() bool { return len(f.match) > 0 }
+
 func TestMatchesProtectedResource(t *testing.T) {
 	checker := fakeChecker{match: map[string]bool{"secret": true}}
 
@@ -306,12 +309,94 @@ func TestMatchesProtectedResource(t *testing.T) {
 		{"create secret", []string{"create", "secret", "tls", "tls"}, true},
 		{"delete pod", []string{"delete", "pod", "nginx"}, false},
 		{"get pods", []string{"get", "pods"}, false},
+		// S3: un-inspectable sources are blocked when resource protection is active.
+		{"stdin source", []string{"apply", "-f", "-"}, true},
+		{"url source", []string{"apply", "-f", "https://x/secret.yaml"}, true},
+		{"kustomize source", []string{"apply", "-k", "./dir"}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := MatchesProtectedResource(checker, tt.args)
 			if got != tt.want {
 				t.Errorf("MatchesProtectedResource(%v) = %v, want %v", tt.args, got, tt.want)
+			}
+		})
+	}
+
+	// When no protected resources are configured, un-inspectable sources pass.
+	empty := fakeChecker{match: map[string]bool{}}
+	if MatchesProtectedResource(empty, []string{"apply", "-f", "-"}) {
+		t.Error("un-inspectable source should not match when no resources are protected")
+	}
+}
+
+func TestMatchesProtectedResourceShortNames(t *testing.T) {
+	// S4: protecting configmap must also block its short name "cm".
+	checker := fakeChecker{match: map[string]bool{"configmap": true}}
+	cases := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"get", "configmap"}, true},
+		{[]string{"get", "cm"}, true},
+		{[]string{"get", "cms"}, true},
+		{[]string{"get", "ConfigMap"}, true},
+		{[]string{"get", "secret"}, false},
+	}
+	for _, c := range cases {
+		t.Run(strings.Join(c.args, " "), func(t *testing.T) {
+			if got := MatchesProtectedResource(checker, c.args); got != c.want {
+				t.Errorf("MatchesProtectedResource(%v) = %v, want %v", c.args, got, c.want)
+			}
+		})
+	}
+}
+
+func TestParseArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want ParsedArgs
+	}{
+		{
+			name: "context kubeconfig filename kustomize",
+			args: []string{"--context=prod", "--kubeconfig", "/k.yaml", "apply", "-f", "a.yaml", "-k", "dir"},
+			want: ParsedArgs{
+				Positional: []string{"apply"}, Context: "prod", Kubeconfig: "/k.yaml",
+				Filenames: []string{"a.yaml"}, Kustomize: "dir", ExplicitContext: true,
+			},
+		},
+		{
+			name: "double dash stops flags",
+			args: []string{"get", "pod", "--", "--context=dev"},
+			want: ParsedArgs{Positional: []string{"get", "pod"}},
+		},
+		{
+			name: "value taking flag skipped",
+			args: []string{"-n", "default", "get", "pods"},
+			want: ParsedArgs{Positional: []string{"get", "pods"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseArgs(tt.args)
+			if !equalStrings(got.Positional, tt.want.Positional) {
+				t.Errorf("Positional = %v, want %v", got.Positional, tt.want.Positional)
+			}
+			if got.Context != tt.want.Context {
+				t.Errorf("Context = %q, want %q", got.Context, tt.want.Context)
+			}
+			if got.Kubeconfig != tt.want.Kubeconfig {
+				t.Errorf("Kubeconfig = %q, want %q", got.Kubeconfig, tt.want.Kubeconfig)
+			}
+			if got.Kustomize != tt.want.Kustomize {
+				t.Errorf("Kustomize = %q, want %q", got.Kustomize, tt.want.Kustomize)
+			}
+			if !equalStrings(got.Filenames, tt.want.Filenames) {
+				t.Errorf("Filenames = %v, want %v", got.Filenames, tt.want.Filenames)
+			}
+			if got.ExplicitContext != tt.want.ExplicitContext {
+				t.Errorf("ExplicitContext = %v, want %v", got.ExplicitContext, tt.want.ExplicitContext)
 			}
 		})
 	}

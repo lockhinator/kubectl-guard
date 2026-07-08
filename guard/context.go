@@ -49,26 +49,12 @@ func GetAllContexts() ([]KubectlContext, error) {
 }
 
 // ResolveContextFromArgs inspects args for --context and --kubeconfig flags
-// (in explicit-value, space-separated, and "=" forms). It returns the
-// explicitly requested context (if any), the kubeconfig path (if any), and
-// whether a context was given explicitly. This is pure and easily tested.
+// via the shared ParseArgs tokenizer. Because ParseArgs stops interpreting
+// flags at "--", a trailing "-- --context=dev" can no longer spoof context
+// resolution (the S1 bypass). Pure and easily tested.
 func ResolveContextFromArgs(args []string) (ctx, kubeconfig string, explicit bool) {
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "--context" && i+1 < len(args):
-			ctx, explicit = args[i+1], true
-			i++
-		case strings.HasPrefix(arg, "--context="):
-			ctx, explicit = strings.TrimPrefix(arg, "--context="), true
-		case arg == "--kubeconfig" && i+1 < len(args):
-			kubeconfig = args[i+1]
-			i++
-		case strings.HasPrefix(arg, "--kubeconfig="):
-			kubeconfig = strings.TrimPrefix(arg, "--kubeconfig=")
-		}
-	}
-	return
+	p := ParseArgs(args)
+	return p.Context, p.Kubeconfig, p.ExplicitContext
 }
 
 // ResolveContext determines the context a command will actually target.

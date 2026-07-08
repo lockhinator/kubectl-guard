@@ -263,4 +263,17 @@ func TestCheckResourceProtectionRound2(t *testing.T) {
 			t.Errorf("result = %v, want Blocked for -Rf <dir with secret>", result)
 		}
 	})
+
+	t.Run("H4: resource after -- is blocked", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"get", "--", "secret"},
+			{"delete", "--", "secret", "db"},
+			{"get", "pods", "--", "secret"},
+		} {
+			result, _, _, _ := checkWith(args, dev)
+			if result != Blocked {
+				t.Errorf("Check(%v) = %v, want Blocked", args, result)
+			}
+		}
+	})
 }

@@ -229,7 +229,7 @@ func TestPositionalArgs(t *testing.T) {
 		{"short flag with value", []string{"-n", "default", "get", "pods"}, []string{"get", "pods"}},
 		{"long flag with value", []string{"get", "--namespace", "x", "pods"}, []string{"get", "pods"}},
 		{"equals flag", []string{"--namespace=x", "get", "pods"}, []string{"get", "pods"}},
-		{"stops at --", []string{"exec", "nginx", "--", "get", "pods"}, []string{"exec", "nginx"}},
+		{"stops at --", []string{"exec", "nginx", "--", "get", "pods"}, []string{"exec", "nginx", "get", "pods"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -393,6 +393,28 @@ func TestMatchesProtectedResourceAll(t *testing.T) {
 	}
 }
 
+// TestMatchesProtectedResourceAfterDoubleDash locks down H4: resource tokens
+// placed after "--" are still positional to kubectl and must be matched.
+func TestMatchesProtectedResourceAfterDoubleDash(t *testing.T) {
+	checker := fakeChecker{match: map[string]bool{"secret": true}}
+	cases := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"get", "--", "secret"}, true},
+		{[]string{"delete", "--", "secret", "db"}, true},
+		{[]string{"get", "pods", "--", "secret"}, true},
+		{[]string{"get", "--", "configmap"}, false},
+	}
+	for _, c := range cases {
+		t.Run(strings.Join(c.args, " "), func(t *testing.T) {
+			if got := MatchesProtectedResource(checker, c.args); got != c.want {
+				t.Errorf("MatchesProtectedResource(%v) = %v, want %v", c.args, got, c.want)
+			}
+		})
+	}
+}
+
 func TestParseArgs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -408,9 +430,9 @@ func TestParseArgs(t *testing.T) {
 			},
 		},
 		{
-			name: "double dash stops flags",
+			name: "double dash: flags stop, positionals collected",
 			args: []string{"get", "pod", "--", "--context=dev"},
-			want: ParsedArgs{Positional: []string{"get", "pod"}},
+			want: ParsedArgs{Positional: []string{"get", "pod", "--context=dev"}},
 		},
 		{
 			name: "value taking flag skipped",

@@ -211,6 +211,11 @@ func ParseArgs(args []string) ParsedArgs {
 			continue
 		}
 		if arg == "--" {
+			// kubectl treats everything after "--" as positional (resource names,
+			// exec args, etc.). Flags stop here, so a trailing "--context=dev"
+			// cannot spoof context resolution (S1); but resource tokens after
+			// "--" must still be matched (H4).
+			p.Positional = append(p.Positional, args[i+1:]...)
 			break
 		}
 		switch {

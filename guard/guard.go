@@ -34,6 +34,12 @@ const (
 // loaded config (non-nil for Allow/Blocked/RequireConfirmation) so callers do
 // not need to re-read the file.
 func Check(args []string) (Result, string, *config.Config, error) {
+	return checkWith(args, defaultCurrentContext)
+}
+
+// checkWith is the testable core of Check: the current-context lookup is
+// injected so the protection decision can be exercised without kubectl.
+func checkWith(args []string, current CurrentContextFunc) (Result, string, *config.Config, error) {
 	// Config must be readable; if we cannot tell what is protected we refuse.
 	exists, err := config.Exists()
 	if err != nil {
@@ -50,7 +56,7 @@ func Check(args []string) (Result, string, *config.Config, error) {
 	cfg.ApplyDefaults()
 
 	// Best-effort context for messaging; failures are handled below.
-	ctx, ctxErr := ResolveContext(args)
+	ctx, ctxErr := resolveContextWith(args, current)
 
 	// Protected resources are blocked globally, regardless of context or verb.
 	if MatchesProtectedResource(cfg, args) {

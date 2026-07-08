@@ -57,26 +57,38 @@ func ResolveContextFromArgs(args []string) (ctx, kubeconfig string, explicit boo
 	return p.Context, p.Kubeconfig, p.ExplicitContext
 }
 
-// ResolveContext determines the context a command will actually target.
-//
-// It honors an explicit --context flag first (closing the bypass where
-// "kubectl --context=prod delete ..." would otherwise skip the guard), then a
-// --kubeconfig flag, and finally falls back to the current context (which
-// itself honors KUBECONFIG).
+// CurrentContextFunc returns the current kubectl context for a given
+// kubeconfig path ("" = default lookup). The default implementation shells
+// out to kubectl; tests inject a fake so the protection logic can be exercised
+// without kubectl on PATH.
+type CurrentContextFunc func(kubeconfig string) (string, error)
+
+// ResolveContext determines the context a command will actually target, using
+// the default (shelling-out) current-context lookup.
 func ResolveContext(args []string) (string, error) {
-	ctx, kubeconfig, explicit := ResolveContextFromArgs(args)
-	if explicit && ctx != "" {
-		return ctx, nil
-	}
+	return resolveContextWith(args, defaultCurrentContext)
+}
 
-	base := []string{}
+// resolveContextWith is the testable core: it honors an explicit --context
+// only when it appears before "--" (ParseArgs enforces this), otherwise it
+// falls back to the current-context lookup. This is the seam that makes the
+// S1 ("--" bypass) and S2 (fail-closed) guarantees unit-testable.
+func resolveContextWith(args []string, current CurrentContextFunc) (string, error) {
+	p := ParseArgs(args)
+	if p.ExplicitContext && p.Context != "" {
+		return p.Context, nil
+	}
+	return current(p.Kubeconfig)
+}
+
+// defaultCurrentContext shells out to `kubectl config current-context`,
+// honoring an explicit --kubeconfig path.
+func defaultCurrentContext(kubeconfig string) (string, error) {
+	base := []string{"config", "current-context"}
 	if kubeconfig != "" {
-		base = append(base, "--kubeconfig="+kubeconfig)
+		base = append([]string{"--kubeconfig=" + kubeconfig}, base...)
 	}
-	base = append(base, "config", "current-context")
-
-	cmd := exec.Command("kubectl", base...)
-	out, err := cmd.Output()
+	out, err := exec.Command("kubectl", base...).Output()
 	if err != nil {
 		return "", err
 	}

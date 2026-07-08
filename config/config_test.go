@@ -296,3 +296,61 @@ func TestAuditPath(t *testing.T) {
 		t.Errorf("expected custom path, got %q", p)
 	}
 }
+
+func TestApplyDefaultsAuditMode(t *testing.T) {
+	cfg := &Config{}
+	cfg.ApplyDefaults()
+	if cfg.AuditMode != AuditModeAll {
+		t.Errorf("expected default audit mode %q, got %q", AuditModeAll, cfg.AuditMode)
+	}
+}
+
+func TestSetAuditMode(t *testing.T) {
+	cfg := &Config{}
+	for _, valid := range []string{AuditModeAll, AuditModeGated, AuditModeOff} {
+		if !cfg.SetAuditMode(valid) {
+			t.Errorf("SetAuditMode(%q) should return true", valid)
+		}
+		if cfg.AuditMode != valid {
+			t.Errorf("expected %q, got %q", valid, cfg.AuditMode)
+		}
+	}
+	if cfg.SetAuditMode("bogus") {
+		t.Error("SetAuditMode should reject invalid mode")
+	}
+}
+
+func TestShouldAudit(t *testing.T) {
+	tests := []struct {
+		mode    string
+		outcome string
+		want    bool
+	}{
+		// "all" logs everything
+		{AuditModeAll, "allowed", true},
+		{AuditModeAll, "confirmed", true},
+		{AuditModeAll, "aborted", true},
+		{AuditModeAll, "blocked", true},
+		{AuditModeAll, "denied", true},
+
+		// "gated" logs only interventions (not allowed passthrough)
+		{AuditModeGated, "allowed", false},
+		{AuditModeGated, "confirmed", true},
+		{AuditModeGated, "aborted", true},
+		{AuditModeGated, "blocked", true},
+		{AuditModeGated, "denied", true},
+
+		// "off" logs nothing
+		{AuditModeOff, "allowed", false},
+		{AuditModeOff, "confirmed", false},
+		{AuditModeOff, "blocked", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mode+"_"+tt.outcome, func(t *testing.T) {
+			cfg := &Config{AuditMode: tt.mode}
+			if got := cfg.ShouldAudit(tt.outcome); got != tt.want {
+				t.Errorf("ShouldAudit(%q) in mode %q = %v, want %v", tt.outcome, tt.mode, got, tt.want)
+			}
+		})
+	}
+}

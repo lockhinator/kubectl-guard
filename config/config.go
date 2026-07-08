@@ -15,6 +15,13 @@ const (
 	ConfirmModeTypeName = "type-name" // must type the context name exactly
 )
 
+// Audit modes control what gets written to the audit log.
+const (
+	AuditModeAll   = "all"   // log every command, including allowed passthrough (default)
+	AuditModeGated = "gated" // log only interventions (blocked/confirmed/aborted/denied)
+	AuditModeOff   = "off"   // log nothing
+)
+
 const (
 	configFileName = ".kubectl-guard.yaml"
 	auditFileName  = ".kubectl-guard-audit.log"
@@ -39,6 +46,10 @@ type Config struct {
 	// AuditLog is the path to the audit log file. When empty it defaults to
 	// ~/.kubectl-guard-audit.log.
 	AuditLog string `yaml:"audit_log,omitempty"`
+
+	// AuditMode controls what is written to the audit log: "all" (default,
+	// every command), "gated" (only interventions), or "off".
+	AuditMode string `yaml:"audit_mode,omitempty"`
 }
 
 // ApplyDefaults fills in zero-value fields with sensible defaults.
@@ -46,6 +57,33 @@ func (c *Config) ApplyDefaults() {
 	if c.ConfirmMode == "" {
 		c.ConfirmMode = ConfirmModeSimple
 	}
+	if c.AuditMode == "" {
+		c.AuditMode = AuditModeAll
+	}
+}
+
+// ShouldAudit reports whether an entry with the given outcome should be
+// written, based on the configured audit mode. outcome is one of the
+// guard.Outcome* constants (passed as a string to avoid an import cycle).
+func (c *Config) ShouldAudit(outcome string) bool {
+	switch c.AuditMode {
+	case AuditModeOff:
+		return false
+	case AuditModeGated:
+		return outcome != "allowed"
+	default: // AuditModeAll
+		return true
+	}
+}
+
+// SetAuditMode sets the audit mode if the value is valid.
+func (c *Config) SetAuditMode(mode string) bool {
+	switch mode {
+	case AuditModeAll, AuditModeGated, AuditModeOff:
+		c.AuditMode = mode
+		return true
+	}
+	return false
 }
 
 // Path returns the full path to the config file.

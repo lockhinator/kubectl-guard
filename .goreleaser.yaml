@@ -1,0 +1,50 @@
+# GoReleaser config (v2).
+# Builds cross-platform archives + checksums and attaches them to the GitHub
+# Release that release-please created for the tag.
+# Docs: https://goreleaser.com
+version: 2
+
+project_name: kubectl-guard
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: .
+    binary: kubectl-guard
+    ldflags:
+      # main.version is injected at build time (see main.go).
+      - -s -w -X main.version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_amd64
+      - darwin_arm64
+      - windows_amd64
+      - windows_arm64
+
+archives:
+  - formats: [tar.gz]
+    # mise's github backend auto-detects OS/arch from the asset name; a clear
+    # os_arch scheme makes that reliable across platforms.
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: 'checksums.txt'
+
+# release-please already generates the changelog; don't duplicate it.
+changelog:
+  disable: true
+
+release:
+  # release-please creates the release for this tag; GoReleaser attaches to it
+  # rather than creating a new one.
+  disable: true

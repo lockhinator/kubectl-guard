@@ -13,6 +13,9 @@ kubectl-guard
 coverage.out
 coverage.html
 
+# GoReleaser build output
+dist/
+
 # IDE
 .idea/
 .vscode/

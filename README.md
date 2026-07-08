@@ -63,35 +63,75 @@ Aborted.
 
 ## Blocking all secret access
 
+To block **all** access to a resource on every cluster, context, and verb
+(reads included), add it as a protected resource:
+
 ```bash
+# Enable: block all secret access everywhere
 $ kubectl-guard config add-resource secret
 ✓ Blocked resource: secret
 
+# Disable: stop blocking secrets
+$ kubectl-guard config remove-resource secret
+```
+
+Once enabled, every command targeting that resource is refused with exit 1:
+
+```bash
 $ kubectl get secret
 ⚠️  Blocked: get secret targets a protected resource (context: prod-cluster)
 
 $ kubectl get secrets -A           # plural form also blocked
 $ kubectl create secret generic x  # writes blocked
 $ kubectl apply -f secret.yaml     # manifests scanned for kind: Secret
+$ kubectl get secret,configmap     # comma-separated lists matched per-part
+$ kubectl get all                  # "all"/"*" blocked (they span secrets)
 ```
 
-Everything else is allowed. Singular/plural forms (`secret`/`secrets`) and
-`type/name` tokens (`secret/db`) are treated equivalently. Remove with
-`config remove-resource secret`.
+Everything else is allowed — non-protected resources pass through normally.
+
+**What gets matched:**
+- Singular/plural forms (`secret` / `secrets`)
+- Short names (`cm` → `configmap`, `svc` → `service`, …)
+- `type/name` tokens (`secret/db`)
+- Comma-separated resource lists (`secret,configmap`)
+- `all` and `*` wildcards (blocked whenever any resource is protected)
+
+**Manifest sources:**
+- `-f file.yaml` — scanned for `kind:` (multi-document aware)
+- `-f dir` / `-Rf dir` — directories walked recursively
+- `-f -` (stdin), URLs, and `-k` (kustomize) — cannot be inspected, so they
+  are **conservatively blocked** when resource protection is active
+
+Use `kubectl-guard config list` to see which resources are currently protected.
 
 ## Configuration
 
-Config file: `~/.kubectl-guard.yaml`
+Config file: `~/.kubectl-guard.yaml` (print the exact path with
+`kubectl-guard config path`). It is written with `0600` permissions
+(owner read/write only) and re-read on every invocation, so it can also be
+hand-edited.
 
 ```yaml
+# kubectl-guard configuration
+# Protect production contexts and sensitive resources from accidental commands
+
 protected_contexts:
   - prod-cluster
   - prod-*           # Glob patterns supported
 protected_resources:
   - secret           # Blocked on every context
 confirm_mode: type-name   # simple (y/N) or type-name (type the context name)
-audit_log: ~/.kubectl-guard-audit.log
+audit_log: ~/.kubectl-guard-audit.log   # optional; defaults to this path
 ```
+
+Fields:
+- **`protected_contexts`** — glob patterns of contexts that gate
+  state-altering commands (require confirmation)
+- **`protected_resources`** — resources blocked everywhere, reads included
+- **`confirm_mode`** — `simple` (y/N prompt) or `type-name` (type the
+  context name to confirm)
+- **`audit_log`** — optional override for the audit log path
 
 Manage via CLI:
 

@@ -191,3 +191,103 @@ func TestPath(t *testing.T) {
 		t.Errorf("Expected filename %q, got %q", configFileName, filepath.Base(path))
 	}
 }
+
+func TestNormalizeResource(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"secret", "secret"},
+		{"secrets", "secret"},
+		{"Secret", "secret"},
+		{"secret/mysecret", "secret"},
+		{"secrets.v1", "secret"},
+		{"configmap", "configmap"},
+		{"configmaps", "configmap"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := NormalizeResource(tt.in); got != tt.want {
+				t.Errorf("NormalizeResource(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsResourceProtected(t *testing.T) {
+	cfg := &Config{ProtectedResources: []string{"secret"}}
+
+	tests := []struct {
+		candidate string
+		want      bool
+	}{
+		{"secret", true},
+		{"secrets", true},
+		{"Secret", true},
+		{"secret/mysecret", true},
+		{"configmap", false},
+		{"pod", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.candidate, func(t *testing.T) {
+			if got := cfg.IsResourceProtected(tt.candidate); got != tt.want {
+				t.Errorf("IsResourceProtected(%q) = %v, want %v", tt.candidate, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAddRemoveResource(t *testing.T) {
+	cfg := &Config{}
+	if !cfg.AddResource("secret") {
+		t.Error("AddResource should return true for new resource")
+	}
+	if cfg.AddResource("secrets") {
+		t.Error("AddResource should return false for equivalent plural")
+	}
+	if len(cfg.ProtectedResources) != 1 {
+		t.Errorf("expected 1 resource, got %d", len(cfg.ProtectedResources))
+	}
+	if !cfg.RemoveResource("secrets") {
+		t.Error("RemoveResource should return true for equivalent plural")
+	}
+	if len(cfg.ProtectedResources) != 0 {
+		t.Errorf("expected 0 resources, got %d", len(cfg.ProtectedResources))
+	}
+	if cfg.RemoveResource("secret") {
+		t.Error("RemoveResource should return false when absent")
+	}
+}
+
+func TestApplyDefaults(t *testing.T) {
+	cfg := &Config{}
+	cfg.ApplyDefaults()
+	if cfg.ConfirmMode != ConfirmModeSimple {
+		t.Errorf("expected default confirm mode %q, got %q", ConfirmModeSimple, cfg.ConfirmMode)
+	}
+	if !cfg.SetConfirmMode(ConfirmModeTypeName) {
+		t.Error("SetConfirmMode should accept type-name")
+	}
+	if cfg.ConfirmMode != ConfirmModeTypeName {
+		t.Errorf("expected type-name, got %q", cfg.ConfirmMode)
+	}
+	if cfg.SetConfirmMode("bogus") {
+		t.Error("SetConfirmMode should reject invalid mode")
+	}
+}
+
+func TestAuditPath(t *testing.T) {
+	// Default path under home.
+	p, err := AuditPath(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(p) != auditFileName {
+		t.Errorf("expected %q, got %q", auditFileName, filepath.Base(p))
+	}
+	// Explicit override.
+	p, _ = AuditPath(&Config{AuditLog: "/tmp/custom-audit.log"})
+	if p != "/tmp/custom-audit.log" {
+		t.Errorf("expected custom path, got %q", p)
+	}
+}

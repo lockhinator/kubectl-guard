@@ -1,6 +1,12 @@
 package guard
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/cameronlockhart/kubectl-guard/config"
+)
 
 func TestExtractCommand(t *testing.T) {
 	tests := []struct {
@@ -82,10 +88,17 @@ func TestIsSafeCommand(t *testing.T) {
 		{"api-versions", []string{"api-versions"}, true},
 		{"version", []string{"version"}, true},
 		{"cluster-info", []string{"cluster-info"}, true},
-		{"config get-contexts", []string{"config", "get-contexts"}, true},
-		{"auth can-i", []string{"auth", "can-i", "get", "pods"}, true},
 		{"wait", []string{"wait", "--for=condition=ready", "pod/nginx"}, true},
 		{"diff", []string{"diff", "-f", "deployment.yaml"}, true},
+		// config/auth are conditional: read-only subcommands are safe.
+		{"config get-contexts", []string{"config", "get-contexts"}, true},
+		{"config view", []string{"config", "view"}, true},
+		{"config current-context", []string{"config", "current-context"}, true},
+		{"config use-context", []string{"config", "use-context", "prod"}, false},
+		{"config set-context", []string{"config", "set-context", "--current"}, false},
+		{"auth can-i", []string{"auth", "can-i", "get", "pods"}, true},
+		{"auth whoami", []string{"auth", "whoami"}, true},
+		{"auth reconcile", []string{"auth", "reconcile", "-f", "rbac.yaml"}, false},
 
 		// Rollout safe subcommands
 		{"rollout status", []string{"rollout", "status", "deployment/nginx"}, true},
@@ -146,6 +159,20 @@ func TestIsStateAltering(t *testing.T) {
 		{"debug", []string{"debug", "nginx"}, true},
 		{"attach", []string{"attach", "nginx"}, true},
 
+		// config/auth mutating subcommands are state-altering
+		{"config use-context", []string{"config", "use-context", "prod"}, true},
+		{"config delete-context", []string{"config", "delete-context", "prod"}, true},
+		{"config set-credentials", []string{"config", "set-credentials", "admin"}, true},
+		{"config unset", []string{"config", "unset", "users.foo"}, true},
+		{"auth reconcile", []string{"auth", "reconcile", "-f", "rbac.yaml"}, true},
+
+		// config/auth read-only subcommands are not state-altering
+		{"config view", []string{"config", "view"}, false},
+		{"config get-contexts", []string{"config", "get-contexts"}, false},
+		{"config current-context", []string{"config", "current-context"}, false},
+		{"auth can-i", []string{"auth", "can-i", "get", "pods"}, false},
+		{"auth whoami", []string{"auth", "whoami"}, false},
+
 		// Safe commands are not state-altering
 		{"get", []string{"get", "pods"}, false},
 		{"describe", []string{"describe", "pod", "nginx"}, false},
@@ -189,4 +216,163 @@ func TestGetCommandDescription(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPositionalArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"simple", []string{"get", "pods"}, []string{"get", "pods"}},
+		{"short flag with value", []string{"-n", "default", "get", "pods"}, []string{"get", "pods"}},
+		{"long flag with value", []string{"get", "--namespace", "x", "pods"}, []string{"get", "pods"}},
+		{"equals flag", []string{"--namespace=x", "get", "pods"}, []string{"get", "pods"}},
+		{"stops at --", []string{"exec", "nginx", "--", "get", "pods"}, []string{"exec", "nginx"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PositionalArgs(tt.args)
+			if !equalStrings(got, tt.want) {
+				t.Errorf("PositionalArgs(%v) = %v, want %v", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractResourceCandidates(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"get secret", []string{"get", "secret"}, []string{"secret"}},
+		{"get named secret", []string{"get", "secret", "mysecret"}, []string{"secret", "mysecret"}},
+		{"create secret", []string{"create", "secret", "generic", "x"}, []string{"secret", "generic", "x"}},
+		{"slash form", []string{"delete", "secret/mysecret"}, []string{"secret/mysecret"}},
+		{"verb only", []string{"get"}, nil},
+		{"filename value skipped", []string{"apply", "-f", "secret.yaml"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractResourceCandidates(tt.args)
+			if !equalStrings(got, tt.want) {
+				t.Errorf("ExtractResourceCandidates(%v) = %v, want %v", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractFilenames(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"short", []string{"apply", "-f", "a.yaml"}, []string{"a.yaml"}},
+		{"long", []string{"apply", "--filename", "a.yaml"}, []string{"a.yaml"}},
+		{"equals", []string{"apply", "--filename=a.yaml"}, []string{"a.yaml"}},
+		{"multiple", []string{"apply", "-f", "a.yaml", "-f", "b.yaml"}, []string{"a.yaml", "b.yaml"}},
+		{"none", []string{"get", "pods"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractFilenames(tt.args)
+			if !equalStrings(got, tt.want) {
+				t.Errorf("ExtractFilenames(%v) = %v, want %v", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+// fakeChecker implements ProtectedResourceChecker for testing.
+type fakeChecker struct{ match map[string]bool }
+
+func (f fakeChecker) IsResourceProtected(candidate string) bool {
+	return f.match[candidate] || f.match[config.NormalizeResource(candidate)]
+}
+
+func TestMatchesProtectedResource(t *testing.T) {
+	checker := fakeChecker{match: map[string]bool{"secret": true}}
+
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"get secret", []string{"get", "secret"}, true},
+		{"get secrets plural", []string{"get", "secrets"}, true},
+		{"describe secret named", []string{"describe", "secret", "mysecret"}, true},
+		{"create secret", []string{"create", "secret", "tls", "tls"}, true},
+		{"delete pod", []string{"delete", "pod", "nginx"}, false},
+		{"get pods", []string{"get", "pods"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MatchesProtectedResource(checker, tt.args)
+			if got != tt.want {
+				t.Errorf("MatchesProtectedResource(%v) = %v, want %v", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesProtectedResourceFile(t *testing.T) {
+	checker := fakeChecker{match: map[string]bool{"secret": true}}
+
+	secretManifest := []byte("apiVersion: v1\nkind: Secret\nmetadata:\n  name: x\n")
+	deployManifest := []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\n")
+	multiDoc := []byte("kind: ConfigMap\n---\nkind: Secret\n")
+
+	files := map[string][]byte{
+		"secret.yaml":  secretManifest,
+		"deploy.yaml":  deployManifest,
+		"multi.yaml":   multiDoc,
+	}
+
+	for name, content := range files {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, content, 0600); err != nil {
+			t.Fatal(err)
+	}
+		files[name] = []byte(path) // reuse map to hold the real path
+	}
+
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"secret file", string(files["secret.yaml"]), true},
+		{"deploy file", string(files["deploy.yaml"]), false},
+		{"multi doc with secret", string(files["multi.yaml"]), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := fileContainsProtectedKind(c.path, checker)
+			if got != c.want {
+				t.Errorf("fileContainsProtectedKind(%q) = %v, want %v", c.path, got, c.want)
+			}
+		})
+	}
+
+	// End-to-end via MatchesProtectedResource with -f
+	if !MatchesProtectedResource(checker, []string{"apply", "-f", string(files["secret.yaml"])}) {
+		t.Error("apply -f secret.yaml should match")
+	}
+	if MatchesProtectedResource(checker, []string{"apply", "-f", string(files["deploy.yaml"])}) {
+		t.Error("apply -f deploy.yaml should not match")
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

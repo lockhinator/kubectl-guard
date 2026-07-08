@@ -38,21 +38,20 @@ func TestCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Note: The following tests would require mocking kubectl,
-	// which is complex. In a real scenario, you'd use interfaces
-	// to allow mocking the kubectl calls. For now, we test what we can.
-
 	// Test command classification is integrated correctly
 	t.Run("result types exist", func(t *testing.T) {
-		// Just verify the constants are defined correctly
+		// Verify the constants are distinct and ordered.
 		if Allow != 0 {
 			t.Error("Allow should be 0")
 		}
 		if RequireConfirmation != 1 {
 			t.Error("RequireConfirmation should be 1")
 		}
-		if SetupRequired != 2 {
-			t.Error("SetupRequired should be 2")
+		if Blocked != 2 {
+			t.Error("Blocked should be 2")
+		}
+		if SetupRequired != 3 {
+			t.Error("SetupRequired should be 3")
 		}
 	})
 }

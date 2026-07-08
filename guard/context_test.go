@@ -2,6 +2,65 @@ package guard
 
 import "testing"
 
+func TestResolveContextFromArgs(t *testing.T) {
+	tests := []struct {
+		name            string
+		args            []string
+		wantCtx         string
+		wantKubeconfig  string
+		wantExplicit    bool
+	}{
+		{
+			name:         "--context space form",
+			args:         []string{"--context", "prod", "get", "pods"},
+			wantCtx:      "prod",
+			wantExplicit: true,
+		},
+		{
+			name:         "--context=equals form",
+			args:         []string{"--context=prod-us-east", "delete", "pod", "x"},
+			wantCtx:      "prod-us-east",
+			wantExplicit: true,
+		},
+		{
+			name:           "--kubeconfig space form",
+			args:           []string{"--kubeconfig", "/tmp/kc.yaml", "get", "pods"},
+			wantKubeconfig: "/tmp/kc.yaml",
+		},
+		{
+			name:           "--kubeconfig=equals form",
+			args:           []string{"--kubeconfig=/tmp/kc.yaml", "get", "pods"},
+			wantKubeconfig: "/tmp/kc.yaml",
+		},
+		{
+			name:    "no flags",
+			args:    []string{"get", "pods"},
+		},
+		{
+			name:         "both context and kubeconfig",
+			args:         []string{"--kubeconfig=/tmp/kc.yaml", "--context=prod", "get", "pods"},
+			wantCtx:      "prod",
+			wantKubeconfig: "/tmp/kc.yaml",
+			wantExplicit: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, kc, explicit := ResolveContextFromArgs(tt.args)
+			if ctx != tt.wantCtx {
+				t.Errorf("ctx = %q, want %q", ctx, tt.wantCtx)
+			}
+			if kc != tt.wantKubeconfig {
+				t.Errorf("kubeconfig = %q, want %q", kc, tt.wantKubeconfig)
+			}
+			if explicit != tt.wantExplicit {
+				t.Errorf("explicit = %v, want %v", explicit, tt.wantExplicit)
+			}
+		})
+	}
+}
+
 func TestParseContextLine(t *testing.T) {
 	tests := []struct {
 		name     string

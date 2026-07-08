@@ -17,14 +17,10 @@ type KubectlContext struct {
 	Current   bool
 }
 
-// GetCurrentContext returns the current kubectl context name.
+// GetCurrentContext returns the current kubectl context name, honoring the
+// KUBECONFIG environment variable.
 func GetCurrentContext() (string, error) {
-	cmd := exec.Command("kubectl", "config", "current-context")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	return ResolveContext(nil)
 }
 
 // GetAllContexts returns all available kubectl contexts.
@@ -50,6 +46,55 @@ func GetAllContexts() ([]KubectlContext, error) {
 	}
 
 	return contexts, scanner.Err()
+}
+
+// ResolveContextFromArgs inspects args for --context and --kubeconfig flags
+// (in explicit-value, space-separated, and "=" forms). It returns the
+// explicitly requested context (if any), the kubeconfig path (if any), and
+// whether a context was given explicitly. This is pure and easily tested.
+func ResolveContextFromArgs(args []string) (ctx, kubeconfig string, explicit bool) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--context" && i+1 < len(args):
+			ctx, explicit = args[i+1], true
+			i++
+		case strings.HasPrefix(arg, "--context="):
+			ctx, explicit = strings.TrimPrefix(arg, "--context="), true
+		case arg == "--kubeconfig" && i+1 < len(args):
+			kubeconfig = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--kubeconfig="):
+			kubeconfig = strings.TrimPrefix(arg, "--kubeconfig=")
+		}
+	}
+	return
+}
+
+// ResolveContext determines the context a command will actually target.
+//
+// It honors an explicit --context flag first (closing the bypass where
+// "kubectl --context=prod delete ..." would otherwise skip the guard), then a
+// --kubeconfig flag, and finally falls back to the current context (which
+// itself honors KUBECONFIG).
+func ResolveContext(args []string) (string, error) {
+	ctx, kubeconfig, explicit := ResolveContextFromArgs(args)
+	if explicit && ctx != "" {
+		return ctx, nil
+	}
+
+	base := []string{}
+	if kubeconfig != "" {
+		base = append(base, "--kubeconfig="+kubeconfig)
+	}
+	base = append(base, "config", "current-context")
+
+	cmd := exec.Command("kubectl", base...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // parseContextLine parses a line from `kubectl config get-contexts --no-headers`.

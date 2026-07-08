@@ -16,11 +16,14 @@ const (
 	Allow Result = iota
 	// RequireConfirmation means the command needs user confirmation.
 	RequireConfirmation
+	// Blocked means the command targets a protected resource and is refused.
+	Blocked
 	// SetupRequired means the config doesn't exist and setup is needed.
 	SetupRequired
 )
 
-// Check evaluates whether a command should be allowed, require confirmation, or trigger setup.
+// Check evaluates whether a command should be allowed, require confirmation,
+// be blocked, or trigger setup.
 func Check(args []string) (Result, string, error) {
 	// Check if config exists
 	exists, err := config.Exists()
@@ -31,30 +34,42 @@ func Check(args []string) (Result, string, error) {
 		return SetupRequired, "", nil
 	}
 
-	// Load config
 	cfg, err := config.Load()
 	if err != nil {
 		return Allow, "", err
 	}
+	cfg.ApplyDefaults()
 
-	// Get current context
-	ctx, err := GetCurrentContext()
-	if err != nil {
-		// If we can't get context, allow the command (kubectl will handle errors)
+	// Best-effort context resolution (for messaging). A failure here does not
+	// block: kubectl will surface any real error itself.
+	ctx, _ := ResolveContext(args)
+
+	// Protected resources are blocked globally, regardless of context or verb.
+	if MatchesProtectedResource(cfg, args) {
+		return Blocked, ctx, nil
+	}
+
+	if ctx == "" {
 		return Allow, "", nil
 	}
 
-	// Check if context is protected
-	if !cfg.IsContextProtected(ctx) {
-		return Allow, ctx, nil
-	}
-
-	// Context is protected - check if command is state-altering
-	if IsStateAltering(args) {
+	// Context is protected - check if command is state-altering.
+	if cfg.IsContextProtected(ctx) && IsStateAltering(args) {
 		return RequireConfirmation, ctx, nil
 	}
 
 	return Allow, ctx, nil
+}
+
+// LoadConfig loads the config with defaults applied. Returns nil if the config
+// does not exist or cannot be read.
+func LoadConfig() (*config.Config, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	cfg.ApplyDefaults()
+	return cfg, nil
 }
 
 // ExecKubectl replaces the current process with kubectl.

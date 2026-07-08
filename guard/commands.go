@@ -1,8 +1,15 @@
 package guard
 
-import "strings"
+import (
+	"bytes"
+	"os"
+	"strings"
 
-// safeCommands are read-only commands that don't modify cluster state.
+	"gopkg.in/yaml.v3"
+)
+
+// safeCommands are read-only top-level commands that don't modify cluster
+// state and have no subcommand nuance.
 var safeCommands = map[string]bool{
 	"get":           true,
 	"describe":      true,
@@ -13,13 +20,12 @@ var safeCommands = map[string]bool{
 	"api-versions":  true,
 	"version":       true,
 	"cluster-info":  true,
-	"config":        true,
-	"auth":          true,
 	"wait":          true,
 	"diff":          true,
 }
 
-// stateAlteringCommands modify cluster state and require confirmation.
+// stateAlteringCommands modify cluster state and require confirmation on
+// protected contexts.
 var stateAlteringCommands = map[string]bool{
 	"apply":     true,
 	"create":    true,
@@ -28,7 +34,6 @@ var stateAlteringCommands = map[string]bool{
 	"replace":   true,
 	"edit":      true,
 	"scale":     true,
-	"rollout":   true,
 	"autoscale": true,
 	"expose":    true,
 	"run":       true,
@@ -45,10 +50,18 @@ var stateAlteringCommands = map[string]bool{
 	"attach":    true,
 }
 
-// safeRolloutSubcommands are rollout subcommands that don't modify state.
-var safeRolloutSubcommands = map[string]bool{
-	"status":  true,
-	"history": true,
+// safeSubcommands maps a command to the subset of its subcommands that are
+// read-only. Any other subcommand of these commands is treated as
+// state-altering. A bare invocation (no subcommand) only prints help and is
+// treated as safe.
+//
+// Notably this makes kubectl "config use-context" and "auth reconcile"
+// state-altering, while keeping "config view"/"config get-contexts" and
+// "auth can-i" read-only.
+var safeSubcommands = map[string]map[string]bool{
+	"rollout": {"status": true, "history": true},
+	"config":  {"view": true, "get-contexts": true, "current-context": true},
+	"auth":    {"can-i": true, "whoami": true},
 }
 
 // knownShortFlags are kubectl flags that take a value.
@@ -57,49 +70,93 @@ var knownShortFlags = map[string]bool{
 	"-s": true, "-p": true, "-k": true, "-R": true,
 }
 
-// knownLongFlags are kubectl long flags that take a separate value (not --flag=value style).
+// knownLongFlags are kubectl long flags that take a separate value
+// (not --flag=value style).
 var knownLongFlags = map[string]bool{
 	"--context": true, "--namespace": true, "--selector": true,
 	"--filename": true, "--output": true, "--container": true,
 	"--kubeconfig": true, "--cluster": true, "--user": true,
 }
 
-// ExtractCommand extracts the kubectl command from args, ignoring flags.
-// Returns the command name and any subcommand.
-func ExtractCommand(args []string) (cmd string, subCmd string) {
+// ProtectedResourceChecker is satisfied by *config.Config; kept as an interface
+// so command classification stays testable without shelling out.
+type ProtectedResourceChecker interface {
+	IsResourceProtected(candidate string) bool
+}
+
+// PositionalArgs returns the non-flag arguments, skipping values consumed by
+// value-taking flags, and stopping at the "--" separator. It is the basis for
+// command, subcommand, and resource extraction.
+func PositionalArgs(args []string) []string {
+	var pos []string
 	skipNext := false
 	for _, arg := range args {
 		if skipNext {
 			skipNext = false
 			continue
 		}
-
-		// Skip long flags (--flag or --flag=value)
+		if arg == "--" {
+			break
+		}
 		if strings.HasPrefix(arg, "--") {
-			// If it doesn't contain = and is a known flag that takes a value, skip next arg
 			if !strings.Contains(arg, "=") && knownLongFlags[arg] {
 				skipNext = true
 			}
 			continue
 		}
-
-		// Skip short flags
 		if strings.HasPrefix(arg, "-") {
-			// Check if this flag takes a value
 			if knownShortFlags[arg] {
 				skipNext = true
 			}
 			continue
 		}
+		pos = append(pos, arg)
+	}
+	return pos
+}
 
-		if cmd == "" {
-			cmd = arg
-		} else {
-			subCmd = arg
-			break
-		}
+// ExtractCommand extracts the kubectl command and its first subcommand from
+// args, ignoring flags.
+func ExtractCommand(args []string) (cmd string, subCmd string) {
+	pos := PositionalArgs(args)
+	if len(pos) >= 1 {
+		cmd = pos[0]
+	}
+	if len(pos) >= 2 {
+		subCmd = pos[1]
 	}
 	return
+}
+
+// ExtractResourceCandidates returns the positional arguments after the verb.
+// Any of these may be a resource type or "type/name" token (e.g. for
+// "get secret x", "delete pod nginx", "create secret generic y").
+func ExtractResourceCandidates(args []string) []string {
+	pos := PositionalArgs(args)
+	if len(pos) <= 1 {
+		return nil
+	}
+	return pos[1:]
+}
+
+// ExtractFilenames returns the paths supplied via -f / --filename (in any of
+// the forms -f x, --filename x, --filename=x). Directories and URLs are
+// returned as-is; callers stat them before reading.
+func ExtractFilenames(args []string) []string {
+	var files []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-f" || arg == "--filename":
+			if i+1 < len(args) {
+				files = append(files, args[i+1])
+				i++
+			}
+		case strings.HasPrefix(arg, "--filename="):
+			files = append(files, strings.TrimPrefix(arg, "--filename="))
+		}
+	}
+	return files
 }
 
 // IsSafeCommand returns true if the command is read-only.
@@ -113,9 +170,11 @@ func IsSafeCommand(args []string) bool {
 		return true
 	}
 
-	// Special case: rollout status/history are safe
-	if cmd == "rollout" && safeRolloutSubcommands[subCmd] {
-		return true
+	if subs, ok := safeSubcommands[cmd]; ok {
+		if subCmd == "" {
+			return true // bare command prints help
+		}
+		return subs[subCmd]
 	}
 
 	return safeCommands[cmd]
@@ -132,9 +191,12 @@ func IsStateAltering(args []string) bool {
 		return false
 	}
 
-	// Special case: rollout status/history are safe
-	if cmd == "rollout" && safeRolloutSubcommands[subCmd] {
-		return false
+	if subs, ok := safeSubcommands[cmd]; ok {
+		if subCmd == "" {
+			return false // bare command prints help
+		}
+		_, safe := subs[subCmd]
+		return !safe
 	}
 
 	return stateAlteringCommands[cmd]
@@ -147,4 +209,48 @@ func GetCommandDescription(args []string) string {
 		return cmd + " " + subCmd
 	}
 	return cmd
+}
+
+// MatchesProtectedResource reports whether args target a protected resource,
+// either via an explicit resource token on the command line or via a -f file
+// whose kind is protected.
+func MatchesProtectedResource(cfg ProtectedResourceChecker, args []string) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, cand := range ExtractResourceCandidates(args) {
+		if cfg.IsResourceProtected(cand) {
+			return true
+		}
+	}
+	for _, f := range ExtractFilenames(args) {
+		if fileContainsProtectedKind(f, cfg) {
+			return true
+		}
+	}
+	return false
+}
+
+// fileContainsProtectedKind reports whether the given file is a regular
+// YAML/JSON manifest (possibly multi-document) whose kind is protected.
+func fileContainsProtectedKind(path string, cfg ProtectedResourceChecker) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, doc := range bytes.Split(data, []byte("\n---")) {
+		var meta struct {
+			Kind string `yaml:"kind"`
+		}
+		if yaml.Unmarshal(doc, &meta) == nil && meta.Kind != "" {
+			if cfg.IsResourceProtected(meta.Kind) {
+				return true
+			}
+		}
+	}
+	return false
 }

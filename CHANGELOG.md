@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/lockhinator/kubectl-guard/compare/v0.1.1...v0.2.0) (2026-07-08)
+
+
+### Features
+
+* comprehensive audit logging + AI-agent positioning ([#6](https://github.com/lockhinator/kubectl-guard/issues/6)) ([d618184](https://github.com/lockhinator/kubectl-guard/commit/d618184df3ceb0ff03a879426e0d0a582d1be202))
+
 ## [0.1.1](https://github.com/lockhinator/kubectl-guard/compare/v0.1.0...v0.1.1) (2026-07-08)
 
 

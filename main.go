@@ -29,6 +29,8 @@ var guardConfigSubcommands = map[string]bool{
 	"remove-context":  true,
 	"add-resource":    true,
 	"remove-resource": true,
+	"add-namespace":   true,
+	"remove-namespace": true,
 	"confirm-mode":    true,
 	"audit-mode":     true,
 	"audit":           true,
@@ -301,11 +303,23 @@ func runGuard(args []string) error {
 		}
 
 		cmdDesc := guard.GetCommandDescription(forwarded)
-		message := fmt.Sprintf("%s on protected context: %s", cmdDesc, ctx)
+		// Describe what is protected so the user knows why they're confirming.
+		// Namespace protection (#19) may trigger gating even on an unprotected
+		// context, so the message reflects whichever applies.
+		reason := "protected context"
+		target := ctx
+		if parsed.AllNamespaces {
+			reason = "protected namespace"
+			target = "all namespaces"
+		} else if parsed.HasNamespace && parsed.Namespace != "" {
+			reason = "protected namespace"
+			target = parsed.Namespace
+		}
+		message := fmt.Sprintf("%s on %s: %s", cmdDesc, reason, target)
 
 		confirmed := false
 		if cfg != nil && cfg.ConfirmMode == config.ConfirmModeTypeName {
-			confirmed = ui.ConfirmWithName(message, ctx)
+			confirmed = ui.ConfirmWithName(message, target)
 		} else {
 			confirmed = ui.Confirm(message)
 		}
@@ -374,6 +388,9 @@ func runConfigCommand() error {
 			if len(cfg.ProtectedResources) > 0 {
 				ui.PrintInfo("Protected resources: " + strings.Join(cfg.ProtectedResources, ", "))
 			}
+			if len(cfg.ProtectedNamespaces) > 0 {
+				ui.PrintInfo("Protected namespaces: " + strings.Join(cfg.ProtectedNamespaces, ", "))
+			}
 			ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 			return nil
 		},
@@ -411,6 +428,8 @@ func runConfigCommand() error {
 	addCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true)
 	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false)
 	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false)
+	addCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*)", (*config.Config).AddNamespace, "Protected namespace: %s", "Namespace already protected: %s", false)
+	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "confirm-mode [simple|type-name]",
@@ -560,6 +579,15 @@ func printConfig() error {
 	} else {
 		for _, r := range cfg.ProtectedResources {
 			fmt.Printf("  - %s\n", r)
+		}
+	}
+
+	ui.PrintInfo("Protected namespaces:")
+	if len(cfg.ProtectedNamespaces) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		for _, ns := range cfg.ProtectedNamespaces {
+			fmt.Printf("  - %s\n", ns)
 		}
 	}
 

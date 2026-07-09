@@ -125,30 +125,53 @@ func checkWith(args []string, current CurrentContextFunc) (Result, string, *conf
 		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts are configured (use --context instead)")
 	}
 
-	// If we cannot resolve the context, we cannot confirm it is unprotected.
-	// When protected contexts exist, fail closed; otherwise there is nothing
-	// to enforce beyond resources.
-	if ctxErr != nil || ctx == "" {
-		if len(cfg.ProtectedContexts) > 0 {
-			if ctxErr != nil {
-				return Deny, "", cfg, fmt.Errorf("cannot resolve current context: %w", ctxErr)
-			}
-			return Deny, "", cfg, fmt.Errorf("cannot resolve current context")
+	// Context protection. If we cannot resolve the context while protected
+	// contexts are configured, fail closed (we can't confirm it's unprotected).
+	contextProtected := false
+	if ctx != "" && cfg.IsContextProtected(ctx) {
+		contextProtected = true
+	} else if (ctxErr != nil || ctx == "") && len(cfg.ProtectedContexts) > 0 {
+		if ctxErr != nil {
+			return Deny, "", cfg, fmt.Errorf("cannot resolve current context: %w", ctxErr)
 		}
-		return Allow, "", cfg, nil
+		return Deny, "", cfg, fmt.Errorf("cannot resolve current context")
 	}
 
-	if cfg.IsContextProtected(ctx) {
-		// Optional policy: deny any impersonation (--as*) on a protected context.
-		if cfg.BlockImpersonation && p.HasImpersonation() {
-			return Deny, ctx, cfg, fmt.Errorf("impersonation (--as) is blocked on protected context %q", ctx)
-		}
-		if IsStateAltering(args) {
-			return RequireConfirmation, ctx, cfg, nil
-		}
+	// Namespace protection is independent of context resolution: the target
+	// namespace comes from --namespace/-n (or kubectl's "default"), and
+	// --all-namespaces/-A spans every namespace, so it is gated when any
+	// namespace is protected (like "get all" spans resources).
+	namespaceProtected := namespaceTargetProtected(cfg, p)
+
+	// Optional policy: deny any impersonation (--as*) on a protected context.
+	if contextProtected && cfg.BlockImpersonation && p.HasImpersonation() {
+		return Deny, ctx, cfg, fmt.Errorf("impersonation (--as) is blocked on protected context %q", ctx)
+	}
+
+	if (contextProtected || namespaceProtected) && IsStateAltering(args) {
+		return RequireConfirmation, ctx, cfg, nil
 	}
 
 	return Allow, ctx, cfg, nil
+}
+
+// namespaceTargetProtected reports whether the command targets a protected
+// namespace. --all-namespaces/-A spans every namespace, so it is treated as
+// protected whenever any namespace pattern is configured; otherwise the
+// resolved namespace (--namespace/-n, or "default") is matched against the
+// configured patterns.
+func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs) bool {
+	if p.AllNamespaces && cfg.HasProtectedNamespaces() {
+		return true
+	}
+	return cfg.IsNamespaceProtected(p.ResolvedNamespace())
+}
+
+// namespaceChecker is satisfied by *config.Config; kept as an interface so the
+// guard decision logic stays testable without a real config file.
+type namespaceChecker interface {
+	HasProtectedNamespaces() bool
+	IsNamespaceProtected(namespace string) bool
 }
 
 // ExecKubectl replaces the current process with the REAL kubectl. It resolves

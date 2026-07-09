@@ -78,7 +78,7 @@ var shortTakesValue = map[byte]bool{
 // (not --flag=value style). --context/--kubeconfig/--filename/--kustomize are
 // handled explicitly in ParseArgs and intentionally omitted here.
 var knownLongFlags = map[string]bool{
-	"--namespace": true, "--selector": true,
+	"--selector": true,
 	"--output": true, "--container": true,
 	"--cluster": true, "--user": true,
 }
@@ -114,12 +114,30 @@ type ParsedArgs struct {
 	HasAs     bool     // any --as / --as-group / --as-uid present
 	Token     string   // --token
 	HasToken  bool
+
+	// Namespace targeting. --namespace/-n sets an explicit namespace;
+	// --all-namespaces/-A spans every namespace (gated when any namespace is
+	// protected, like "get all" spans resources).
+	Namespace     string
+	HasNamespace  bool
+	AllNamespaces bool
 }
 
 // HasImpersonation reports whether any --as / --as-group / --as-uid flag is
 // set, i.e. the command impersonates another identity.
 func (p ParsedArgs) HasImpersonation() bool {
 	return p.HasAs
+}
+
+// ResolvedNamespace returns the namespace a command targets, for protection
+// decisions. An explicit --namespace/-n wins; otherwise kubectl's default
+// ("default") is assumed. (Resolving the namespace baked into a context would
+// require parsing kubeconfig and is not done here.)
+func (p ParsedArgs) ResolvedNamespace() string {
+	if p.HasNamespace && p.Namespace != "" {
+		return p.Namespace
+	}
+	return "default"
 }
 
 // ResourceCandidates returns the positional arguments after the verb. Any may
@@ -215,6 +233,18 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 				return true
 			}
 			return false
+		case c == 'n':
+			// -n / --namespace sets the target namespace.
+			p.HasNamespace = true
+			if len(shorthands) > 1 {
+				p.Namespace = strings.TrimPrefix(shorthands[1:], "=")
+				return false
+			}
+			if len(rest) > 0 {
+				p.Namespace = rest[0]
+				return true
+			}
+			return false
 		case shortTakesValue[c]:
 			// consumes the rest of the token, or the next argument.
 			if len(shorthands) > 1 {
@@ -222,7 +252,10 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 			}
 			return len(rest) > 0
 		default:
-			// boolean short flag (e.g. -R); keep walking.
+			// boolean short flag. -A / --all-namespaces spans every namespace.
+			if c == 'A' {
+				p.AllNamespaces = true
+			}
 			shorthands = shorthands[1:]
 		}
 	}
@@ -323,6 +356,16 @@ func ParseArgs(args []string) ParsedArgs {
 					p.Token = args[i+1]
 					skipNext = true
 				}
+			case "--namespace":
+				p.HasNamespace = true
+				if hasInline {
+					p.Namespace = val
+				} else if i+1 < len(args) {
+					p.Namespace = args[i+1]
+					skipNext = true
+				}
+			case "--all-namespaces":
+				p.AllNamespaces = true
 			default:
 				// Other long flag: skip its value if it's a known value-taker.
 				if !hasInline && knownLongFlags[arg] {

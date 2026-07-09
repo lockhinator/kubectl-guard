@@ -15,6 +15,15 @@ const (
 	ConfirmModeTypeName = "type-name" // must type the context name exactly
 )
 
+// Protection modes for protected contexts/namespaces. "confirm" (default)
+// prompts; "block" hard-refuses state-altering commands with no prompt.
+const (
+	ContextModeConfirm   = "confirm"
+	ContextModeBlock     = "block"
+	NamespaceModeConfirm = "confirm"
+	NamespaceModeBlock   = "block"
+)
+
 // Audit modes control what gets written to the audit log.
 const (
 	AuditModeAll   = "all"   // log every command, including allowed passthrough (default)
@@ -37,6 +46,18 @@ type Config struct {
 	// blocked entirely on every context, regardless of verb. Singular, plural,
 	// and short-name forms ("secret", "secrets", "cm") match the same things.
 	ProtectedResources []string `yaml:"protected_resources,omitempty"`
+
+	// ProtectedNamespaces are namespace name patterns (glob) that gate
+	// state-altering commands when the target namespace matches. Composes with
+	// protected contexts: a command is gated if either matches.
+	ProtectedNamespaces []string `yaml:"protected_namespaces,omitempty"`
+
+	// ContextMode controls how protected contexts treat state-altering
+	// commands: "confirm" (default) prompts; "block" hard-refuses.
+	ContextMode string `yaml:"context_mode,omitempty"`
+
+	// NamespaceMode is the equivalent of ContextMode for protected namespaces.
+	NamespaceMode string `yaml:"namespace_mode,omitempty"`
 
 	// ConfirmMode controls the confirmation prompt for protected contexts.
 	// "simple" (default) is a y/N prompt; "type-name" requires the user to
@@ -69,6 +90,12 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.AuditMode == "" {
 		c.AuditMode = AuditModeAll
+	}
+	if c.ContextMode == "" {
+		c.ContextMode = ContextModeConfirm
+	}
+	if c.NamespaceMode == "" {
+		c.NamespaceMode = NamespaceModeConfirm
 	}
 }
 
@@ -219,6 +246,63 @@ func (c *Config) RemoveContext(context string) bool {
 			c.ProtectedContexts = append(c.ProtectedContexts[:i], c.ProtectedContexts[i+1:]...)
 			return true
 		}
+	}
+	return false
+}
+
+// HasProtectedNamespaces reports whether any namespace protection is configured.
+func (c *Config) HasProtectedNamespaces() bool {
+	return len(c.ProtectedNamespaces) > 0
+}
+
+// IsNamespaceProtected checks if a namespace matches any protected pattern.
+func (c *Config) IsNamespaceProtected(namespace string) bool {
+	for _, pattern := range c.ProtectedNamespaces {
+		if matched, _ := filepath.Match(pattern, namespace); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// AddNamespace adds a namespace pattern to the protected list if not present.
+func (c *Config) AddNamespace(namespace string) bool {
+	for _, ns := range c.ProtectedNamespaces {
+		if ns == namespace {
+			return false
+		}
+	}
+	c.ProtectedNamespaces = append(c.ProtectedNamespaces, namespace)
+	return true
+}
+
+// RemoveNamespace removes a namespace pattern from the protected list.
+func (c *Config) RemoveNamespace(namespace string) bool {
+	for i, ns := range c.ProtectedNamespaces {
+		if ns == namespace {
+			c.ProtectedNamespaces = append(c.ProtectedNamespaces[:i], c.ProtectedNamespaces[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// SetContextMode sets the context protection mode if valid.
+func (c *Config) SetContextMode(mode string) bool {
+	switch mode {
+	case ContextModeConfirm, ContextModeBlock:
+		c.ContextMode = mode
+		return true
+	}
+	return false
+}
+
+// SetNamespaceMode sets the namespace protection mode if valid.
+func (c *Config) SetNamespaceMode(mode string) bool {
+	switch mode {
+	case NamespaceModeConfirm, NamespaceModeBlock:
+		c.NamespaceMode = mode
+		return true
 	}
 	return false
 }

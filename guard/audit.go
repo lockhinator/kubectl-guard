@@ -18,14 +18,14 @@ const ActorEnvVar = "KUBECTL_GUARD_ACTOR"
 
 // Outcome constants for audit entries.
 const (
-	OutcomeAllowed        = "allowed"        // command passed through ungated
-	OutcomeConfirmed      = "confirmed"      // gated command, user confirmed
-	OutcomeAborted        = "aborted"        // gated command, user declined
-	OutcomeBlocked        = "blocked"        // protected resource, refused
-	OutcomeDenied         = "denied"         // fail-closed (config/context error)
-	OutcomeAutoConfirmed  = "auto-confirmed" // gated command, auto-approved via --yes/KUBECTL_GUARD_CONFIRM (audited)
-	OutcomeBypassed       = "bypassed"       // guard fully bypassed via KUBECTL_GUARD_BYPASS (audited, discouraged)
-	OutcomeDryRun         = "dry-run"        // state-altering command allowed because --dry-run changes nothing
+	OutcomeAllowed       = "allowed"        // command passed through ungated
+	OutcomeConfirmed     = "confirmed"      // gated command, user confirmed
+	OutcomeAborted       = "aborted"        // gated command, user declined
+	OutcomeBlocked       = "blocked"        // protected resource, refused
+	OutcomeDenied        = "denied"         // fail-closed (config/context error)
+	OutcomeAutoConfirmed = "auto-confirmed" // gated command, auto-approved via --yes/KUBECTL_GUARD_CONFIRM (audited)
+	OutcomeBypassed      = "bypassed"       // guard fully bypassed via KUBECTL_GUARD_BYPASS (audited, discouraged)
+	OutcomeDryRun        = "dry-run"        // state-altering command allowed because --dry-run changes nothing
 )
 
 // AuditEntry is a single line in the audit log.
@@ -36,10 +36,10 @@ const (
 // blocked, or prompted for the command.
 type AuditEntry struct {
 	Time        string `json:"time"`
-	User        string `json:"user"`              // OS user (kept for attribution)
-	Actor       string `json:"actor,omitempty"`   // who drove it: claude-code, ci, human, etc.
+	User        string `json:"user"`                  // OS user (kept for attribution)
+	Actor       string `json:"actor,omitempty"`       // who drove it: claude-code, ci, human, etc.
 	Impersonate string `json:"impersonate,omitempty"` // --as user, when impersonation was used
-	Token       bool   `json:"token,omitempty"`       // true when --token overrode credentials
+	Token       bool   `json:"token,omitempty"`       // true when credentials were overridden via --token
 	Context     string `json:"context,omitempty"`
 	Command     string `json:"command"`
 	Outcome     string `json:"outcome"` // allowed | confirmed | aborted | blocked | denied

@@ -108,8 +108,9 @@ type ParsedArgs struct {
 
 	// Targeting & identity flags. --server points at a different API server
 	// (a different cluster) the guard cannot map to a context; --as* impersonate
-	// another identity; --token overrides credentials. Captured so the guard
-	// can fail closed on --server and attribute impersonation in the audit log.
+	// another identity; credentials can be overridden with --token. Captured so
+	// the guard can fail closed on --server and attribute impersonation in the
+	// audit log.
 	Server    string // --server / -s
 	HasServer bool
 	AsUser    string   // --as

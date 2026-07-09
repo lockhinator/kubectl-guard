@@ -4,7 +4,6 @@ package guard
 import (
 	"bufio"
 	"bytes"
-	"os/exec"
 	"strings"
 )
 
@@ -23,9 +22,14 @@ func GetCurrentContext() (string, error) {
 	return ResolveContext(nil)
 }
 
-// GetAllContexts returns all available kubectl contexts.
+// GetAllContexts returns all available kubectl contexts. It targets the REAL
+// kubectl (via RealKubectlPath) so a PATH-shadowing shim cannot make the guard
+// recurse into itself.
 func GetAllContexts() ([]KubectlContext, error) {
-	cmd := exec.Command("kubectl", "config", "get-contexts", "--no-headers")
+	cmd, err := kubectlCommand("config", "get-contexts", "--no-headers")
+	if err != nil {
+		return nil, err
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -82,13 +86,18 @@ func resolveContextWith(args []string, current CurrentContextFunc) (string, erro
 }
 
 // defaultCurrentContext shells out to `kubectl config current-context`,
-// honoring an explicit --kubeconfig path.
+// honoring an explicit --kubeconfig path. It targets the REAL kubectl so a
+// PATH-shadowing shim cannot make the guard recurse into itself.
 func defaultCurrentContext(kubeconfig string) (string, error) {
 	base := []string{"config", "current-context"}
 	if kubeconfig != "" {
 		base = append([]string{"--kubeconfig=" + kubeconfig}, base...)
 	}
-	out, err := exec.Command("kubectl", base...).Output()
+	cmd, err := kubectlCommand(base...)
+	if err != nil {
+		return "", err
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}

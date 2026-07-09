@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -65,16 +66,37 @@ func run() error {
 }
 
 func runGuard(args []string) error {
-	result, ctx, cfg, err := guard.Check(args)
-	cmdStr := strings.Join(args, " ")
+	// --json is a guard-only flag: parse and strip it before anything reaches
+	// kubectl or Check, so it is never forwarded to kubectl.
+	forwarded, jsonMode := guard.StripGuardFlags(args)
+
+	result, ctx, cfg, err := guard.Check(forwarded)
+	cmdStr := strings.Join(forwarded, " ")
+
+	// emitDecision writes the structured JSON decision object to stderr. Used
+	// only in --json mode for non-Allow results; for Allow nothing is emitted so
+	// kubectl's stdout stays clean for the agent.
+	emitDecision := func() {
+		jr := guard.JSONForResult(result, ctx, cmdStr, forwarded, err)
+		b, mErr := json.Marshal(jr)
+		if mErr != nil {
+			return
+		}
+		fmt.Fprintln(os.Stderr, string(b))
+	}
+
 	switch result {
 	case guard.Deny:
-		msg := "the guard cannot verify this command is safe"
-		if err != nil {
-			msg = err.Error()
+		if jsonMode {
+			emitDecision()
+		} else {
+			msg := "the guard cannot verify this command is safe"
+			if err != nil {
+				msg = err.Error()
+			}
+			ui.PrintWarning("Refusing to run: " + msg)
+			ui.PrintInfo("Fix the issue above, or run kubectl directly if you understand the risk.")
 		}
-		ui.PrintWarning("Refusing to run: " + msg)
-		ui.PrintInfo("Fix the issue above, or run kubectl directly if you understand the risk.")
 		// cfg is non-nil when context resolution failed but config loaded; log it.
 		if cfg != nil {
 			_ = guard.AppendAudit(cfg, guard.AuditEntry{
@@ -83,7 +105,7 @@ func runGuard(args []string) error {
 				Outcome: guard.OutcomeDenied,
 			})
 		}
-		os.Exit(1)
+		os.Exit(guard.ExitDenied)
 
 	case guard.SetupRequired:
 		contexts, err := guard.GetAllContexts()
@@ -100,10 +122,14 @@ func runGuard(args []string) error {
 		return nil
 
 	case guard.Blocked:
-		cmdDesc := guard.GetCommandDescription(args)
-		ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
-		if guard.HasUninspectableSource(args) {
-			ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+		if jsonMode {
+			emitDecision()
+		} else {
+			cmdDesc := guard.GetCommandDescription(forwarded)
+			ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
+			if guard.HasUninspectableSource(forwarded) {
+				ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+			}
 		}
 		_ = guard.AppendAudit(cfg, guard.AuditEntry{
 			Context: ctx,
@@ -111,10 +137,22 @@ func runGuard(args []string) error {
 			Outcome: guard.OutcomeBlocked,
 			Reason:  "protected-resource",
 		})
-		os.Exit(1)
+		os.Exit(guard.ExitBlocked)
 
 	case guard.RequireConfirmation:
-		cmdDesc := guard.GetCommandDescription(args)
+		if jsonMode {
+			// An agent framework cannot answer an interactive prompt; abort
+			// immediately with structured output instead of blocking on stdin.
+			emitDecision()
+			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+				Context: ctx,
+				Command: cmdStr,
+				Outcome: guard.OutcomeAborted,
+			})
+			os.Exit(guard.ExitNeedsConfirm)
+		}
+
+		cmdDesc := guard.GetCommandDescription(forwarded)
 		message := fmt.Sprintf("%s on protected context: %s", cmdDesc, ctx)
 
 		confirmed := false
@@ -130,7 +168,7 @@ func runGuard(args []string) error {
 				Command: cmdStr,
 				Outcome: guard.OutcomeConfirmed,
 			})
-			return guard.ExecKubectl(args)
+			return guard.ExecKubectl(forwarded)
 		}
 
 		_ = guard.AppendAudit(cfg, guard.AuditEntry{
@@ -139,7 +177,7 @@ func runGuard(args []string) error {
 			Outcome: guard.OutcomeAborted,
 		})
 		fmt.Fprintln(os.Stderr, "Aborted.")
-		os.Exit(1)
+		os.Exit(guard.ExitNeedsConfirm)
 
 	case guard.Allow:
 		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so
@@ -149,7 +187,7 @@ func runGuard(args []string) error {
 			Command: cmdStr,
 			Outcome: guard.OutcomeAllowed,
 		})
-		return guard.ExecKubectl(args)
+		return guard.ExecKubectl(forwarded)
 	}
 
 	return nil

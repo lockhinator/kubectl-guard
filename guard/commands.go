@@ -269,6 +269,34 @@ func ParseArgs(args []string) ParsedArgs {
 	return p
 }
 
+// StripGuardFlags removes guard-only flags from args and reports whether the
+// --json flag was requested. These flags belong to the guard, not kubectl, and
+// must never be forwarded. --json is recognized as "--json", "--json=true",
+// or "--json=false" and is only honored before the "--" separator (after it,
+// tokens are positional kubectl args such as exec payloads).
+func StripGuardFlags(args []string) (filtered []string, jsonMode bool) {
+	seenSep := false
+	for _, a := range args {
+		if a == "--" {
+			seenSep = true
+			filtered = append(filtered, a)
+			continue
+		}
+		if !seenSep {
+			switch a {
+			case "--json", "--json=true":
+				jsonMode = true
+				continue
+			case "--json=false":
+				jsonMode = false
+				continue
+			}
+		}
+		filtered = append(filtered, a)
+	}
+	return filtered, jsonMode
+}
+
 // PositionalArgs returns the non-flag arguments before "--". Thin wrapper over
 // ParseArgs kept for callers/tests.
 func PositionalArgs(args []string) []string {

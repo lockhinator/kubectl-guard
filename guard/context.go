@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"strings"
+	"sync"
 )
 
 // KubectlContext represents a kubectl context.
@@ -116,12 +117,51 @@ type NamespaceForContextFunc func(kubeconfig, context string) (string, error)
 // kubectl subprocess is spawned during unit tests that don't opt in.
 func noContextNamespace(_, _ string) (string, error) { return "", nil }
 
-// defaultContextNamespace reads the namespace baked into a context via
+// ctxNamespaceMemo caches context-namespace lookups for the lifetime of the
+// process. A kubectl invocation resolves at most one (kubeconfig, context)
+// pair, but the decision path and the message path both look it up; memoizing
+// makes the second lookup a cache hit instead of a second `kubectl config view`
+// subprocess, and — more importantly — guarantees the message names the same
+// namespace the gating decision used (they cannot disagree). The kubeconfig
+// cannot change within a single short-lived CLI invocation, so caching is
+// always correct here; a fresh process starts with an empty cache.
+var (
+	ctxNamespaceMu   sync.Mutex
+	ctxNamespaceMemo = map[string]ctxNamespaceResult{}
+)
+
+type ctxNamespaceResult struct {
+	ns  string
+	err error
+}
+
+// defaultContextNamespace is the memoized entry point used as the production
+// NamespaceForContextFunc. It reads through ctxNamespaceMemo so repeated
+// lookups of the same context within one invocation share a single subprocess
+// and a single result (including a single error outcome).
+func defaultContextNamespace(kubeconfig, context string) (string, error) {
+	key := kubeconfig + "\x00" + context
+	ctxNamespaceMu.Lock()
+	if r, ok := ctxNamespaceMemo[key]; ok {
+		ctxNamespaceMu.Unlock()
+		return r.ns, r.err
+	}
+	ctxNamespaceMu.Unlock()
+
+	ns, err := lookupContextNamespace(kubeconfig, context)
+
+	ctxNamespaceMu.Lock()
+	ctxNamespaceMemo[key] = ctxNamespaceResult{ns: ns, err: err}
+	ctxNamespaceMu.Unlock()
+	return ns, err
+}
+
+// lookupContextNamespace reads the namespace baked into a context via
 // `kubectl config view --minify`, honoring an explicit --kubeconfig/--context.
 // It targets the REAL kubectl so a PATH-shadowing shim cannot make the guard
 // recurse into itself. An empty result means the context sets no namespace
 // (kubectl then defaults to "default").
-func defaultContextNamespace(kubeconfig, context string) (string, error) {
+func lookupContextNamespace(kubeconfig, context string) (string, error) {
 	var args []string
 	if kubeconfig != "" {
 		args = append(args, "--kubeconfig="+kubeconfig)

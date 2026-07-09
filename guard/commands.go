@@ -297,6 +297,34 @@ func StripGuardFlags(args []string) (filtered []string, jsonMode bool) {
 	return filtered, jsonMode
 }
 
+// StripNoPrompt removes the guard-only --no-prompt flag from args and reports
+// whether headless/no-prompt mode was requested. Like --json, it belongs to the
+// guard and must never be forwarded to kubectl. Recognized as "--no-prompt",
+// "--no-prompt=true", or "--no-prompt=false", and only before the "--"
+// separator (after it, tokens are positional kubectl args).
+func StripNoPrompt(args []string) (filtered []string, noPrompt bool) {
+	seenSep := false
+	for _, a := range args {
+		if a == "--" {
+			seenSep = true
+			filtered = append(filtered, a)
+			continue
+		}
+		if !seenSep {
+			switch a {
+			case "--no-prompt", "--no-prompt=true":
+				noPrompt = true
+				continue
+			case "--no-prompt=false":
+				noPrompt = false
+				continue
+			}
+		}
+		filtered = append(filtered, a)
+	}
+	return filtered, noPrompt
+}
+
 // PositionalArgs returns the non-flag arguments before "--". Thin wrapper over
 // ParseArgs kept for callers/tests.
 func PositionalArgs(args []string) []string {

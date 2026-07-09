@@ -21,6 +21,7 @@ var version = "dev"
 // command and must be forwarded through the guard rather than intercepted.
 var guardConfigSubcommands = map[string]bool{
 	"setup":           true,
+	"init":            true,
 	"list":            true,
 	"add":             true,
 	"remove":          true,
@@ -107,10 +108,25 @@ func orUnknown(s string) string {
 	return s
 }
 
+// boolEnv reports whether the env var is set to a truthy value (1, t, true,
+// yes, y, case-insensitive). Empty/unset is false.
+func boolEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "t", "true", "yes", "y":
+		return true
+	}
+	return false
+}
+
 func runGuard(args []string) error {
 	// --json is a guard-only flag: parse and strip it before anything reaches
 	// kubectl or Check, so it is never forwarded to kubectl.
 	forwarded, jsonMode := guard.StripGuardFlags(args)
+	// --no-prompt is also guard-only (headless bootstrap); strip it too.
+	forwarded, noPrompt := guard.StripNoPrompt(forwarded)
+	if !noPrompt {
+		noPrompt = boolEnv(config.EnvNoPrompt)
+	}
 
 	result, ctx, cfg, err := guard.Check(forwarded)
 	cmdStr := strings.Join(forwarded, " ")
@@ -150,6 +166,30 @@ func runGuard(args []string) error {
 		os.Exit(guard.ExitDenied)
 
 	case guard.SetupRequired:
+		// Headless / non-interactive bootstrap: prefer env-var config, then
+		// --no-prompt, before falling back to the interactive wizard. This lets
+		// agents and CI configure the guard without a TTY.
+		if envCfg, ok := config.InitFromEnv(); ok {
+			if err := config.Save(envCfg); err != nil {
+				ui.PrintWarning("Failed to save config from environment: " + err.Error())
+				return nil
+			}
+			if p, perr := config.Path(); perr == nil {
+				ui.PrintInfo("Wrote initial config from KUBECTL_GUARD_* env vars: " + p)
+			}
+			// Proceed to run the command against the freshly written config.
+			return runGuard(args)
+		}
+		if noPrompt {
+			empty := &config.Config{}
+			empty.ApplyDefaults()
+			if err := config.Save(empty); err != nil {
+				ui.PrintWarning("Failed to save config: " + err.Error())
+				return nil
+			}
+			ui.PrintWarning("--no-prompt set with no env config: wrote an empty config (no protection) and proceeding.")
+			return runGuard(args)
+		}
 		contexts, err := guard.GetAllContexts()
 		if err != nil {
 			ui.PrintWarning("Could not get kubectl contexts: " + err.Error())
@@ -257,6 +297,38 @@ func runConfigCommand() error {
 			return nil
 		},
 	})
+
+	initCmd := &cobra.Command{
+		Use:   "init",
+		Short: "Write a config non-interactively (headless / CI / agents)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			contexts, _ := cmd.Flags().GetString("protected-contexts")
+			resources, _ := cmd.Flags().GetString("protected-resources")
+			confirm, _ := cmd.Flags().GetString("confirm-mode")
+			cfg := config.InitFromFlags(contexts, resources, confirm)
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			path, err := config.Path()
+			if err != nil {
+				return err
+			}
+			ui.PrintSuccess("Wrote config: " + path)
+			if len(cfg.ProtectedContexts) > 0 {
+				ui.PrintInfo("Protected contexts: " + strings.Join(cfg.ProtectedContexts, ", "))
+			}
+			if len(cfg.ProtectedResources) > 0 {
+				ui.PrintInfo("Protected resources: " + strings.Join(cfg.ProtectedResources, ", "))
+			}
+			ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
+			return nil
+		},
+	}
+	initCmd.Flags().String("protected-contexts", "", "comma-separated context patterns to protect (e.g. 'prod-*,prod-cluster')")
+	initCmd.Flags().String("protected-resources", "", "comma-separated resources to block on every context (e.g. 'secret')")
+	initCmd.Flags().String("confirm-mode", "", "confirmation mode for protected contexts (simple|type-name)")
+	rootCmd.AddCommand(initCmd)
+
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "list",

@@ -116,6 +116,31 @@ Select contexts to protect (space to toggle, enter to confirm):
 ✓ Saved to ~/.kubectl-guard.yaml
 ```
 
+##### Headless / non-interactive setup (CI, agents, no TTY)
+
+The wizard requires a TTY, so in a headless context (CI, a container, an agent
+subprocess) it cancels and the command doesn't run. Bootstrap the guard
+without a prompt using either **environment variables** or `config init`:
+
+```bash
+# Option 1: env vars (take effect on first run when no config exists)
+export KUBECTL_GUARD_PROTECTED_CONTEXTS=prod-*,prod-cluster
+export KUBECTL_GUARD_PROTECTED_RESOURCES=secret
+export KUBECTL_GUARD_CONFIRM_MODE=type-name   # optional: simple|type-name
+
+# Option 2: write the config in one shot
+kubectl-guard config init \
+  --protected-contexts 'prod-*,prod-cluster' \
+  --protected-resources secret \
+  --confirm-mode type-name
+```
+
+If no config exists and you just want the guard to get out of the way
+deterministically (e.g. a CI step that hasn't been configured yet), pass
+`--no-prompt` or set `KUBECTL_GUARD_NO_PROMPT=yes`: the guard writes an empty
+config (no protection) and proceeds with a stderr warning. A headless
+`bash -c 'kubectl-guard get pods'` will not hang or fail.
+
 ## Using kubectl-guard with AI agents
 
 The agent-safe setup is two commands:
@@ -273,6 +298,7 @@ kubectl-guard config confirm-mode type-name  # Stronger confirmation prompt
 kubectl-guard config audit-mode all          # Log every command (default)
 kubectl-guard config audit                # Show audit log path + recent entries
 kubectl-guard config setup                # Re-run setup wizard
+kubectl-guard config init                 # Write config non-interactively (headless)
 kubectl-guard config path                 # Print config file path
 ```
 

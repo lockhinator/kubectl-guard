@@ -102,6 +102,86 @@ func TestAppendAuditStampsTimeAndUser(t *testing.T) {
 	}
 }
 
+// lastAuditEntry reads and unmarshals the final JSON line of the audit log at
+// path. It fails the test if the log is empty or malformed.
+func lastAuditEntry(t *testing.T, path string) AuditEntry {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatal("no audit entries")
+	}
+	var entry AuditEntry
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &entry); err != nil {
+		t.Fatal(err)
+	}
+	return entry
+}
+
+func TestAppendAuditActorFromEnv(t *testing.T) {
+	path := withTempAuditHome(t)
+	t.Setenv(ActorEnvVar, "claude-code")
+	cfg := &config.Config{AuditMode: config.AuditModeAll}
+	if err := AppendAudit(cfg, AuditEntry{Command: "get secret", Outcome: OutcomeBlocked}); err != nil {
+		t.Fatal(err)
+	}
+	entry := lastAuditEntry(t, path)
+	if entry.Actor != "claude-code" {
+		t.Errorf("actor = %q, want %q", entry.Actor, "claude-code")
+	}
+	// The OS user must still be recorded alongside the actor.
+	if entry.User == "" {
+		t.Error("user field should be populated even when actor is set")
+	}
+}
+
+func TestAppendAuditActorFallback(t *testing.T) {
+	path := withTempAuditHome(t)
+	// Explicitly clear the env var so the fallback path is exercised even if
+	// the surrounding environment happens to set it.
+	t.Setenv(ActorEnvVar, "")
+	cfg := &config.Config{AuditMode: config.AuditModeAll}
+	if err := AppendAudit(cfg, AuditEntry{Command: "get pods", Outcome: OutcomeAllowed}); err != nil {
+		t.Fatal(err)
+	}
+	entry := lastAuditEntry(t, path)
+	if entry.User == "" {
+		t.Fatal("user is empty; cannot validate actor fallback")
+	}
+	if entry.Actor != entry.User {
+		t.Errorf("actor = %q, want fallback to user %q", entry.Actor, entry.User)
+	}
+}
+
+func TestAppendAuditActorFromConfig(t *testing.T) {
+	path := withTempAuditHome(t)
+	t.Setenv(ActorEnvVar, "")
+	cfg := &config.Config{AuditMode: config.AuditModeAll, Actor: "ci-deploy"}
+	if err := AppendAudit(cfg, AuditEntry{Command: "apply -f deploy.yaml", Outcome: OutcomeConfirmed}); err != nil {
+		t.Fatal(err)
+	}
+	entry := lastAuditEntry(t, path)
+	if entry.Actor != "ci-deploy" {
+		t.Errorf("actor = %q, want %q (from config)", entry.Actor, "ci-deploy")
+	}
+}
+
+func TestAppendAuditActorEnvOverridesConfig(t *testing.T) {
+	path := withTempAuditHome(t)
+	t.Setenv(ActorEnvVar, "claude-code")
+	cfg := &config.Config{AuditMode: config.AuditModeAll, Actor: "ci-deploy"}
+	if err := AppendAudit(cfg, AuditEntry{Command: "get secret", Outcome: OutcomeBlocked}); err != nil {
+		t.Fatal(err)
+	}
+	entry := lastAuditEntry(t, path)
+	if entry.Actor != "claude-code" {
+		t.Errorf("actor = %q, env var must override config", entry.Actor)
+	}
+}
+
 func TestAppendAuditConcurrent(t *testing.T) {
 	path := withTempAuditHome(t)
 	cfg := &config.Config{AuditMode: config.AuditModeAll}

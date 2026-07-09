@@ -50,6 +50,11 @@ type Config struct {
 	// AuditMode controls what is written to the audit log: "all" (default,
 	// every command), "gated" (only interventions), or "off".
 	AuditMode string `yaml:"audit_mode,omitempty"`
+
+	// Actor is a static default identity for who drove a command (e.g.
+	// "ci-deploy"), stamped into audit entries when KUBECTL_GUARD_ACTOR is
+	// unset. Empty falls back to the OS username.
+	Actor string `yaml:"actor,omitempty"`
 }
 
 // ApplyDefaults fills in zero-value fields with sensible defaults.

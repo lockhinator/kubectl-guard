@@ -144,7 +144,7 @@ func Load() (*Config, error) {
 	return &cfg, nil
 }
 
-// Save writes the config to disk.
+// Save writes the config to disk atomically.
 func Save(cfg *Config) error {
 	path, err := Path()
 	if err != nil {
@@ -157,7 +157,28 @@ func Save(cfg *Config) error {
 	}
 
 	header := "# kubectl-guard configuration\n# Protect production contexts and sensitive resources from accidental commands\n\n"
-	return os.WriteFile(path, []byte(header+string(data)), 0600)
+	content := []byte(header + string(data))
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".kubectl-guard-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op if rename succeeded
+
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // IsContextProtected checks if a context matches any protected pattern.

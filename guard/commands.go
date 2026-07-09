@@ -174,6 +174,13 @@ type ParsedArgs struct {
 	// original args, or -1 if none was found before the "--" separator.
 	VerbIndex int
 
+	// PositionalsBeforeSep is how many of Positional appeared before the "--"
+	// separator. Everything at or past this index is a payload token (exec
+	// args, a shell command), not a kubectl resource token. Positional merges
+	// both, so this preserves the boundary for consumers that must distinguish
+	// them — e.g. an "/etc/hosts" in an exec payload is not an API path.
+	PositionalsBeforeSep int
+
 	// Targeting & identity flags. --server points at a different API server
 	// (a different cluster) the guard cannot map to a context; --as* impersonate
 	// another identity; credentials can be overridden with --token. Captured so
@@ -200,6 +207,14 @@ type ParsedArgs struct {
 	Namespace     string
 	HasNamespace  bool
 	AllNamespaces bool
+
+	// Raw is the value of --raw: a literal API-server path, e.g.
+	// "/api/v1/namespaces/default/secrets/db-creds". kubectl requests it
+	// verbatim, so no resource token ever appears in the command and resource
+	// protection has nothing to match against. Available on get/create/replace/
+	// delete, so --raw is a write vector as well as a read one.
+	Raw    string
+	HasRaw bool
 }
 
 // HasImpersonation reports whether any --as / --as-group / --as-uid flag is
@@ -407,8 +422,9 @@ func ParseArgs(args []string) ParsedArgs {
 			// exec args, etc.). Flags stop here, so a trailing "--context=dev"
 			// cannot spoof context resolution (S1); but resource tokens after
 			// "--" must still be matched (H4).
+			p.PositionalsBeforeSep = len(p.Positional)
 			p.Positional = append(p.Positional, args[i+1:]...)
-			break
+			return p
 		}
 		switch {
 		case strings.HasPrefix(arg, "--"):
@@ -505,6 +521,14 @@ func ParseArgs(args []string) ParsedArgs {
 				} else {
 					p.AllNamespaces = true
 				}
+			case "--raw":
+				p.HasRaw = true
+				if hasInline {
+					p.Raw = val
+				} else if i+1 < len(args) {
+					p.Raw = args[i+1]
+					skipNext = true
+				}
 			case "--dry-run":
 				p.HasDryRun = true
 				if hasInline {
@@ -530,6 +554,8 @@ func ParseArgs(args []string) ParsedArgs {
 			p.Positional = append(p.Positional, arg)
 		}
 	}
+	// No "--" separator: every positional is a kubectl token.
+	p.PositionalsBeforeSep = len(p.Positional)
 	return p
 }
 
@@ -768,22 +794,54 @@ func HasUninspectableSource(args []string) bool {
 	return ParseArgs(args).HasUninspectableSource()
 }
 
+// HasRawPath reports whether args carry a --raw API-server path, which the
+// guard cannot map to a resource type. Used to explain a Blocked decision.
+func HasRawPath(args []string) bool {
+	return ParseArgs(args).HasRaw
+}
+
 // MatchesProtectedResource reports whether args target a protected resource,
 // either via an explicit resource token, an inspectable -f file/dir whose kind
-// is protected, or an un-inspectable source (-f -, URL, -k) when resource
-// protection is active (we cannot prove it is safe, so we block).
+// is protected, an un-inspectable source (-f -, URL, -k), or a --raw API path —
+// the latter two when resource protection is active (we cannot prove they are
+// safe, so we block).
 func MatchesProtectedResource(cfg ProtectedResourceChecker, args []string) bool {
 	if cfg == nil || !cfg.HasProtectedResources() {
 		return false
 	}
 	p := ParseArgs(args)
-	for _, cand := range p.ResourceCandidates() {
+
+	// --raw requests a literal API-server path. The guard cannot map that path
+	// to a resource type, so with resource protection active it cannot prove the
+	// request is safe — e.g. `get --raw /api/v1/namespaces/default/secrets/db`
+	// reads a secret with no "secret" token anywhere in the command. Block, the
+	// same conservative stance taken for stdin/URL/kustomize sources. When no
+	// resource protection is configured, --raw is untouched (/healthz, /version).
+	if p.HasRaw {
+		return true
+	}
+
+	for i, cand := range p.ResourceCandidates() {
+		// ResourceCandidates is Positional[1:], so candidate i sits at
+		// Positional[i+1]. Tokens at or past the "--" separator are payload
+		// (exec args, a shell command line), not kubectl resource tokens.
+		isResourceToken := i+1 < p.PositionalsBeforeSep
+
 		// G5: kubectl accepts comma-separated resource lists like
 		// "secret,configmap"; match each part independently.
 		for _, part := range strings.Split(cand, ",") {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
+			}
+			// An API path in resource position (a leading "/") cannot be
+			// normalized to a resource type: NormalizeResource strips at the
+			// first "/" and returns "", which silently matches nothing. Treat it
+			// as un-inspectable rather than let it slip through as a non-match.
+			// Only applies before "--": "exec pod -- ls /tmp" is a payload path,
+			// not an API path, and must not be blocked.
+			if isResourceToken && strings.HasPrefix(part, "/") {
+				return true
 			}
 			// G7: "all" / "*" span every resource type, including protected
 			// ones, so they are blocked when any resource is protected.

@@ -146,6 +146,37 @@ func TestCheckContextProtection(t *testing.T) {
 		}
 	})
 
+	t.Run("uppercase state-altering verb on protected context requires confirmation", func(t *testing.T) {
+		// This is the security fix: DELETE must be treated the same as delete
+		result, _, _, err := checkWith([]string{"DELETE", "pod", "nginx"}, prod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result != RequireConfirmation {
+			t.Errorf("result = %v, want RequireConfirmation (uppercase verb bypass must be blocked)", result)
+		}
+	})
+
+	t.Run("uppercase APPLY on protected context requires confirmation", func(t *testing.T) {
+		result, _, _, err := checkWith([]string{"APPLY", "-f", "deployment.yaml"}, prod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result != RequireConfirmation {
+			t.Errorf("result = %v, want RequireConfirmation (uppercase verb bypass must be blocked)", result)
+		}
+	})
+
+	t.Run("uppercase safe command on protected context is allowed", func(t *testing.T) {
+		result, _, _, err := checkWith([]string{"GET", "pods"}, prod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result != Allow {
+			t.Errorf("result = %v, want Allow", result)
+		}
+	})
+
 	t.Run("state-altering command on unprotected context is allowed", func(t *testing.T) {
 		result, _, _, err := checkWith([]string{"delete", "pod", "nginx"}, dev)
 		if err != nil {

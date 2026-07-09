@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -78,8 +79,8 @@ var shortTakesValue = map[byte]bool{
 // (not --flag=value style). --context/--kubeconfig/--filename/--kustomize are
 // handled explicitly in ParseArgs and intentionally omitted here.
 var knownLongFlags = map[string]bool{
-	"--namespace": true, "--selector": true,
-	"--output": true, "--container": true,
+	"--selector": true,
+	"--output":   true, "--container": true,
 	"--cluster": true, "--user": true,
 }
 
@@ -101,6 +102,100 @@ type ParsedArgs struct {
 	Filenames       []string
 	Kustomize       string // value of -k / --kustomize
 	ExplicitContext bool
+	// VerbIndex is the index of the kubectl verb (first positional) in the
+	// original args, or -1 if none was found before the "--" separator.
+	VerbIndex int
+
+	// Targeting & identity flags. --server points at a different API server
+	// (a different cluster) the guard cannot map to a context; --as* impersonate
+	// another identity; credentials can be overridden with --token. Captured so
+	// the guard can fail closed on --server and attribute impersonation in the
+	// audit log.
+	Server    string // --server / -s
+	HasServer bool
+	AsUser    string   // --as
+	AsGroups  []string // --as-group (repeatable)
+	AsUID     string   // --as-uid
+	HasAs     bool     // any --as / --as-group / --as-uid present
+	Token     string   // --token
+	HasToken  bool
+
+	// DryRun captures --dry-run (client|server|none). A bare --dry-run is
+	// treated as client. State-altering commands in dry-run mode change no
+	// cluster state and skip context/namespace gating.
+	DryRun    string
+	HasDryRun bool
+
+	// Namespace targeting. --namespace/-n sets an explicit namespace;
+	// --all-namespaces/-A spans every namespace (gated when any namespace is
+	// protected, like "get all" spans resources).
+	Namespace     string
+	HasNamespace  bool
+	AllNamespaces bool
+}
+
+// HasImpersonation reports whether any --as / --as-group / --as-uid flag is
+// set, i.e. the command impersonates another identity.
+func (p ParsedArgs) HasImpersonation() bool {
+	return p.HasAs
+}
+
+// IsDryRun reports whether the command runs in dry-run mode, mirroring
+// kubectl's own --dry-run parsing (cmdutil.GetDryRunStrategy). Anything kubectl
+// treats as a real mutation must NOT be treated as a dry-run here, or the guard
+// would skip gating on a command that actually changes cluster state.
+//
+// kubectl parses the flag with strconv.ParseBool first: any boolean-false form
+// (false/f/F/0/False/FALSE/...) means DryRunNone -> a REAL mutation. Only
+// "client", "server", "unchanged" (bare --dry-run), and boolean-true forms are
+// genuine dry-runs. "none" and any invalid value gate normally (kubectl rejects
+// invalid values, so nothing runs anyway; failing closed is correct).
+func (p ParsedArgs) IsDryRun() bool {
+	if !p.HasDryRun {
+		return false
+	}
+	if b, err := strconv.ParseBool(p.DryRun); err == nil {
+		// true (client) is a dry-run; false is a real mutation.
+		return b
+	}
+	switch strings.ToLower(p.DryRun) {
+	case "client", "server", "unchanged":
+		return true
+	default: // "none" or an invalid value: gate normally.
+		return false
+	}
+}
+
+// ImpersonationString summarizes the impersonation identity (--as / --as-group
+// / --as-uid) for the audit log, or "" when none is set. It combines all three
+// so that group- or uid-only impersonation (e.g. --as-group=system:masters with
+// no --as) is still attributed, not silently dropped.
+func (p ParsedArgs) ImpersonationString() string {
+	if !p.HasAs {
+		return ""
+	}
+	var parts []string
+	if p.AsUser != "" {
+		parts = append(parts, p.AsUser)
+	}
+	for _, g := range p.AsGroups {
+		parts = append(parts, "group:"+g)
+	}
+	if p.AsUID != "" {
+		parts = append(parts, "uid:"+p.AsUID)
+	}
+	return strings.Join(parts, ",")
+}
+
+// ResolvedNamespace returns the namespace a command targets, for protection
+// decisions. An explicit --namespace/-n wins; otherwise kubectl's default
+// ("default") is assumed. (Resolving the namespace baked into a context would
+// require parsing kubeconfig and is not done here.)
+func (p ParsedArgs) ResolvedNamespace() string {
+	if p.HasNamespace && p.Namespace != "" {
+		return p.Namespace
+	}
+	return "default"
 }
 
 // ResourceCandidates returns the positional arguments after the verb. Any may
@@ -183,6 +278,31 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 				return true
 			}
 			return false
+		case c == 's':
+			// -s / --server points at a different API server; capture it so the
+			// guard can fail closed when context protection is configured.
+			p.HasServer = true
+			if len(shorthands) > 1 {
+				p.Server = strings.TrimPrefix(shorthands[1:], "=")
+				return false
+			}
+			if len(rest) > 0 {
+				p.Server = rest[0]
+				return true
+			}
+			return false
+		case c == 'n':
+			// -n / --namespace sets the target namespace.
+			p.HasNamespace = true
+			if len(shorthands) > 1 {
+				p.Namespace = strings.TrimPrefix(shorthands[1:], "=")
+				return false
+			}
+			if len(rest) > 0 {
+				p.Namespace = rest[0]
+				return true
+			}
+			return false
 		case shortTakesValue[c]:
 			// consumes the rest of the token, or the next argument.
 			if len(shorthands) > 1 {
@@ -190,7 +310,10 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 			}
 			return len(rest) > 0
 		default:
-			// boolean short flag (e.g. -R); keep walking.
+			// boolean short flag. -A / --all-namespaces spans every namespace.
+			if c == 'A' {
+				p.AllNamespaces = true
+			}
 			shorthands = shorthands[1:]
 		}
 	}
@@ -203,6 +326,7 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 // (the S1 bypass), and it stops positional collection there to match kubectl.
 func ParseArgs(args []string) ParsedArgs {
 	var p ParsedArgs
+	p.VerbIndex = -1
 	skipNext := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -251,6 +375,75 @@ func ParseArgs(args []string) ParsedArgs {
 					p.Kustomize = args[i+1]
 					skipNext = true
 				}
+			case "--server":
+				p.HasServer = true
+				if hasInline {
+					p.Server = val
+				} else if i+1 < len(args) {
+					p.Server = args[i+1]
+					skipNext = true
+				}
+			case "--as":
+				p.HasAs = true
+				if hasInline {
+					p.AsUser = val
+				} else if i+1 < len(args) {
+					p.AsUser = args[i+1]
+					skipNext = true
+				}
+			case "--as-group":
+				p.HasAs = true
+				if hasInline {
+					p.AsGroups = append(p.AsGroups, val)
+				} else if i+1 < len(args) {
+					p.AsGroups = append(p.AsGroups, args[i+1])
+					skipNext = true
+				}
+			case "--as-uid":
+				p.HasAs = true
+				if hasInline {
+					p.AsUID = val
+				} else if i+1 < len(args) {
+					p.AsUID = args[i+1]
+					skipNext = true
+				}
+			case "--token":
+				p.HasToken = true
+				if hasInline {
+					p.Token = val
+				} else if i+1 < len(args) {
+					p.Token = args[i+1]
+					skipNext = true
+				}
+			case "--namespace":
+				p.HasNamespace = true
+				if hasInline {
+					p.Namespace = val
+				} else if i+1 < len(args) {
+					p.Namespace = args[i+1]
+					skipNext = true
+				}
+			case "--all-namespaces":
+				// Honor an explicit boolean value: --all-namespaces=false does
+				// NOT span namespaces (matches kubectl), so it must not be gated
+				// as if it did. A bare --all-namespaces or a non-boolean value
+				// means true.
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.AllNamespaces = b
+					} else {
+						p.AllNamespaces = true
+					}
+				} else {
+					p.AllNamespaces = true
+				}
+			case "--dry-run":
+				p.HasDryRun = true
+				if hasInline {
+					p.DryRun = val
+				} else {
+					p.DryRun = "true" // bare --dry-run behaves as client
+				}
 			default:
 				// Other long flag: skip its value if it's a known value-taker.
 				if !hasInline && knownLongFlags[arg] {
@@ -263,6 +456,9 @@ func ParseArgs(args []string) ParsedArgs {
 				skipNext = true
 			}
 		default:
+			if p.VerbIndex < 0 {
+				p.VerbIndex = i
+			}
 			p.Positional = append(p.Positional, arg)
 		}
 	}
@@ -404,6 +600,12 @@ func IsSafeCommand(args []string) bool {
 	return safeCommands[cmd]
 }
 
+// IsDryRun reports whether args run kubectl in dry-run mode (--dry-run=client
+// or =server, or a bare --dry-run). --dry-run=none/=false are not dry-runs.
+func IsDryRun(args []string) bool {
+	return ParseArgs(args).IsDryRun()
+}
+
 // IsStateAltering returns true if the command modifies cluster state.
 func IsStateAltering(args []string) bool {
 	if len(args) == 0 {
@@ -424,6 +626,35 @@ func IsStateAltering(args []string) bool {
 	}
 
 	return stateAlteringCommands[cmd]
+}
+
+// IsDiffable reports whether a command can be previewed with `kubectl diff`:
+// it must apply a manifest (apply/create/replace with a -f/-k source), so there
+// is something to diff. delete/scale/exec/patch have no manifest to diff and
+// are skipped.
+func IsDiffable(args []string) bool {
+	cmd, _ := ExtractCommand(args)
+	switch cmd {
+	case "apply", "create", "replace":
+	default:
+		return false
+	}
+	p := ParseArgs(args)
+	return len(p.Filenames) > 0 || p.Kustomize != ""
+}
+
+// DiffArgs returns a copy of args with the kubectl verb replaced by "diff",
+// preserving global flags (--context, -n, -f, ...), suitable for `kubectl diff`.
+// It returns nil if no verb token is found before the "--" separator.
+func DiffArgs(args []string) []string {
+	p := ParseArgs(args)
+	if p.VerbIndex < 0 {
+		return nil
+	}
+	out := make([]string, len(args))
+	copy(out, args)
+	out[p.VerbIndex] = "diff"
+	return out
 }
 
 // GetCommandDescription returns a human-readable description of the command.

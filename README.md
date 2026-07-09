@@ -9,17 +9,26 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
 ## Features
 
 - **🔒 Secret protection** — Block all secret access across your entire cluster. Secrets never leave the cluster, so they can never enter LLM context windows or logs.
-- **🚦 Production gating** — Require explicit confirmation for state-altering commands on production contexts. Type the context name to confirm — something autonomous agents can't do.
+- **🚦 Production gating** — Require explicit confirmation for state-altering commands on production contexts **and namespaces**. Type the context/namespace name to confirm — something autonomous agents can't do. Optional hard **block mode** refuses with no prompt.
 - **📋 Comprehensive audit logging** — Every command is logged with timestamps, context, outcome, and *who drove it* (the actor). Full visibility into what your agents (or you) tried to do.
 - **🤖 Agent-native output** — Distinct exit codes (0/1/2/3/4) and a `--json` mode let agent frameworks parse guard decisions programmatically instead of scraping warning text.
-- **🛡️ Hard to bypass** — Honors `--context`/`--kubeconfig`, and a PATH-shadowing install (`make install-shim`) intercepts `kubectl` even in non-interactive shells and agent subprocesses where an alias can't reach.
-- **🤫 Headless-friendly** — Configure without a TTY via env vars, `config init`, or `--no-prompt`, so CI and agents bootstrap deterministically.
-- **🔓 Audited escape hatch** — `--yes`/`KUBECTL_GUARD_CONFIRM` auto-confirms gated commands for automation while still logging them (protected-resource blocks are never bypassed).
+- **🛡️ Hard to bypass** — Honors `--context`/`--kubeconfig`/`--namespace`, denies `--server` (unknown cluster) and optionally `--as` impersonation, and a PATH-shadowing install (`make install-shim`) intercepts `kubectl` even in non-interactive shells and agent subprocesses where an alias can't reach.
+- **🤫 Headless-friendly** — Configure without a TTY via env vars, `config init`, or `--no-prompt`, so CI and agents bootstrap deterministically. `--dry-run` commands skip the prompt (no cry-wolf).
+- **🔓 Audited escape hatch** — `--yes`/`KUBECTL_GUARD_CONFIRM` auto-confirms gated commands for automation while still logging them (protected-resource blocks and block mode are never bypassed).
+- **👀 Diff before confirm** — Optionally preview `kubectl diff` before the prompt for apply/create/replace, so a confirmation is informed.
 - **⚡ Drop-in replacement** — Works as a kubectl alias. No changes to your workflows or agent prompts.
 - **🔧 Reliable configuration** — Atomic config writes and concurrent-safe audit logging prevent corruption.
 - **🎯 Smart command classification** — Automatically distinguishes safe reads from dangerous mutations, even with uppercase verbs or plugins.
 
 ## What's New
+
+### v0.4.0 — Security completeness
+
+- **Targeting & identity flags** — `--server` (which points at a different cluster the guard can't verify) is now **denied** when context protection is configured. `--as`/`--as-group`/`--as-uid` impersonation and `--token` are **recorded in the audit log**, and optionally **blocked** on protected contexts via `block_impersonation`.
+- **Namespace-level protection** — new `protected_namespaces` (glob patterns) gate state-altering commands by namespace, composing with context protection. The target namespace is resolved from `--namespace`/`-n`, then the namespace baked into the active context, then `default`; `--all-namespaces`/`-A` is gated when any namespace is protected.
+- **Hard block mode** — `context_mode: block` / `namespace_mode: block` hard-refuse state-altering commands with no confirmation option. Block mode is absolute: `--yes` cannot override it.
+- **Diff before confirm** — `diff_before_confirm: true` runs `kubectl diff` and shows it on stderr before the prompt for diffable commands (apply/create/replace).
+- **Dry-run aware** — `apply --dry-run=client`/`server` change nothing, so they skip the prompt (audited as `dry-run`); `--dry-run=none` still gates. Reduces cry-wolf confirmations.
 
 ### v0.3.0 — Agent-native safety
 
@@ -146,6 +155,13 @@ kubectl-guard config init \
   --confirm-mode type-name
 ```
 
+The first-run env vars and `config init` cover protected **contexts**,
+**resources**, and the **confirm mode**. Protected **namespaces** and the
+**block modes** (`context_mode`/`namespace_mode`) are not part of first-run
+bootstrap — set them afterward with `config add-namespace` /
+`config namespace-mode` / `config context-mode`, or by writing the YAML
+directly (config is re-read every invocation).
+
 If no config exists and you just want the guard to get out of the way
 deterministically (e.g. a CI step that hasn't been configured yet), pass
 `--no-prompt` or set `KUBECTL_GUARD_NO_PROMPT=yes`: the guard writes an empty
@@ -210,13 +226,37 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
 ## Protection model
 
 - **Protected contexts** — state-altering commands (`apply`, `delete`, `scale`,
-  `exec`, `config use-context`, …) require confirmation. Read-only commands
-  (`get`, `describe`, `logs`, `config view`, …) pass through.
+  `exec`, `config use-context`, …) require confirmation (or are hard-blocked in
+  `context_mode: block`). Read-only commands (`get`, `describe`, `logs`,
+  `config view`, …) pass through.
+- **Protected namespaces** — glob patterns of namespaces that gate
+  state-altering commands when the target namespace matches. The target
+  namespace is resolved from `--namespace`/`-n`, then the namespace baked into
+  the resolved context (best-effort via kubeconfig), then `default`.
+  `--all-namespaces`/`-A` is gated whenever any namespace is protected.
+  Composes with context protection: a command is gated if *either* the context
+  or the namespace is protected.
+- **Block mode** — set `context_mode: block` and/or `namespace_mode: block` to
+  hard-refuse state-altering commands with **no confirmation option** (for CI
+  service accounts or a strict "agents must never touch prod" policy). Block
+  mode is absolute: `--yes`/`KUBECTL_GUARD_CONFIRM` cannot override it.
+- **Dry-run aware** — `apply --dry-run=client`/`--dry-run=server` change no
+  cluster state, so they skip the confirmation prompt (audited as `dry-run`).
+  The guard mirrors kubectl's own dry-run parsing, so every form kubectl treats
+  as a real mutation still gates: `--dry-run=none`, `--dry-run=false`/`0`, and a
+  plain `apply`. Protected-resource blocks still apply (a dry-run of a secret is
+  still blocked).
 - **Protected resources** — any command touching the resource is **blocked
   everywhere** (reads included), regardless of context. Use this to block all
   access to secrets, for example.
 - **No bypass** — the `--context` and `--kubeconfig` flags are honored, so
   `kubectl --context=prod delete pod x` is still gated.
+- **Targeting & identity flags** — `--server` (which points at a different
+  cluster the guard can't map to a context) is **denied** when context
+  protection is configured (fail-closed). `--as`/`--as-group`/`--as-uid`
+  impersonation and `--token` credential overrides are **recorded in the
+  audit log** for attribution, and optionally **blocked** on protected
+  contexts via `block_impersonation`.
 - **Case-insensitive verbs** — Commands with uppercase verbs (`DELETE`, `APPLY`)
   are normalized and treated the same as lowercase, preventing bypass attempts.
 - **Clean output** — Guard messages route to stderr, keeping stdout clean for
@@ -280,16 +320,28 @@ protected_contexts:
   - prod-*           # Glob patterns supported
 protected_resources:
   - secret           # Blocked on every context
+protected_namespaces:
+  - kube-system      # State changes gated in these namespaces
+  - prod-*           # Glob patterns supported
+context_mode: confirm     # confirm (default) | block
+namespace_mode: confirm   # confirm (default) | block
 confirm_mode: type-name   # simple (y/N) or type-name (type the context name)
 audit_mode: all           # all (default) | gated | off
 audit_log: ~/.kubectl-guard-audit.log   # optional; defaults to this path
 actor: ci-deploy          # optional static default actor (overridden by KUBECTL_GUARD_ACTOR)
+block_impersonation: true # optional: deny --as* on protected contexts
+diff_before_confirm: true # optional: show `kubectl diff` before the confirm prompt
 ```
 
 Fields:
 - **`protected_contexts`** — glob patterns of contexts that gate
   state-altering commands (require confirmation)
+- **`protected_namespaces`** — glob patterns of namespaces that gate
+  state-altering commands (resolved from `--namespace`/`-n`, the context's
+  baked-in namespace, or `default`)
 - **`protected_resources`** — resources blocked everywhere, reads included
+- **`context_mode`** — `confirm` (default, prompts) or `block` (hard-refuse)
+- **`namespace_mode`** — `confirm` (default) or `block`, for protected namespaces
 - **`confirm_mode`** — `simple` (y/N prompt) or `type-name` (type the
   context name to confirm)
 - **`audit_mode`** — `all` (default, logs every command including allowed
@@ -298,17 +350,26 @@ Fields:
 - **`audit_log`** — optional override for the audit log path
 - **`actor`** — optional static default for the audit `actor` field (overridden
   by `KUBECTL_GUARD_ACTOR` when set); useful for a shared CI host
+- **`diff_before_confirm`** — when true, run `kubectl diff` (server-side) and
+  show the result on stderr before the confirmation prompt for diffable commands
+  (`apply`/`create`/`replace -f`). Off by default (adds latency and needs
+  server-side dry-run RBAC; a failed diff warns and prompts anyway)
 
 Manage via CLI:
 
 ```bash
 kubectl-guard --version                  # Show version (or -V)
-kubectl-guard config list                 # Show contexts, resources, modes
+kubectl-guard config list                 # Show contexts, resources, namespaces, confirm mode, audit path
 kubectl-guard config add-context prod-*   # Protect matching contexts
 kubectl-guard config remove-context staging
 kubectl-guard config add-resource secret  # Block a resource everywhere
 kubectl-guard config remove-resource secret
+kubectl-guard config add-namespace kube-system  # Gate state changes in a namespace
+kubectl-guard config add-namespace 'prod-*'      # Glob patterns supported
+kubectl-guard config remove-namespace kube-system
 kubectl-guard config confirm-mode type-name  # Stronger confirmation prompt
+kubectl-guard config context-mode block      # Hard-block state changes on protected contexts
+kubectl-guard config namespace-mode block    # Hard-block state changes on protected namespaces
 kubectl-guard config audit-mode all          # Log every command (default)
 kubectl-guard config audit                # Show audit log path + recent entries
 kubectl-guard config setup                # Re-run setup wizard
@@ -362,20 +423,26 @@ protection wholesale, and expect it to stand out in the audit log.
 
 kubectl-guard is installed as a drop-in alias for `kubectl`. Each invocation
 parses the arguments, resolves the target context (honoring `--context`,
-`--kubeconfig`, and `KUBECONFIG`), and decides whether to block, prompt, or
-pass through — then replaces its own process with the real `kubectl` via
-`exec`, so stdout, stdin, and exit codes are preserved exactly.
+`--kubeconfig`, and `KUBECONFIG`) and namespace (`--namespace`/`-n`), and
+decides whether to block, prompt, or pass through — then replaces its own
+process with the real `kubectl` via `exec`, so stdout, stdin, and exit codes
+are preserved exactly.
 
 - **Safe commands** (`get`, `describe`, `logs`, `config view`, `auth can-i`, …)
   pass through without prompts.
 - **State-altering commands** (`apply`, `delete`, `scale`, `exec`,
-  `config use-context`, `auth reconcile`, …) require confirmation on
-  protected contexts. Verbs are case-insensitive (uppercase `DELETE` is
+  `config use-context`, `auth reconcile`, …) require confirmation on protected
+  contexts **or namespaces** (or are hard-blocked in `context_mode`/
+  `namespace_mode: block`). Verbs are case-insensitive (uppercase `DELETE` is
   treated the same as lowercase `delete`).
+- **Dry-run commands** (`apply --dry-run=client|server`) change no state and
+  skip the prompt (audited as `dry-run`).
 - **Protected resources** are blocked on every context, including reads.
+- **Targeting/identity** — `--server` is denied when contexts are protected;
+  `--as`/`--token` are recorded in the audit log.
 - **Guard messages** route to stderr, keeping stdout clean for kubectl output
   and piping to other tools.
-- Context matching uses glob patterns; resource matching treats
+- Context and namespace matching use glob patterns; resource matching treats
   singular/plural/short-name forms as equivalent.
 
 ### Exit codes
@@ -388,8 +455,8 @@ itself uses `0`/`1`, so the guard uses higher codes:
 |------|---------|
 | `0`  | allowed / ran successfully (kubectl's own code is preserved via `exec`) |
 | `1`  | kubectl error (passthrough) |
-| `2`  | blocked (protected resource) |
-| `3`  | denied (fail-closed: config/context could not be verified) |
+| `2`  | blocked — a protected resource, or a block-mode refusal on a protected context/namespace (`context_mode`/`namespace_mode: block`) |
+| `3`  | denied (fail-closed: config/context could not be verified, `--server` on a protected setup, or blocked impersonation) |
 | `4`  | needs confirmation but aborted (no TTY / agent / declined) |
 
 ### JSON output mode (`--json`)
@@ -410,8 +477,10 @@ $ kubectl get pods --json     # allowed
 ```
 
 The object fields: `decision` (`blocked` | `denied` | `needs-confirmation`),
-`reason`, `context`, `command`, and `resource` (the protected-resource token,
-for `blocked`). In `--json` mode a `needs-confirmation` decision aborts
+`reason` (e.g. `protected-resource`, `protected-context-block-mode`,
+`protected-namespace-block-mode`), `context`, `command`, and `resource` (the
+protected-resource token, for a resource `blocked`). In `--json` mode a
+`needs-confirmation` decision aborts
 immediately with exit `4` (an agent cannot answer an interactive prompt) rather
 than blocking on stdin.
 

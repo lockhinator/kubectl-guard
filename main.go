@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -20,19 +21,23 @@ var version = "dev"
 // "config <subcommand>" (e.g. "config use-context", "config view") is a kubectl
 // command and must be forwarded through the guard rather than intercepted.
 var guardConfigSubcommands = map[string]bool{
-	"setup":           true,
-	"init":            true,
-	"list":            true,
-	"add":             true,
-	"remove":          true,
-	"add-context":     true,
-	"remove-context":  true,
-	"add-resource":    true,
-	"remove-resource": true,
-	"confirm-mode":    true,
-	"audit-mode":     true,
-	"audit":           true,
-	"path":            true,
+	"setup":            true,
+	"init":             true,
+	"list":             true,
+	"add":              true,
+	"remove":           true,
+	"add-context":      true,
+	"remove-context":   true,
+	"add-resource":     true,
+	"remove-resource":  true,
+	"add-namespace":    true,
+	"remove-namespace": true,
+	"confirm-mode":     true,
+	"context-mode":     true,
+	"namespace-mode":   true,
+	"audit-mode":       true,
+	"audit":            true,
+	"path":             true,
 }
 
 func main() {
@@ -124,13 +129,23 @@ func orUnknown(s string) string {
 func runBypass(args []string) error {
 	ui.PrintWarning("KUBECTL_GUARD_BYPASS set: guard disabled for this invocation (audited).")
 	// Best-effort audit: if a config exists, log the bypass so it's traceable.
+	// Attribute impersonation/token like the main path so the bypass record
+	// still shows who it ran as.
 	if exists, err := config.Exists(); err == nil && exists {
 		if cfg, err := config.Load(); err == nil {
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+			e := guard.AuditEntry{
 				Command: strings.Join(args, " "),
 				Outcome: guard.OutcomeBypassed,
 				Reason:  "KUBECTL_GUARD_BYPASS",
-			})
+			}
+			p := guard.ParseArgs(args)
+			if imp := p.ImpersonationString(); imp != "" {
+				e.Impersonate = imp
+			}
+			if p.HasToken {
+				e.Token = true
+			}
+			_ = guard.AppendAudit(cfg, e)
 		}
 	}
 	return guard.ExecKubectl(args)
@@ -161,6 +176,33 @@ func runGuard(args []string) error {
 	result, ctx, cfg, err := guard.Check(forwarded)
 	cmdStr := strings.Join(forwarded, " ")
 
+	// Parse once to attribute impersonation (--as) and credential overrides
+	// (--token) in the audit log, so the record shows who a command ran AS,
+	// not just who invoked the guard.
+	parsed := guard.ParseArgs(forwarded)
+
+	// audit writes an attributed audit entry for this invocation. It is a
+	// thin wrapper so every decision path records impersonation/token the same
+	// way. cfg may be nil (Deny before config load); in that case it is a no-op.
+	audit := func(outcome, reason string) {
+		if cfg == nil {
+			return
+		}
+		e := guard.AuditEntry{
+			Context: ctx,
+			Command: cmdStr,
+			Outcome: outcome,
+			Reason:  reason,
+		}
+		if imp := parsed.ImpersonationString(); imp != "" {
+			e.Impersonate = imp
+		}
+		if parsed.HasToken {
+			e.Token = true
+		}
+		_ = guard.AppendAudit(cfg, e)
+	}
+
 	// emitDecision writes the structured JSON decision object to stderr. Used
 	// only in --json mode for non-Allow results; for Allow nothing is emitted so
 	// kubectl's stdout stays clean for the agent.
@@ -186,13 +228,7 @@ func runGuard(args []string) error {
 			ui.PrintInfo("Fix the issue above, or run kubectl directly if you understand the risk.")
 		}
 		// cfg is non-nil when context resolution failed but config loaded; log it.
-		if cfg != nil {
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
-				Context: ctx,
-				Command: cmdStr,
-				Outcome: guard.OutcomeDenied,
-			})
-		}
+		audit(guard.OutcomeDenied, "")
 		os.Exit(guard.ExitDenied)
 
 	case guard.SetupRequired:
@@ -234,21 +270,45 @@ func runGuard(args []string) error {
 		return nil
 
 	case guard.Blocked:
-		if jsonMode {
-			emitDecision()
-		} else {
-			cmdDesc := guard.GetCommandDescription(forwarded)
-			ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
-			if guard.HasUninspectableSource(forwarded) {
-				ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+		// A Blocked result is either a protected-resource block or a block-mode
+		// refusal (context_mode/namespace_mode: block). Determine which so the
+		// message and audit reason are accurate.
+		blockReason := "protected-resource"
+		if !guard.MatchesProtectedResource(cfg, forwarded) {
+			if cfg != nil && cfg.IsContextProtected(ctx) && cfg.ContextMode == config.ContextModeBlock {
+				blockReason = "protected-context-block-mode"
+			} else {
+				blockReason = "protected-namespace-block-mode"
 			}
 		}
-		_ = guard.AppendAudit(cfg, guard.AuditEntry{
-			Context: ctx,
-			Command: cmdStr,
-			Outcome: guard.OutcomeBlocked,
-			Reason:  "protected-resource",
-		})
+		if jsonMode {
+			jr := guard.JSONForResult(result, ctx, cmdStr, forwarded, err)
+			jr.Reason = blockReason
+			if blockReason != "protected-resource" {
+				jr.Resource = "" // block-mode is not about a specific resource
+			}
+			if b, mErr := json.Marshal(jr); mErr == nil {
+				fmt.Fprintln(os.Stderr, string(b))
+			}
+		} else {
+			cmdDesc := guard.GetCommandDescription(forwarded)
+			switch blockReason {
+			case "protected-resource":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
+				if guard.HasUninspectableSource(forwarded) {
+					ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+				}
+			case "protected-context-block-mode":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
+			default: // protected-namespace-block-mode
+				ns := "all namespaces"
+				if !parsed.AllNamespaces {
+					ns = guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
+				}
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected namespace %q (block mode: no confirmation offered)", cmdDesc, ns))
+			}
+		}
+		audit(guard.OutcomeBlocked, blockReason)
 		os.Exit(guard.ExitBlocked)
 
 	case guard.RequireConfirmation:
@@ -262,12 +322,7 @@ func runGuard(args []string) error {
 			if !jsonMode {
 				ui.PrintWarning("Auto-confirming gated command (--yes / KUBECTL_GUARD_CONFIRM=yes); logged as auto-confirmed.")
 			}
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
-				Context: ctx,
-				Command: cmdStr,
-				Outcome: guard.OutcomeAutoConfirmed,
-				Reason:  "yes-flag",
-			})
+			audit(guard.OutcomeAutoConfirmed, "yes-flag")
 			return guard.ExecKubectl(forwarded)
 		}
 
@@ -275,49 +330,77 @@ func runGuard(args []string) error {
 			// An agent framework cannot answer an interactive prompt; abort
 			// immediately with structured output instead of blocking on stdin.
 			emitDecision()
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
-				Context: ctx,
-				Command: cmdStr,
-				Outcome: guard.OutcomeAborted,
-			})
+			audit(guard.OutcomeAborted, "")
 			os.Exit(guard.ExitNeedsConfirm)
 		}
 
 		cmdDesc := guard.GetCommandDescription(forwarded)
-		message := fmt.Sprintf("%s on protected context: %s", cmdDesc, ctx)
+		// Describe what is protected so the user knows why they're confirming.
+		// Namespace protection (#19) may trigger gating even on an unprotected
+		// context (including from the context's baked-in namespace), so the
+		// message names whichever actually applies.
+		reason := "protected context"
+		target := ctx
+		switch {
+		case parsed.AllNamespaces && cfg != nil && cfg.HasProtectedNamespaces():
+			reason, target = "protected namespace", "all namespaces"
+		case parsed.HasNamespace && parsed.Namespace != "" && cfg != nil && cfg.IsNamespaceProtected(parsed.Namespace):
+			reason, target = "protected namespace", parsed.Namespace
+		case cfg != nil && cfg.IsContextProtected(ctx):
+			reason, target = "protected context", ctx
+		case cfg != nil && cfg.HasProtectedNamespaces():
+			// Namespace-driven gating from the context's baked-in namespace.
+			reason, target = "protected namespace", guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
+		}
+		message := fmt.Sprintf("%s on %s: %s", cmdDesc, reason, target)
+
+		// Optional: preview the change with `kubectl diff` before prompting.
+		// Only for diffable commands (apply/create/replace -f). A failed diff
+		// (e.g. RBAC denies server-side dry-run) warns and prompts anyway.
+		if cfg != nil && cfg.DiffBeforeConfirm && guard.IsDiffable(forwarded) {
+			if diffArgs := guard.DiffArgs(forwarded); diffArgs != nil {
+				out, derr := guard.RunKubectl(diffArgs...)
+				if derr != nil {
+					if ee, ok := derr.(*exec.ExitError); ok && (ee.ExitCode() == 0 || ee.ExitCode() == 1) {
+						derr = nil // exit 1 means diffs were found, which is normal
+					}
+				}
+				if derr != nil {
+					ui.PrintWarning("Could not generate a diff (server-side dry-run may be denied by RBAC); prompting anyway.")
+				} else {
+					fmt.Fprintln(os.Stderr, "--- preview: kubectl diff ---")
+					if len(strings.TrimRight(string(out), "\n")) > 0 {
+						fmt.Fprint(os.Stderr, string(out))
+					}
+					fmt.Fprintln(os.Stderr, "--- end diff ---")
+				}
+			}
+		}
 
 		confirmed := false
 		if cfg != nil && cfg.ConfirmMode == config.ConfirmModeTypeName {
-			confirmed = ui.ConfirmWithName(message, ctx)
+			confirmed = ui.ConfirmWithName(message, target)
 		} else {
 			confirmed = ui.Confirm(message)
 		}
 
 		if confirmed {
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
-				Context: ctx,
-				Command: cmdStr,
-				Outcome: guard.OutcomeConfirmed,
-			})
+			audit(guard.OutcomeConfirmed, "")
 			return guard.ExecKubectl(forwarded)
 		}
 
-		_ = guard.AppendAudit(cfg, guard.AuditEntry{
-			Context: ctx,
-			Command: cmdStr,
-			Outcome: guard.OutcomeAborted,
-		})
+		audit(guard.OutcomeAborted, "")
 		fmt.Fprintln(os.Stderr, "Aborted.")
 		os.Exit(guard.ExitNeedsConfirm)
 
 	case guard.Allow:
 		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so
 		// anything after the call never runs.
-		_ = guard.AppendAudit(cfg, guard.AuditEntry{
-			Context: ctx,
-			Command: cmdStr,
-			Outcome: guard.OutcomeAllowed,
-		})
+		outcome := guard.OutcomeAllowed
+		if guard.IsDryRun(forwarded) {
+			outcome = guard.OutcomeDryRun
+		}
+		audit(outcome, "")
 		return guard.ExecKubectl(forwarded)
 	}
 
@@ -369,6 +452,9 @@ func runConfigCommand() error {
 			if len(cfg.ProtectedResources) > 0 {
 				ui.PrintInfo("Protected resources: " + strings.Join(cfg.ProtectedResources, ", "))
 			}
+			if len(cfg.ProtectedNamespaces) > 0 {
+				ui.PrintInfo("Protected namespaces: " + strings.Join(cfg.ProtectedNamespaces, ", "))
+			}
 			ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 			return nil
 		},
@@ -377,7 +463,6 @@ func runConfigCommand() error {
 	initCmd.Flags().String("protected-resources", "", "comma-separated resources to block on every context (e.g. 'secret')")
 	initCmd.Flags().String("confirm-mode", "", "confirmation mode for protected contexts (simple|type-name)")
 	rootCmd.AddCommand(initCmd)
-
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "list",
@@ -391,9 +476,9 @@ func runConfigCommand() error {
 	// add-resource / remove-resource all share one shape.
 	addCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool) {
 		rootCmd.AddCommand(&cobra.Command{
-			Use:   use,
-			Short: short,
-			Args:  cobra.ExactArgs(1),
+			Use:    use,
+			Short:  short,
+			Args:   cobra.ExactArgs(1),
 			Hidden: hidden,
 			RunE: func(_ *cobra.Command, a []string) error {
 				return mutateConfig(func(c *config.Config) bool { return fn(c, a[0]) }, fmt.Sprintf(doneTmpl, a[0]), fmt.Sprintf(noopTmpl, a[0]))
@@ -406,6 +491,8 @@ func runConfigCommand() error {
 	addCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true)
 	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false)
 	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false)
+	addCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*)", (*config.Config).AddNamespace, "Protected namespace: %s", "Namespace already protected: %s", false)
+	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "confirm-mode [simple|type-name]",
@@ -451,6 +538,54 @@ func runConfigCommand() error {
 				return err
 			}
 			ui.PrintSuccess("Audit mode set: " + cfg.AuditMode)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "context-mode [confirm|block]",
+		Short: "Show or set how protected contexts treat state-altering commands",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Context mode: " + cfg.ContextMode)
+				return nil
+			}
+			if !cfg.SetContextMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.ContextModeConfirm, config.ContextModeBlock)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Context mode set: " + cfg.ContextMode)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "namespace-mode [confirm|block]",
+		Short: "Show or set how protected namespaces treat state-altering commands",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Namespace mode: " + cfg.NamespaceMode)
+				return nil
+			}
+			if !cfg.SetNamespaceMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.NamespaceModeConfirm, config.NamespaceModeBlock)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Namespace mode set: " + cfg.NamespaceMode)
 			return nil
 		},
 	})
@@ -558,6 +693,15 @@ func printConfig() error {
 		}
 	}
 
+	ui.PrintInfo("Protected namespaces:")
+	if len(cfg.ProtectedNamespaces) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		for _, ns := range cfg.ProtectedNamespaces {
+			fmt.Printf("  - %s\n", ns)
+		}
+	}
+
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 
 	auditPath, _ := config.AuditPath(cfg)
@@ -590,26 +734,49 @@ func printHelp() {
 Usage:
   kubectl-guard [kubectl args...]     Run kubectl with protection
   kubectl-guard config <subcommand>   Manage configuration
-  kubectl-guard --version             Print version
+  kubectl-guard doctor                Check PATH-shadowing interception
+  kubectl-guard --version             Print version (or -V)
   kubectl-guard --help                Print this help
 
 Protection model:
-  - Protected CONTEXTS: state-altering commands require confirmation.
+  - Protected CONTEXTS: state-altering commands require confirmation (or are
+    hard-blocked in context_mode: block).
+  - Protected NAMESPACES: state-altering commands are gated when the target
+    namespace (--namespace/-n, the context's namespace, or "default", and any
+    namespace under --all-namespaces/-A) matches (or blocked in
+    namespace_mode: block).
   - Protected RESOURCES: any command touching the resource is blocked
     everywhere (reads included), e.g. block all secret access.
-  - The --context / --kubeconfig flags are honored, so you cannot bypass the
-    guard by pointing at a protected context explicitly.
+  - Dry-run (--dry-run=client|server) skips the prompt; real-mutation forms
+    (--dry-run=none|false, plain apply) still gate. Resource blocks still apply.
+  - The --context / --kubeconfig / --namespace flags are honored; --server
+    (unverifiable cluster) is denied when contexts are protected; --as/--token
+    are recorded in the audit log (and --as optionally blocked).
+
+Guard-only flags (stripped before forwarding to kubectl):
+  --json         Emit a structured decision object on stderr for non-allow
+  --yes          Auto-confirm a gated command (audited; block mode not bypassed)
+  --no-prompt    Headless: no interactive setup wizard
 
 Config subcommands:
   setup                      Run the setup wizard
-  list                       Show protected contexts, resources, and modes
+  init                       Write config non-interactively (headless / CI)
+  list                       Show protected contexts, resources, namespaces,
+                             confirm mode, and audit log path
   add-context <pattern>      Protect matching contexts (glob)
   remove-context <pattern>   Stop protecting matching contexts
   add-resource <name>        Block a resource everywhere (e.g. secret)
   remove-resource <name>     Stop blocking a resource
+  add-namespace <pattern>    Gate state changes in matching namespaces (glob)
+  remove-namespace <pattern> Stop protecting matching namespaces
   confirm-mode [simple|type-name]
                              Show or set the confirmation prompt style
-                             (type-name requires typing the context name)
+                             (type-name requires typing the context/namespace name)
+  context-mode [confirm|block]
+                             Show or set how protected contexts are enforced
+  namespace-mode [confirm|block]
+                             Show or set how protected namespaces are enforced
+  audit-mode [all|gated|off] Show or set what the audit log records
   audit                      Show the audit log path and recent entries
   path                       Print the config file path
 
@@ -619,6 +786,10 @@ Examples:
 
   # Block all secret access on every cluster
   kubectl-guard config add-resource secret
+
+  # Gate state changes in a protected namespace, or hard-block them
+  kubectl-guard config add-namespace kube-system
+  kubectl-guard config namespace-mode block
 
   # Require typing the context name to confirm dangerous commands
   kubectl-guard config confirm-mode type-name
@@ -630,6 +801,8 @@ Examples:
 Environment:
   Config file: ~/.kubectl-guard.yaml
   Audit log:   ~/.kubectl-guard-audit.log
+  See the README for KUBECTL_GUARD_* variables (actor, headless bootstrap,
+  CONFIRM, BYPASS).
 `
 	fmt.Print(strings.TrimSpace(help) + "\n")
 }

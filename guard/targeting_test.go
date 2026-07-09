@@ -44,7 +44,7 @@ func TestParseArgsServerShortAttached(t *testing.T) {
 
 // TestParseArgsIdentityFlags captures --as / --as-group / --as-uid / --token.
 func TestParseArgsIdentityFlags(t *testing.T) {
-	p := ParseArgs([]string{"--as=system:admin", "--as-group", "devs", "--as-group=sres", "--as-uid=abc", "--token=tok", "get", "pods"})
+	p := ParseArgs([]string{"--as=system:admin", "--as-group", "devs", "--as-group=sres", "--as-uid=abc", "--token", "tok", "get", "pods"})
 	if !p.HasImpersonation() {
 		t.Error("HasImpersonation = false, want true")
 	}

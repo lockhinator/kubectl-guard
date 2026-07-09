@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -347,6 +348,29 @@ func runGuard(args []string) error {
 			target = parsed.Namespace
 		}
 		message := fmt.Sprintf("%s on %s: %s", cmdDesc, reason, target)
+
+		// Optional: preview the change with `kubectl diff` before prompting.
+		// Only for diffable commands (apply/create/replace -f). A failed diff
+		// (e.g. RBAC denies server-side dry-run) warns and prompts anyway.
+		if cfg != nil && cfg.DiffBeforeConfirm && guard.IsDiffable(forwarded) {
+			if diffArgs := guard.DiffArgs(forwarded); diffArgs != nil {
+				out, derr := guard.RunKubectl(diffArgs...)
+				if derr != nil {
+					if ee, ok := derr.(*exec.ExitError); ok && (ee.ExitCode() == 0 || ee.ExitCode() == 1) {
+						derr = nil // exit 1 means diffs were found, which is normal
+					}
+				}
+				if derr != nil {
+					ui.PrintWarning("Could not generate a diff (server-side dry-run may be denied by RBAC); prompting anyway.")
+				} else {
+					fmt.Fprintln(os.Stderr, "--- preview: kubectl diff ---")
+					if len(strings.TrimRight(string(out), "\n")) > 0 {
+						fmt.Fprint(os.Stderr, string(out))
+					}
+					fmt.Fprintln(os.Stderr, "--- end diff ---")
+				}
+			}
+		}
 
 		confirmed := false
 		if cfg != nil && cfg.ConfirmMode == config.ConfirmModeTypeName {

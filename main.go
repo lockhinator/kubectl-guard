@@ -391,7 +391,11 @@ func runGuard(args []string) error {
 	case guard.Allow:
 		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so
 		// anything after the call never runs.
-		audit(guard.OutcomeAllowed, "")
+		outcome := guard.OutcomeAllowed
+		if guard.IsDryRun(forwarded) {
+			outcome = guard.OutcomeDryRun
+		}
+		audit(outcome, "")
 		return guard.ExecKubectl(forwarded)
 	}
 

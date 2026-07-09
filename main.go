@@ -136,7 +136,7 @@ func runGuard(args []string) error {
 			Command: cmdStr,
 			Outcome: guard.OutcomeAborted,
 		})
-		fmt.Println("Aborted.")
+		fmt.Fprintln(os.Stderr, "Aborted.")
 		os.Exit(1)
 
 	case guard.Allow:

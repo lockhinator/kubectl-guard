@@ -35,8 +35,8 @@ var (
 // Confirm prompts the user for a yes/no confirmation.
 // Returns true if the user confirms, false otherwise.
 func Confirm(message string) bool {
-	fmt.Print(warningStyle.Render("⚠️  "+message) + "\n")
-	fmt.Print("Confirm? [y/N]: ")
+	fmt.Fprintln(os.Stderr, warningStyle.Render("⚠️  "+message))
+	fmt.Fprint(os.Stderr, "Confirm? [y/N]: ")
 
 	reader := bufio.NewReader(os.Stdin)
 	response, err := reader.ReadString('\n')
@@ -52,8 +52,8 @@ func Confirm(message string) bool {
 // stronger gate than Confirm, designed to defeat muscle-memory "y" on
 // production contexts.
 func ConfirmWithName(message, name string) bool {
-	fmt.Print(warningStyle.Render("⚠️  "+message) + "\n")
-	fmt.Printf("Type %q to confirm (anything else aborts): ", name)
+	fmt.Fprintln(os.Stderr, warningStyle.Render("⚠️  "+message))
+	fmt.Fprintf(os.Stderr, "Type %q to confirm (anything else aborts): ", name)
 
 	reader := bufio.NewReader(os.Stdin)
 	response, err := reader.ReadString('\n')
@@ -185,15 +185,15 @@ func MultiSelect(items []MultiSelectItem) ([]MultiSelectItem, bool) {
 
 // PrintSuccess prints a success message.
 func PrintSuccess(message string) {
-	fmt.Println(successStyle.Render("✓ " + message))
+	fmt.Fprintln(os.Stderr, successStyle.Render("✓ "+message))
 }
 
 // PrintWarning prints a warning message.
 func PrintWarning(message string) {
-	fmt.Println(warningStyle.Render("⚠️  " + message))
+	fmt.Fprintln(os.Stderr, warningStyle.Render("⚠️  "+message))
 }
 
 // PrintInfo prints an info message.
 func PrintInfo(message string) {
-	fmt.Println(message)
+	fmt.Fprintln(os.Stderr, message)
 }

@@ -111,6 +111,11 @@ func TestIsSafeCommand(t *testing.T) {
 		{"delete", []string{"delete", "pod", "nginx"}, false},
 		{"rollout restart", []string{"rollout", "restart", "deployment/nginx"}, false},
 
+		// Uppercase verbs are normalized to lowercase and classified correctly
+		{"APPLY uppercase", []string{"APPLY", "-f", "deployment.yaml"}, false},
+		{"DELETE uppercase", []string{"DELETE", "pod", "nginx"}, false},
+		{"GET uppercase safe", []string{"GET", "pods"}, true},
+
 		// Edge cases
 		{"empty", []string{}, true},
 		{"flags only", []string{"-n", "default"}, true},
@@ -137,6 +142,11 @@ func TestIsStateAltering(t *testing.T) {
 		{"apply", []string{"apply", "-f", "deployment.yaml"}, true},
 		{"create", []string{"create", "deployment", "nginx"}, true},
 		{"delete", []string{"delete", "pod", "nginx"}, true},
+
+		// Uppercase verbs are normalized to lowercase and classified correctly
+		{"DELETE uppercase", []string{"DELETE", "pod", "nginx"}, true},
+		{"APPLY uppercase", []string{"APPLY", "-f", "deployment.yaml"}, true},
+		{"GET uppercase not state-altering", []string{"GET", "pods"}, false},
 		{"patch", []string{"patch", "deployment", "nginx", "-p", `{"spec":{}}`}, true},
 		{"replace", []string{"replace", "-f", "deployment.yaml"}, true},
 		{"edit", []string{"edit", "deployment", "nginx"}, true},

@@ -49,7 +49,7 @@ func run() error {
 				return runConfigCommand()
 			}
 			return runGuard(os.Args[1:])
-		case "--version", "-v":
+		case "--version", "-V":
 			fmt.Printf("kubectl-guard %s\n", version)
 			return nil
 		case "--help", "-h":
@@ -136,7 +136,7 @@ func runGuard(args []string) error {
 			Command: cmdStr,
 			Outcome: guard.OutcomeAborted,
 		})
-		fmt.Println("Aborted.")
+		fmt.Fprintln(os.Stderr, "Aborted.")
 		os.Exit(1)
 
 	case guard.Allow:

@@ -222,6 +222,10 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
   hard-refuse state-altering commands with **no confirmation option** (for CI
   service accounts or a strict "agents must never touch prod" policy). Block
   mode is absolute: `--yes`/`KUBECTL_GUARD_CONFIRM` cannot override it.
+- **Dry-run aware** — `apply --dry-run=client`/`--dry-run=server` change no
+  cluster state, so they skip the confirmation prompt (audited as `dry-run`).
+  `--dry-run=none` and a plain `apply` still gate. Protected-resource blocks
+  still apply (a dry-run of a secret is still blocked).
 - **Protected resources** — any command touching the resource is **blocked
   everywhere** (reads included), regardless of context. Use this to block all
   access to secrets, for example.

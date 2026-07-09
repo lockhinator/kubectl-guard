@@ -118,6 +118,12 @@ type ParsedArgs struct {
 	Token     string   // --token
 	HasToken  bool
 
+	// DryRun captures --dry-run (client|server|none). A bare --dry-run is
+	// treated as client. State-altering commands in dry-run mode change no
+	// cluster state and skip context/namespace gating.
+	DryRun    string
+	HasDryRun bool
+
 	// Namespace targeting. --namespace/-n sets an explicit namespace;
 	// --all-namespaces/-A spans every namespace (gated when any namespace is
 	// protected, like "get all" spans resources).
@@ -130,6 +136,13 @@ type ParsedArgs struct {
 // set, i.e. the command impersonates another identity.
 func (p ParsedArgs) HasImpersonation() bool {
 	return p.HasAs
+}
+
+// IsDryRun reports whether the command runs in dry-run mode (--dry-run=client
+// or =server, or a bare --dry-run). --dry-run=none (the default) and =false are
+// NOT dry-runs: the command would change state and is gated normally.
+func (p ParsedArgs) IsDryRun() bool {
+	return p.HasDryRun && p.DryRun != "none" && p.DryRun != "false"
 }
 
 // ResolvedNamespace returns the namespace a command targets, for protection
@@ -370,6 +383,13 @@ func ParseArgs(args []string) ParsedArgs {
 				}
 			case "--all-namespaces":
 				p.AllNamespaces = true
+			case "--dry-run":
+				p.HasDryRun = true
+				if hasInline {
+					p.DryRun = val
+				} else {
+					p.DryRun = "true" // bare --dry-run behaves as client
+				}
 			default:
 				// Other long flag: skip its value if it's a known value-taker.
 				if !hasInline && knownLongFlags[arg] {
@@ -524,6 +544,12 @@ func IsSafeCommand(args []string) bool {
 	}
 
 	return safeCommands[cmd]
+}
+
+// IsDryRun reports whether args run kubectl in dry-run mode (--dry-run=client
+// or =server, or a bare --dry-run). --dry-run=none/=false are not dry-runs.
+func IsDryRun(args []string) bool {
+	return ParseArgs(args).IsDryRun()
 }
 
 // IsStateAltering returns true if the command modifies cluster state.

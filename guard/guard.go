@@ -125,6 +125,14 @@ func checkWith(args []string, current CurrentContextFunc) (Result, string, *conf
 		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts are configured (use --context instead)")
 	}
 
+	// A state-altering command in dry-run mode (--dry-run=client|server, not
+	// none) changes no cluster state, so skip context/namespace gating. This
+	// reduces cry-wolf prompts on safe operations. Protected-resource blocks
+	// above still apply: a dry-run of a protected resource is still blocked.
+	if IsStateAltering(args) && p.IsDryRun() {
+		return Allow, ctx, cfg, nil
+	}
+
 	// Context protection. If we cannot resolve the context while protected
 	// contexts are configured, fail closed (we can't confirm it's unprotected).
 	contextProtected := false

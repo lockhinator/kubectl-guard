@@ -210,13 +210,18 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
 ## Protection model
 
 - **Protected contexts** — state-altering commands (`apply`, `delete`, `scale`,
-  `exec`, `config use-context`, …) require confirmation. Read-only commands
-  (`get`, `describe`, `logs`, `config view`, …) pass through.
+  `exec`, `config use-context`, …) require confirmation (or are hard-blocked in
+  `context_mode: block`). Read-only commands (`get`, `describe`, `logs`,
+  `config view`, …) pass through.
 - **Protected namespaces** — glob patterns of namespaces that gate
   state-altering commands when the target namespace matches (resolved from
   `--namespace`/`-n`, or `default`). `--all-namespaces`/`-A` is gated whenever
   any namespace is protected. Composes with context protection: a command is
   gated if *either* the context or the namespace is protected.
+- **Block mode** — set `context_mode: block` and/or `namespace_mode: block` to
+  hard-refuse state-altering commands with **no confirmation option** (for CI
+  service accounts or a strict "agents must never touch prod" policy). Block
+  mode is absolute: `--yes`/`KUBECTL_GUARD_CONFIRM` cannot override it.
 - **Protected resources** — any command touching the resource is **blocked
   everywhere** (reads included), regardless of context. Use this to block all
   access to secrets, for example.
@@ -333,6 +338,8 @@ kubectl-guard config add-namespace kube-system  # Gate state changes in a namesp
 kubectl-guard config add-namespace 'prod-*'      # Glob patterns supported
 kubectl-guard config remove-namespace kube-system
 kubectl-guard config confirm-mode type-name  # Stronger confirmation prompt
+kubectl-guard config context-mode block      # Hard-block state changes on protected contexts
+kubectl-guard config namespace-mode block    # Hard-block state changes on protected namespaces
 kubectl-guard config audit-mode all          # Log every command (default)
 kubectl-guard config audit                # Show audit log path + recent entries
 kubectl-guard config setup                # Re-run setup wizard

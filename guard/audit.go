@@ -64,7 +64,7 @@ func AppendAudit(cfg *config.Config, entry AuditEntry) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Acquire exclusive lock to prevent concurrent writes from interleaving.
 	// flock is advisory and works across processes on the same host.

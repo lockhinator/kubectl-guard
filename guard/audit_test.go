@@ -16,8 +16,8 @@ func withTempAuditHome(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	orig := os.Getenv("HOME")
-	os.Setenv("HOME", dir)
-	t.Cleanup(func() { os.Setenv("HOME", orig) })
+	_ = os.Setenv("HOME", dir)
+	t.Cleanup(func() { _ = os.Setenv("HOME", orig) })
 	return filepath.Join(dir, ".kubectl-guard-audit.log")
 }
 

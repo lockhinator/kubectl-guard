@@ -16,13 +16,13 @@ func withTempHome(t *testing.T, cfg *config.Config) func() {
 	t.Helper()
 	tmpDir := t.TempDir()
 	orig := os.Getenv("HOME")
-	os.Setenv("HOME", tmpDir)
+	_ = os.Setenv("HOME", tmpDir)
 	if cfg != nil {
 		if err := config.Save(cfg); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return func() { os.Setenv("HOME", orig) }
+	return func() { _ = os.Setenv("HOME", orig) }
 }
 
 func TestCheck(t *testing.T) {

@@ -253,6 +253,14 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
 - **Protected resources** — any command touching the resource is **blocked
   everywhere** (reads included), regardless of context. Use this to block all
   access to secrets, for example.
+- **`--raw` is un-inspectable** — `kubectl get --raw <path>` requests a literal
+  API-server path, so no resource token appears in the command and resource
+  protection has nothing to match. While **any** resource protection is
+  configured, `--raw` is therefore **blocked** — the same conservative stance
+  taken for stdin/URL/kustomize sources. Without resource protection it is
+  untouched, so `kubectl get --raw /healthz` and `/version` keep working.
+  (`--raw` is also available on `create`/`replace`/`delete`, making it a write
+  vector as well as a read one; all are covered.)
 - **No bypass** — the `--context` and `--kubeconfig` flags are honored, so
   `kubectl --context=prod delete pod x` is still gated.
 - **Targeting & identity flags** — `--server` (which points at a different
@@ -446,7 +454,9 @@ are preserved exactly.
   skip the prompt (audited as `dry-run`). Verbs that have no `--dry-run` flag
   (`exec`, `port-forward`, `proxy`, …) are always gated: a `--dry-run` token on
   such a command never buys an ungated pass.
-- **Protected resources** are blocked on every context, including reads.
+- **Protected resources** are blocked on every context, including reads. While
+  resource protection is active, `--raw` API paths are blocked too, since the
+  guard cannot map them to a resource type.
 - **Targeting/identity** — `--server` is denied when contexts are protected;
   `--as`/`--token` are recorded in the audit log.
 - **Verb resolution** — the guard consumes the values of kubectl's global flags

@@ -295,7 +295,9 @@ func runGuard(args []string) error {
 			switch blockReason {
 			case "protected-resource":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
-				if guard.HasUninspectableSource(forwarded) {
+				if guard.HasRawPath(forwarded) {
+					ui.PrintInfo("Command uses --raw, a literal API path the guard cannot map to a resource type; blocked because resource protection is active.")
+				} else if guard.HasUninspectableSource(forwarded) {
 					ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
 				}
 			case "protected-context-block-mode":

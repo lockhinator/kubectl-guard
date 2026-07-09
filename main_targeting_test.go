@@ -26,7 +26,7 @@ func TestAuditRecordsImpersonation(t *testing.T) {
 	// A read-only command on a protected context is Allowed, so it runs and is
 	// audited. Include --as and --token to exercise attribution.
 	cmd := exec.CommandContext(ctx, bin,
-		"--context=prod-cluster", "--as=system:admin", "--token=tok", "get", "pods")
+		"--context=prod-cluster", "--as=system:admin", "--token", "tok", "get", "pods")
 	cmd.Env = []string{"HOME=" + home, "PATH=" + kubectlDir + ":/usr/bin:/bin"}
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() != 0 {

@@ -36,8 +36,8 @@ func TestMessagesGoToStderr(t *testing.T) {
 
 	// Read captured output
 	var stdoutBuf, stderrBuf bytes.Buffer
-	io.Copy(&stdoutBuf, stdoutR)
-	io.Copy(&stderrBuf, stderrR)
+	_, _ = io.Copy(&stdoutBuf, stdoutR)
+	_, _ = io.Copy(&stderrBuf, stderrR)
 
 	stdoutStr := stdoutBuf.String()
 	stderrStr := stderrBuf.String()
@@ -80,8 +80,8 @@ func TestPrintSuccessAndInfoGoToStderr(t *testing.T) {
 
 	// Read captured output
 	var stdoutBuf, stderrBuf bytes.Buffer
-	io.Copy(&stdoutBuf, stdoutR)
-	io.Copy(&stderrBuf, stderrR)
+	_, _ = io.Copy(&stdoutBuf, stdoutR)
+	_, _ = io.Copy(&stderrBuf, stderrR)
 
 	stdoutStr := stdoutBuf.String()
 	stderrStr := stderrBuf.String()

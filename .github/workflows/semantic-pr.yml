@@ -6,7 +6,9 @@ name: Semantic PR
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
-    branches: [main]
+    # release/** is included so feature PRs into a release branch also have to
+    # carry a conventional title — release-please derives the bump from them.
+    branches: [main, 'release/**']
 
 permissions:
   pull-requests: read

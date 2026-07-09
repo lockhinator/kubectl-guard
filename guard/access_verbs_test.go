@@ -150,15 +150,17 @@ func TestEditDryRunCannotSkipGating(t *testing.T) {
 // return Allow before the fix, and each flag is a real kubectl global flag
 // (verified against `kubectl options`, v1.33).
 var verbShiftBypasses = map[string][]string{
-	"-v short":                {"-v", "3", "port-forward", "svc/prod-db", "5432:5432"},
-	"-v short zero":           {"-v", "0", "proxy"},
-	"--v long":                {"--v", "3", "port-forward", "svc/prod-db", "5432:5432"},
-	"--profile":               {"--profile", "none", "port-forward", "svc/prod-db", "5432:5432"},
-	"--request-timeout":       {"--request-timeout", "30", "delete", "pod", "nginx"},
-	"--cache-dir":             {"--cache-dir", "/tmp/c", "delete", "pod", "nginx"},
-	"--tls-server-name":       {"--tls-server-name", "x", "exec", "nginx", "--", "sh"},
-	"--username":              {"--username", "admin", "apply", "-f", "x.yaml"},
-	"--password":              {"--password", "hunter2", "delete", "pod", "nginx"},
+	"-v short":          {"-v", "3", "port-forward", "svc/prod-db", "5432:5432"},
+	"-v short zero":     {"-v", "0", "proxy"},
+	"--v long":          {"--v", "3", "port-forward", "svc/prod-db", "5432:5432"},
+	"--profile":         {"--profile", "none", "port-forward", "svc/prod-db", "5432:5432"},
+	"--request-timeout": {"--request-timeout", "30", "delete", "pod", "nginx"},
+	"--cache-dir":       {"--cache-dir", "/tmp/c", "delete", "pod", "nginx"},
+	"--tls-server-name": {"--tls-server-name", "x", "exec", "nginx", "--", "sh"},
+	"--username":        {"--username", "admin", "apply", "-f", "x.yaml"},
+	// The flag values here are arbitrary placeholders: these cases assert only
+	// that the flag CONSUMES its value, so the verb after it is still seen.
+	"--password":              {"--password", "pw-placeholder", "delete", "pod", "nginx"},
 	"--client-key":            {"--client-key", "/tmp/k", "proxy"},
 	"--log-flush-freq":        {"--log-flush-frequency", "5s", "delete", "pod", "nginx"},
 	"--vmodule":               {"--vmodule", "x=1", "delete", "pod", "nginx"},

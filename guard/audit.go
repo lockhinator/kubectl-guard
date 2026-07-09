@@ -34,13 +34,15 @@ const (
 // capture kubectl's own exit code or output — only whether the guard allowed,
 // blocked, or prompted for the command.
 type AuditEntry struct {
-	Time    string `json:"time"`
-	User    string `json:"user"`            // OS user (kept for attribution)
-	Actor   string `json:"actor,omitempty"` // who drove it: claude-code, ci, human, etc.
-	Context string `json:"context,omitempty"`
-	Command string `json:"command"`
-	Outcome string `json:"outcome"` // allowed | confirmed | aborted | blocked | denied
-	Reason  string `json:"reason,omitempty"`
+	Time        string `json:"time"`
+	User        string `json:"user"`              // OS user (kept for attribution)
+	Actor       string `json:"actor,omitempty"`   // who drove it: claude-code, ci, human, etc.
+	Impersonate string `json:"impersonate,omitempty"` // --as user, when impersonation was used
+	Token       bool   `json:"token,omitempty"`       // true when --token overrode credentials
+	Context     string `json:"context,omitempty"`
+	Command     string `json:"command"`
+	Outcome     string `json:"outcome"` // allowed | confirmed | aborted | blocked | denied
+	Reason      string `json:"reason,omitempty"`
 }
 
 // AppendAudit appends entry as a JSON line to the configured audit log,

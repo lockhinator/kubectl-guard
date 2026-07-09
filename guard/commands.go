@@ -101,6 +101,25 @@ type ParsedArgs struct {
 	Filenames       []string
 	Kustomize       string // value of -k / --kustomize
 	ExplicitContext bool
+
+	// Targeting & identity flags. --server points at a different API server
+	// (a different cluster) the guard cannot map to a context; --as* impersonate
+	// another identity; --token overrides credentials. Captured so the guard
+	// can fail closed on --server and attribute impersonation in the audit log.
+	Server    string   // --server / -s
+	HasServer bool
+	AsUser    string   // --as
+	AsGroups  []string // --as-group (repeatable)
+	AsUID     string   // --as-uid
+	HasAs     bool     // any --as / --as-group / --as-uid present
+	Token     string   // --token
+	HasToken  bool
+}
+
+// HasImpersonation reports whether any --as / --as-group / --as-uid flag is
+// set, i.e. the command impersonates another identity.
+func (p ParsedArgs) HasImpersonation() bool {
+	return p.HasAs
 }
 
 // ResourceCandidates returns the positional arguments after the verb. Any may
@@ -183,6 +202,19 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 				return true
 			}
 			return false
+		case c == 's':
+			// -s / --server points at a different API server; capture it so the
+			// guard can fail closed when context protection is configured.
+			p.HasServer = true
+			if len(shorthands) > 1 {
+				p.Server = strings.TrimPrefix(shorthands[1:], "=")
+				return false
+			}
+			if len(rest) > 0 {
+				p.Server = rest[0]
+				return true
+			}
+			return false
 		case shortTakesValue[c]:
 			// consumes the rest of the token, or the next argument.
 			if len(shorthands) > 1 {
@@ -246,9 +278,49 @@ func ParseArgs(args []string) ParsedArgs {
 				}
 			case "--kustomize":
 				if hasInline {
-					p.Kustomize = val
+				p.Kustomize = val
 				} else if i+1 < len(args) {
 					p.Kustomize = args[i+1]
+					skipNext = true
+				}
+			case "--server":
+				p.HasServer = true
+				if hasInline {
+					p.Server = val
+				} else if i+1 < len(args) {
+					p.Server = args[i+1]
+					skipNext = true
+				}
+			case "--as":
+				p.HasAs = true
+				if hasInline {
+					p.AsUser = val
+				} else if i+1 < len(args) {
+					p.AsUser = args[i+1]
+					skipNext = true
+				}
+			case "--as-group":
+				p.HasAs = true
+				if hasInline {
+					p.AsGroups = append(p.AsGroups, val)
+				} else if i+1 < len(args) {
+					p.AsGroups = append(p.AsGroups, args[i+1])
+					skipNext = true
+				}
+			case "--as-uid":
+				p.HasAs = true
+				if hasInline {
+					p.AsUID = val
+				} else if i+1 < len(args) {
+					p.AsUID = args[i+1]
+					skipNext = true
+				}
+			case "--token":
+				p.HasToken = true
+				if hasInline {
+					p.Token = val
+				} else if i+1 < len(args) {
+					p.Token = args[i+1]
 					skipNext = true
 				}
 			default:

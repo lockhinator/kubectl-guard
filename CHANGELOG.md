@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0](https://github.com/lockhinator/kubectl-guard/compare/v0.3.0...v0.4.0) (2026-07-09)
+
+
+### Features
+
+* dry-run / diff before confirm ([#21](https://github.com/lockhinator/kubectl-guard/issues/21)) ([#65](https://github.com/lockhinator/kubectl-guard/issues/65)) ([f7bb495](https://github.com/lockhinator/kubectl-guard/commit/f7bb4957ee17df86097abc2a178ab960a8d12ab5))
+* hard block mode for protected contexts/namespaces ([#20](https://github.com/lockhinator/kubectl-guard/issues/20)) ([#64](https://github.com/lockhinator/kubectl-guard/issues/64)) ([405b252](https://github.com/lockhinator/kubectl-guard/commit/405b252072ee0271220581f755bace84d13a1f39))
+* honor targeting & identity flags (--server/--as/--token) for protection + audit ([#18](https://github.com/lockhinator/kubectl-guard/issues/18)) ([#61](https://github.com/lockhinator/kubectl-guard/issues/61)) ([a847c52](https://github.com/lockhinator/kubectl-guard/commit/a847c520225944ec90fae453430be4c67278ce41))
+* namespace-level protection (protected_namespaces) ([#19](https://github.com/lockhinator/kubectl-guard/issues/19)) ([#63](https://github.com/lockhinator/kubectl-guard/issues/63)) ([82e509f](https://github.com/lockhinator/kubectl-guard/commit/82e509f77812f21559595923bbc35369e5ad2229))
+
+
+### Bug Fixes
+
+* harden dry-run/namespace parsing and resolve namespace from context ([2c02f72](https://github.com/lockhinator/kubectl-guard/commit/2c02f7228c396a2ba8f29cd8e152b152a75befee))
+* memoize context-namespace lookup so message matches the gated decision ([33e06c1](https://github.com/lockhinator/kubectl-guard/commit/33e06c1b86f3fcbd04606998ea74af32a638b02e))
+* skip the prompt for --dry-run commands (cry-wolf reduction) ([#22](https://github.com/lockhinator/kubectl-guard/issues/22)) ([#66](https://github.com/lockhinator/kubectl-guard/issues/66)) ([c37d707](https://github.com/lockhinator/kubectl-guard/commit/c37d707271cb527747f10ebcd2dedf8e067441f8))
+
 ## [0.3.0](https://github.com/lockhinator/kubectl-guard/compare/v0.2.3...v0.3.0) (2026-07-09)
 
 

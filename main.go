@@ -52,6 +52,8 @@ func run() error {
 				return runConfigCommand()
 			}
 			return runGuard(os.Args[1:])
+		case "doctor":
+			return runDoctor()
 		case "--version", "-V":
 			fmt.Printf("kubectl-guard %s\n", version)
 			return nil
@@ -63,6 +65,46 @@ func run() error {
 
 	// Otherwise, forward to kubectl with protection
 	return runGuard(os.Args[1:])
+}
+
+// runDoctor reports whether PATH-shadowing interception is active and where
+// the real kubectl lives. Output is human-readable and routed to stderr to
+// keep stdout clean (consistent with the guard's other user-facing messages).
+func runDoctor() error {
+	r := guard.Doctor()
+
+	ui.PrintInfo("guard binary:  " + orUnknown(r.GuardPath))
+
+	ui.PrintInfo("kubectl on PATH (in order):")
+	if len(r.KubectlOnPath) == 0 {
+		fmt.Fprintln(os.Stderr, "  (none - kubectl is not on PATH)")
+	} else {
+		for _, p := range r.KubectlOnPath {
+			fmt.Fprintf(os.Stderr, "  - %s\n", p)
+		}
+	}
+
+	if r.Intercepted {
+		ui.PrintSuccess("interception: ACTIVE - kubectl resolves to the guard")
+	} else {
+		ui.PrintWarning("interception: INACTIVE - kubectl does NOT resolve to the guard")
+		ui.PrintInfo("Run 'make install-shim' and prepend the shim directory to PATH to intercept non-interactive/agent calls.")
+	}
+
+	if r.RealKubectlPath != "" {
+		ui.PrintInfo("real kubectl:  " + r.RealKubectlPath)
+	} else if r.Err != nil {
+		ui.PrintWarning("could not resolve the real kubectl: " + r.Err.Error())
+	}
+
+	return nil
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "(unknown)"
+	}
+	return s
 }
 
 func runGuard(args []string) error {

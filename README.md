@@ -68,6 +68,37 @@ Verify the installation:
 kubectl-guard --version  # or -V
 ```
 
+#### PATH-shadowing install (agents & non-interactive shells)
+
+The alias above only applies in **interactive** shells. An AI agent or script
+that execs `kubectl` by name (or by absolute path) in a non-interactive shell
+**bypasses the alias entirely**. For the agent use case, install a
+`kubectl` shim that sits **earlier in `PATH`** than the real kubectl:
+
+```bash
+make install-shim
+```
+
+This installs the guard and a `kubectl` symlink pointing at it under
+`~/.local/share/kubectl-guard/shims/`, then prints the `PATH` line to add to
+your shell config (`~/.zshrc` or `~/.bashrc`):
+
+```bash
+export PATH="$HOME/.local/share/kubectl-guard/shims:$PATH"
+```
+
+Reload your shell, then confirm interception is active:
+
+```bash
+kubectl-guard doctor
+```
+
+When invoked as `kubectl`, the guard runs its protection logic and `exec`s the
+**real** kubectl (found by skipping itself on `PATH`), so stdout, stdin, and
+exit codes are preserved and there is no infinite loop. This intercepts
+`kubectl get secret` even from `bash -c 'kubectl get secret'` or an agent
+subprocess.
+
 On first run, kubectl-guard presents an interactive setup wizard to select which contexts to protect:
 
 ```
@@ -245,6 +276,18 @@ kubectl-guard config setup                # Re-run setup wizard
 kubectl-guard config path                 # Print config file path
 ```
 
+### Diagnostics
+
+```bash
+kubectl-guard doctor                      # Check PATH-shadowing interception
+```
+
+`doctor` reports whether `kubectl` on `PATH` resolves to the guard (i.e.
+interception is **ACTIVE**), lists every `kubectl` found on `PATH` in order
+(like `which -a kubectl`), and prints the resolved path of the **real**
+kubectl the guard forwards to. Use it after `make install-shim` to confirm
+agents and non-interactive shells are covered.
+
 ## How it works
 
 kubectl-guard is installed as a drop-in alias for `kubectl`. Each invocation
@@ -272,9 +315,12 @@ commands**, not a substitute for Kubernetes RBAC or network policy. Worth
 knowing:
 
 - **Not an access-control boundary.** A determined user can bypass it by
-  running the real `kubectl` binary directly or un-aliasing. Use RBAC for
-  real enforcement; use kubectl-guard for the "are you sure?" and the audit
-  trail.
+  running the real `kubectl` binary directly or un-aliasing. The
+  [PATH-shadowing install](#path-shadowing-install-agents--non-interactive-shells)
+  closes the common gap (non-interactive shells and agents that call `kubectl`
+  by name), but a user can still invoke the real binary by absolute path. Use
+  RBAC for real enforcement; use kubectl-guard for the "are you sure?" and the
+  audit trail.
 - **TOCTOU on `-f` files.** There is a small window between the guard
   scanning a manifest and `kubectl` re-reading it. The threat model is
   accidents and unsupervised agents, not an adversary swapping a symlink

@@ -117,6 +117,29 @@ Every attempt — blocked, aborted, or confirmed — is appended to the audit lo
 
 By default the audit log captures **every** command the agent runs — including the ones it was allowed to run — not just the ones that were gated. So when Claude shells into your cluster, you get a complete, timestamped record of everything it executed, which is invaluable for post-incident review. Tune this with `config audit-mode` (`all` | `gated` | `off`).
 
+### Identifying who drove a command
+
+Every audit entry records an **`actor`** — *who* drove the command — alongside the OS `user` whose account ran it. Without this, `kubectl get secret` run by Claude and typed by a human look identical in the log. Set `KUBECTL_GUARD_ACTOR` to a short label so agent activity is distinguishable:
+
+```bash
+# In your shell, CI step, or agent framework's env config:
+export KUBECTL_GUARD_ACTOR=claude-code
+# For Claude Code, add it to settings.json under "env"; for Cursor/other
+# tools, export it in the session that launches the agent.
+```
+
+```jsonl
+{"time":"2026-07-09T10:00:00Z","user":"cameron","actor":"claude-code","command":"get secret stripe-keys","outcome":"blocked","reason":"protected-resource"}
+```
+
+The actor is resolved in priority order:
+
+1. `KUBECTL_GUARD_ACTOR` env var (explicit opt-in — the clean, portable path).
+2. The `actor` field in `~/.kubectl-guard.yaml` (a static default, e.g. for a shared CI host).
+3. The OS username (fallback — current behavior).
+
+The OS `user` is always recorded regardless, so you keep full attribution. `config audit` shows the `actor` in recent entries automatically.
+
 ## Protection model
 
 - **Protected contexts** — state-altering commands (`apply`, `delete`, `scale`,

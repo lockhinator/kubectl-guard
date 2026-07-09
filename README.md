@@ -6,6 +6,26 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
 
 > LLMs can run kubectl on your behalf — but they have no "are you sure?" reflex. Whatever they read becomes context, and context leaks: into logs, into transcripts, into a model provider's servers. kubectl-guard is the human-in-the-loop seatbelt for that.
 
+## Features
+
+- **🔒 Secret protection** — Block all secret access across your entire cluster. Secrets never leave the cluster, so they can never enter LLM context windows or logs.
+- **🚦 Production gating** — Require explicit confirmation for state-altering commands on production contexts. Type the context name to confirm — something autonomous agents can't do.
+- **📋 Comprehensive audit logging** — Every command is logged with timestamps, context, and outcome. Full visibility into what your agents (or you) tried to do.
+- **🛡️ No bypass** — Respects `--context` and `--kubeconfig` flags, so even explicit context switches are gated.
+- **⚡ Drop-in replacement** — Works as a kubectl alias. No changes to your workflows or agent prompts.
+- **🔧 Reliable configuration** — Atomic config writes and concurrent-safe audit logging prevent corruption.
+- **🎯 Smart command classification** — Automatically distinguishes safe reads from dangerous mutations, even with uppercase verbs or plugins.
+
+## What's New
+
+### v0.2.1 — Reliability & Security Fixes
+
+- **Atomic config writes** — Configuration files are now written atomically (temp file + rename) to prevent corruption if writes fail mid-flight.
+- **Concurrent-safe audit logging** — Audit log writes use file locking to prevent interleaved or corrupted entries under concurrent use.
+- **Clean output separation** — Guard messages now route to stderr, keeping stdout clean for kubectl output and piping.
+- **Version flag fix** — `-v` now properly forwards to kubectl for verbosity. Use `--version` or `-V` to show kubectl-guard version.
+- **Uppercase verb protection** — Commands with uppercase verbs (e.g., `DELETE`, `APPLY`) can no longer bypass context protection.
+
 ## The problem
 
 When an autonomous agent has cluster access, these are all one command away from a data leak or an outage — and the agent will just *do* them, with no pause for confirmation:
@@ -40,6 +60,12 @@ Then add the alias to your shell config (`~/.zshrc` or `~/.bashrc`):
 
 ```bash
 alias kubectl='kubectl-guard'
+```
+
+Verify the installation:
+
+```bash
+kubectl-guard --version  # or -V
 ```
 
 On first run, kubectl-guard presents an interactive setup wizard to select which contexts to protect:
@@ -101,9 +127,13 @@ By default the audit log captures **every** command the agent runs — including
   access to secrets, for example.
 - **No bypass** — the `--context` and `--kubeconfig` flags are honored, so
   `kubectl --context=prod delete pod x` is still gated.
+- **Case-insensitive verbs** — Commands with uppercase verbs (`DELETE`, `APPLY`)
+  are normalized and treated the same as lowercase, preventing bypass attempts.
+- **Clean output** — Guard messages route to stderr, keeping stdout clean for
+  kubectl output and piping to other tools.
 - Every command is written to the **audit log** (by default; see
   `audit_mode`), recording who ran it, when, against which context, and the
-  guard's decision.
+  guard's decision. Audit log writes are concurrent-safe with file locking.
 
 ## Protected resources (reference)
 
@@ -148,8 +178,8 @@ Use `kubectl-guard config list` to see which resources are currently protected.
 
 Config file: `~/.kubectl-guard.yaml` (print the exact path with
 `kubectl-guard config path`). It is written with `0600` permissions
-(owner read/write only) and re-read on every invocation, so it can also be
-hand-edited.
+(owner read/write only) using atomic writes (temp file + rename) to prevent
+corruption. Config is re-read on every invocation, so it can also be hand-edited.
 
 ```yaml
 # kubectl-guard configuration
@@ -179,6 +209,7 @@ Fields:
 Manage via CLI:
 
 ```bash
+kubectl-guard --version                  # Show version (or -V)
 kubectl-guard config list                 # Show contexts, resources, modes
 kubectl-guard config add-context prod-*   # Protect matching contexts
 kubectl-guard config remove-context staging
@@ -203,8 +234,11 @@ pass through — then replaces its own process with the real `kubectl` via
   pass through without prompts.
 - **State-altering commands** (`apply`, `delete`, `scale`, `exec`,
   `config use-context`, `auth reconcile`, …) require confirmation on
-  protected contexts.
+  protected contexts. Verbs are case-insensitive (uppercase `DELETE` is
+  treated the same as lowercase `delete`).
 - **Protected resources** are blocked on every context, including reads.
+- **Guard messages** route to stderr, keeping stdout clean for kubectl output
+  and piping to other tools.
 - Context matching uses glob patterns; resource matching treats
   singular/plural/short-name forms as equivalent.
 
@@ -223,6 +257,16 @@ knowing:
   accidents and unsupervised agents, not an adversary swapping a symlink
   mid-flight.
 - **Unknown verbs pass through.** Unrecognized commands (e.g. some plugins)
-  are forwarded without a prompt.
+  are forwarded without a prompt, but verb normalization prevents uppercase
+  bypass attempts.
 - **`-k` kustomize** directories are conservatively blocked when resource
   protection is active, but their contents are not deeply parsed.
+
+## Reliability
+
+- **Atomic config writes** — Configuration is written to a temp file then
+  renamed, preventing corruption if writes fail mid-flight.
+- **Concurrent-safe audit logging** — File locking prevents interleaved or
+  corrupted audit entries under concurrent use.
+- **Clean output separation** — Guard messages route to stderr, keeping
+  stdout clean for kubectl output and piping to other tools.

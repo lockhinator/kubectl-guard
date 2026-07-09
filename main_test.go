@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -68,5 +69,51 @@ func TestVersionFlags(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+func TestVersionFormat(t *testing.T) {
+	// Build with injected version to test format
+	buildCmd := exec.Command("go", "build", "-ldflags", "-X main.version=0.2.2", "-o", "kubectl-guard-version-test", ".")
+	if err := buildCmd.Run(); err != nil {
+		t.Fatalf("failed to build guard with version: %v", err)
+	}
+	defer os.Remove("kubectl-guard-version-test")
+
+	cmd := exec.Command("./kubectl-guard-version-test", "--version")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to run --version: %v", err)
+	}
+
+	outputStr := string(output)
+	// Expected format: "kubectl-guard 0.2.2"
+	versionRegex := regexp.MustCompile(`^kubectl-guard [\d.]+\s*$`)
+	if !versionRegex.MatchString(outputStr) {
+		t.Errorf("version output has unexpected format, got: %q", outputStr)
+	}
+
+	if !strings.Contains(outputStr, "0.2.2") {
+		t.Errorf("version output should contain injected version, got: %q", outputStr)
+	}
+}
+
+func TestVersionDevDefault(t *testing.T) {
+	// Build without version injection should default to "dev"
+	buildCmd := exec.Command("go", "build", "-o", "kubectl-guard-dev-test", ".")
+	if err := buildCmd.Run(); err != nil {
+		t.Fatalf("failed to build guard: %v", err)
+	}
+	defer os.Remove("kubectl-guard-dev-test")
+
+	cmd := exec.Command("./kubectl-guard-dev-test", "--version")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to run --version: %v", err)
+	}
+
+	outputStr := string(output)
+	expected := "kubectl-guard dev\n"
+	if outputStr != expected {
+		t.Errorf("default version should be 'dev', got: %q", outputStr)
 	}
 }

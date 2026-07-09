@@ -11,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// version is injected at build time by GoReleaser (-X main.version=X).
+// Defaults to "dev" for local builds.
 var version = "dev"
 
 // guardConfigSubcommands are the kubectl-guard "config" subcommands. Any other

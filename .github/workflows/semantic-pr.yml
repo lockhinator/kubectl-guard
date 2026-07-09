@@ -32,4 +32,5 @@ jobs:
             ci
             build
             style
+            release
           requireScope: false

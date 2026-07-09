@@ -314,6 +314,36 @@ interception is **ACTIVE**), lists every `kubectl` found on `PATH` in order
 kubectl the guard forwards to. Use it after `make install-shim` to confirm
 agents and non-interactive shells are covered.
 
+### Automation escape hatch (audited)
+
+For legitimate automation — a CI/CD pipeline or deploy script that needs to
+run a gated command on a protected context — the guard offers a deliberate,
+**audited** bypass:
+
+```bash
+# Auto-confirm a gated command (state-altering on a protected context).
+# Runs without prompting and is logged as "auto-confirmed" with the actor.
+kubectl delete pod nginx --yes
+# or via env var (handy for CI):
+KUBECTL_GUARD_CONFIRM=yes kubectl delete pod nginx
+```
+
+**`--yes` / `KUBECTL_GUARD_CONFIRM=yes` only auto-confirms `RequireConfirmation`
+(state-altering on a protected context). It does NOT bypass a protected-resource
+`Blocked` — that stays a hard block.** If you need to apply a secret in CI,
+remove it from `protected_resources` or scope it. The bypass is recorded with a
+distinct `auto-confirmed` outcome (not `confirmed`) so the audit trail shows
+exactly which runs were auto-approved.
+
+```bash
+# Hard bypass (discouraged): disable the guard entirely for one invocation.
+# Even protected-resource blocks are skipped. Logged as "bypassed".
+KUBECTL_GUARD_BYPASS=1 kubectl apply -f emergency.yaml
+```
+
+`KUBECTL_GUARD_BYPASS` is the nuclear option — use it only when you must drop
+protection wholesale, and expect it to stand out in the audit log.
+
 ## How it works
 
 kubectl-guard is installed as a drop-in alias for `kubectl`. Each invocation

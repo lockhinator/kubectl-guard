@@ -18,11 +18,13 @@ const ActorEnvVar = "KUBECTL_GUARD_ACTOR"
 
 // Outcome constants for audit entries.
 const (
-	OutcomeAllowed   = "allowed"   // command passed through ungated
-	OutcomeConfirmed = "confirmed" // gated command, user confirmed
-	OutcomeAborted   = "aborted"   // gated command, user declined
-	OutcomeBlocked   = "blocked"   // protected resource, refused
-	OutcomeDenied    = "denied"    // fail-closed (config/context error)
+	OutcomeAllowed        = "allowed"        // command passed through ungated
+	OutcomeConfirmed      = "confirmed"      // gated command, user confirmed
+	OutcomeAborted        = "aborted"        // gated command, user declined
+	OutcomeBlocked        = "blocked"        // protected resource, refused
+	OutcomeDenied         = "denied"         // fail-closed (config/context error)
+	OutcomeAutoConfirmed  = "auto-confirmed" // gated command, auto-approved via --yes/KUBECTL_GUARD_CONFIRM (audited)
+	OutcomeBypassed       = "bypassed"       // guard fully bypassed via KUBECTL_GUARD_BYPASS (audited, discouraged)
 )
 
 // AuditEntry is a single line in the audit log.

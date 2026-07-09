@@ -170,6 +170,13 @@ func TestIsStateAltering(t *testing.T) {
 		{"debug", []string{"debug", "nginx"}, true},
 		{"attach", []string{"attach", "nginx"}, true},
 
+		// High-risk access vectors: no cluster mutation, but they open a live
+		// channel into it, so they are gated like state-altering commands (#71).
+		{"port-forward", []string{"port-forward", "svc/prod-postgres", "5432:5432"}, true},
+		{"port-forward uppercase", []string{"PORT-FORWARD", "svc/db", "5432:5432"}, true},
+		{"proxy", []string{"proxy"}, true},
+		{"proxy with port", []string{"proxy", "--port=8080"}, true},
+
 		// config/auth mutating subcommands are state-altering
 		{"config use-context", []string{"config", "use-context", "prod"}, true},
 		{"config delete-context", []string{"config", "delete-context", "prod"}, true},

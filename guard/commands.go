@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -79,7 +80,7 @@ var shortTakesValue = map[byte]bool{
 // handled explicitly in ParseArgs and intentionally omitted here.
 var knownLongFlags = map[string]bool{
 	"--selector": true,
-	"--output": true, "--container": true,
+	"--output":   true, "--container": true,
 	"--cluster": true, "--user": true,
 }
 
@@ -109,7 +110,7 @@ type ParsedArgs struct {
 	// (a different cluster) the guard cannot map to a context; --as* impersonate
 	// another identity; --token overrides credentials. Captured so the guard
 	// can fail closed on --server and attribute impersonation in the audit log.
-	Server    string   // --server / -s
+	Server    string // --server / -s
 	HasServer bool
 	AsUser    string   // --as
 	AsGroups  []string // --as-group (repeatable)
@@ -138,11 +139,51 @@ func (p ParsedArgs) HasImpersonation() bool {
 	return p.HasAs
 }
 
-// IsDryRun reports whether the command runs in dry-run mode (--dry-run=client
-// or =server, or a bare --dry-run). --dry-run=none (the default) and =false are
-// NOT dry-runs: the command would change state and is gated normally.
+// IsDryRun reports whether the command runs in dry-run mode, mirroring
+// kubectl's own --dry-run parsing (cmdutil.GetDryRunStrategy). Anything kubectl
+// treats as a real mutation must NOT be treated as a dry-run here, or the guard
+// would skip gating on a command that actually changes cluster state.
+//
+// kubectl parses the flag with strconv.ParseBool first: any boolean-false form
+// (false/f/F/0/False/FALSE/...) means DryRunNone -> a REAL mutation. Only
+// "client", "server", "unchanged" (bare --dry-run), and boolean-true forms are
+// genuine dry-runs. "none" and any invalid value gate normally (kubectl rejects
+// invalid values, so nothing runs anyway; failing closed is correct).
 func (p ParsedArgs) IsDryRun() bool {
-	return p.HasDryRun && p.DryRun != "none" && p.DryRun != "false"
+	if !p.HasDryRun {
+		return false
+	}
+	if b, err := strconv.ParseBool(p.DryRun); err == nil {
+		// true (client) is a dry-run; false is a real mutation.
+		return b
+	}
+	switch strings.ToLower(p.DryRun) {
+	case "client", "server", "unchanged":
+		return true
+	default: // "none" or an invalid value: gate normally.
+		return false
+	}
+}
+
+// ImpersonationString summarizes the impersonation identity (--as / --as-group
+// / --as-uid) for the audit log, or "" when none is set. It combines all three
+// so that group- or uid-only impersonation (e.g. --as-group=system:masters with
+// no --as) is still attributed, not silently dropped.
+func (p ParsedArgs) ImpersonationString() string {
+	if !p.HasAs {
+		return ""
+	}
+	var parts []string
+	if p.AsUser != "" {
+		parts = append(parts, p.AsUser)
+	}
+	for _, g := range p.AsGroups {
+		parts = append(parts, "group:"+g)
+	}
+	if p.AsUID != "" {
+		parts = append(parts, "uid:"+p.AsUID)
+	}
+	return strings.Join(parts, ",")
 }
 
 // ResolvedNamespace returns the namespace a command targets, for protection
@@ -328,7 +369,7 @@ func ParseArgs(args []string) ParsedArgs {
 				}
 			case "--kustomize":
 				if hasInline {
-				p.Kustomize = val
+					p.Kustomize = val
 				} else if i+1 < len(args) {
 					p.Kustomize = args[i+1]
 					skipNext = true
@@ -382,7 +423,19 @@ func ParseArgs(args []string) ParsedArgs {
 					skipNext = true
 				}
 			case "--all-namespaces":
-				p.AllNamespaces = true
+				// Honor an explicit boolean value: --all-namespaces=false does
+				// NOT span namespaces (matches kubectl), so it must not be gated
+				// as if it did. A bare --all-namespaces or a non-boolean value
+				// means true.
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.AllNamespaces = b
+					} else {
+						p.AllNamespaces = true
+					}
+				} else {
+					p.AllNamespaces = true
+				}
 			case "--dry-run":
 				p.HasDryRun = true
 				if hasInline {

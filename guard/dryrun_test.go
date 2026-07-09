@@ -19,6 +19,17 @@ func TestParseArgsDryRun(t *testing.T) {
 		{"none", []string{"apply", "--dry-run=none", "-f", "x.yaml"}, false},
 		{"false", []string{"apply", "--dry-run=false", "-f", "x.yaml"}, false},
 		{"absent", []string{"apply", "-f", "x.yaml"}, false},
+		// Boolean-false forms kubectl accepts (ParseBool) are REAL mutations,
+		// so they must not read as dry-runs (previously they bypassed gating).
+		{"zero", []string{"apply", "--dry-run=0", "-f", "x.yaml"}, false},
+		{"f", []string{"apply", "--dry-run=f", "-f", "x.yaml"}, false},
+		{"F-caps", []string{"apply", "--dry-run=F", "-f", "x.yaml"}, false},
+		{"False", []string{"apply", "--dry-run=False", "-f", "x.yaml"}, false},
+		{"FALSE", []string{"apply", "--dry-run=FALSE", "-f", "x.yaml"}, false},
+		// Boolean-true and "unchanged" forms are genuine dry-runs.
+		{"one", []string{"apply", "--dry-run=1", "-f", "x.yaml"}, true},
+		{"t", []string{"apply", "--dry-run=t", "-f", "x.yaml"}, true},
+		{"unchanged", []string{"apply", "--dry-run=unchanged", "-f", "x.yaml"}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -89,5 +100,34 @@ func TestDryRunNamespaceGatingSkipped(t *testing.T) {
 	res, _, _, _ := checkWith([]string{"apply", "--dry-run=client", "-f", "x.yaml", "-n", "kube-system"}, staticContext("dev"))
 	if res != Allow {
 		t.Errorf("result = %v, want Allow (dry-run skips namespace gating)", res)
+	}
+}
+
+// TestDryRunFalseFormsDoNotBypassBlockMode: a boolean-false --dry-run value is a
+// REAL mutation in kubectl, so it must not skip gating. On a block-mode context
+// these must stay Blocked (regression: --dry-run=0 previously slipped through as
+// an Allow, defeating "absolute" block mode).
+func TestDryRunFalseFormsDoNotBypassBlockMode(t *testing.T) {
+	cleanup := withTempHome(t, &config.Config{
+		ProtectedContexts: []string{"prod-*"},
+		ContextMode:       config.ContextModeBlock,
+	})
+	defer cleanup()
+	for _, v := range []string{"0", "f", "F", "False", "FALSE"} {
+		args := []string{"--context=prod-cluster", "delete", "pod", "nginx", "--dry-run=" + v}
+		if res, _, _, _ := checkWith(args, staticContext("prod-cluster")); res != Blocked {
+			t.Errorf("--dry-run=%s: result = %v, want Blocked (false form is a real mutation)", v, res)
+		}
+	}
+}
+
+// TestDryRunFalseFormStillGatesConfirm: the same false forms still require
+// confirmation on a confirm-mode protected context (not Allowed).
+func TestDryRunFalseFormStillGatesConfirm(t *testing.T) {
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	defer cleanup()
+	res, _, _, _ := checkWith([]string{"--context=prod-cluster", "delete", "pod", "nginx", "--dry-run=0"}, staticContext("prod-cluster"))
+	if res != RequireConfirmation {
+		t.Errorf("result = %v, want RequireConfirmation (--dry-run=0 is a real mutation)", res)
 	}
 }

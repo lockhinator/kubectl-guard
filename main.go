@@ -21,23 +21,23 @@ var version = "dev"
 // "config <subcommand>" (e.g. "config use-context", "config view") is a kubectl
 // command and must be forwarded through the guard rather than intercepted.
 var guardConfigSubcommands = map[string]bool{
-	"setup":           true,
-	"init":            true,
-	"list":            true,
-	"add":             true,
-	"remove":          true,
-	"add-context":     true,
-	"remove-context":  true,
-	"add-resource":    true,
-	"remove-resource": true,
-	"add-namespace":   true,
+	"setup":            true,
+	"init":             true,
+	"list":             true,
+	"add":              true,
+	"remove":           true,
+	"add-context":      true,
+	"remove-context":   true,
+	"add-resource":     true,
+	"remove-resource":  true,
+	"add-namespace":    true,
 	"remove-namespace": true,
-	"confirm-mode":    true,
-	"context-mode":    true,
-	"namespace-mode":  true,
-	"audit-mode":     true,
-	"audit":           true,
-	"path":            true,
+	"confirm-mode":     true,
+	"context-mode":     true,
+	"namespace-mode":   true,
+	"audit-mode":       true,
+	"audit":            true,
+	"path":             true,
 }
 
 func main() {
@@ -139,8 +139,8 @@ func runBypass(args []string) error {
 				Reason:  "KUBECTL_GUARD_BYPASS",
 			}
 			p := guard.ParseArgs(args)
-			if p.AsUser != "" {
-				e.Impersonate = p.AsUser
+			if imp := p.ImpersonationString(); imp != "" {
+				e.Impersonate = imp
 			}
 			if p.HasToken {
 				e.Token = true
@@ -194,8 +194,8 @@ func runGuard(args []string) error {
 			Outcome: outcome,
 			Reason:  reason,
 		}
-		if parsed.AsUser != "" {
-			e.Impersonate = parsed.AsUser
+		if imp := parsed.ImpersonationString(); imp != "" {
+			e.Impersonate = imp
 		}
 		if parsed.HasToken {
 			e.Token = true
@@ -301,9 +301,9 @@ func runGuard(args []string) error {
 			case "protected-context-block-mode":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
 			default: // protected-namespace-block-mode
-				ns := parsed.ResolvedNamespace()
-				if parsed.AllNamespaces {
-					ns = "all namespaces"
+				ns := "all namespaces"
+				if !parsed.AllNamespaces {
+					ns = guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
 				}
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected namespace %q (block mode: no confirmation offered)", cmdDesc, ns))
 			}
@@ -337,15 +337,20 @@ func runGuard(args []string) error {
 		cmdDesc := guard.GetCommandDescription(forwarded)
 		// Describe what is protected so the user knows why they're confirming.
 		// Namespace protection (#19) may trigger gating even on an unprotected
-		// context, so the message reflects whichever applies.
+		// context (including from the context's baked-in namespace), so the
+		// message names whichever actually applies.
 		reason := "protected context"
 		target := ctx
-		if parsed.AllNamespaces {
-			reason = "protected namespace"
-			target = "all namespaces"
-		} else if parsed.HasNamespace && parsed.Namespace != "" {
-			reason = "protected namespace"
-			target = parsed.Namespace
+		switch {
+		case parsed.AllNamespaces && cfg != nil && cfg.HasProtectedNamespaces():
+			reason, target = "protected namespace", "all namespaces"
+		case parsed.HasNamespace && parsed.Namespace != "" && cfg != nil && cfg.IsNamespaceProtected(parsed.Namespace):
+			reason, target = "protected namespace", parsed.Namespace
+		case cfg != nil && cfg.IsContextProtected(ctx):
+			reason, target = "protected context", ctx
+		case cfg != nil && cfg.HasProtectedNamespaces():
+			// Namespace-driven gating from the context's baked-in namespace.
+			reason, target = "protected namespace", guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
 		}
 		message := fmt.Sprintf("%s on %s: %s", cmdDesc, reason, target)
 
@@ -459,7 +464,6 @@ func runConfigCommand() error {
 	initCmd.Flags().String("confirm-mode", "", "confirmation mode for protected contexts (simple|type-name)")
 	rootCmd.AddCommand(initCmd)
 
-
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "list",
 		Short: "List protected contexts and resources",
@@ -472,9 +476,9 @@ func runConfigCommand() error {
 	// add-resource / remove-resource all share one shape.
 	addCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool) {
 		rootCmd.AddCommand(&cobra.Command{
-			Use:   use,
-			Short: short,
-			Args:  cobra.ExactArgs(1),
+			Use:    use,
+			Short:  short,
+			Args:   cobra.ExactArgs(1),
 			Hidden: hidden,
 			RunE: func(_ *cobra.Command, a []string) error {
 				return mutateConfig(func(c *config.Config) bool { return fn(c, a[0]) }, fmt.Sprintf(doneTmpl, a[0]), fmt.Sprintf(noopTmpl, a[0]))

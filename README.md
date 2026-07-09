@@ -223,10 +223,12 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
   `context_mode: block`). Read-only commands (`get`, `describe`, `logs`,
   `config view`, …) pass through.
 - **Protected namespaces** — glob patterns of namespaces that gate
-  state-altering commands when the target namespace matches (resolved from
-  `--namespace`/`-n`, or `default`). `--all-namespaces`/`-A` is gated whenever
-  any namespace is protected. Composes with context protection: a command is
-  gated if *either* the context or the namespace is protected.
+  state-altering commands when the target namespace matches. The target
+  namespace is resolved from `--namespace`/`-n`, then the namespace baked into
+  the resolved context (best-effort via kubeconfig), then `default`.
+  `--all-namespaces`/`-A` is gated whenever any namespace is protected.
+  Composes with context protection: a command is gated if *either* the context
+  or the namespace is protected.
 - **Block mode** — set `context_mode: block` and/or `namespace_mode: block` to
   hard-refuse state-altering commands with **no confirmation option** (for CI
   service accounts or a strict "agents must never touch prod" policy). Block
@@ -326,7 +328,8 @@ Fields:
 - **`protected_contexts`** — glob patterns of contexts that gate
   state-altering commands (require confirmation)
 - **`protected_namespaces`** — glob patterns of namespaces that gate
-  state-altering commands (resolved from `--namespace`/`-n`, or `default`)
+  state-altering commands (resolved from `--namespace`/`-n`, the context's
+  baked-in namespace, or `default`)
 - **`protected_resources`** — resources blocked everywhere, reads included
 - **`context_mode`** — `confirm` (default, prompts) or `block` (hard-refuse)
 - **`namespace_mode`** — `confirm` (default) or `block`, for protected namespaces

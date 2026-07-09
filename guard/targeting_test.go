@@ -62,6 +62,30 @@ func TestParseArgsIdentityFlags(t *testing.T) {
 	}
 }
 
+// TestImpersonationString: the audit summary attributes --as, --as-group, and
+// --as-uid, including group- or uid-only impersonation (which previously left
+// the audit Impersonate field empty).
+func TestImpersonationString(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"as only", []string{"--as=system:admin", "get", "pods"}, "system:admin"},
+		{"group only", []string{"--as-group=system:masters", "delete", "pod", "x"}, "group:system:masters"},
+		{"uid only", []string{"--as-uid=0", "delete", "pod", "x"}, "uid:0"},
+		{"combined", []string{"--as=alice", "--as-group=devs", "--as-uid=42", "get", "pods"}, "alice,group:devs,uid:42"},
+		{"none", []string{"get", "pods"}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ParseArgs(tt.args).ImpersonationString(); got != tt.want {
+				t.Errorf("ImpersonationString(%v) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestParseArgsNoIdentityFlags: without identity flags, HasImpersonation/HasToken are false.
 func TestParseArgsNoIdentityFlags(t *testing.T) {
 	p := ParseArgs([]string{"get", "pods"})

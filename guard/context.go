@@ -104,6 +104,43 @@ func defaultCurrentContext(kubeconfig string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// NamespaceForContextFunc returns the namespace baked into the given context
+// in kubeconfig, or "" when the context sets none. kubeconfig "" uses the
+// default lookup; context "" means the current context. The default
+// implementation shells out to kubectl; tests inject a fake so namespace
+// resolution can be exercised without kubectl on PATH.
+type NamespaceForContextFunc func(kubeconfig, context string) (string, error)
+
+// noContextNamespace is the resolver used by checkWith (the test seam): it
+// reports no context namespace, so resolution falls back to "default" and no
+// kubectl subprocess is spawned during unit tests that don't opt in.
+func noContextNamespace(_, _ string) (string, error) { return "", nil }
+
+// defaultContextNamespace reads the namespace baked into a context via
+// `kubectl config view --minify`, honoring an explicit --kubeconfig/--context.
+// It targets the REAL kubectl so a PATH-shadowing shim cannot make the guard
+// recurse into itself. An empty result means the context sets no namespace
+// (kubectl then defaults to "default").
+func defaultContextNamespace(kubeconfig, context string) (string, error) {
+	var args []string
+	if kubeconfig != "" {
+		args = append(args, "--kubeconfig="+kubeconfig)
+	}
+	if context != "" {
+		args = append(args, "--context="+context)
+	}
+	args = append(args, "config", "view", "--minify", "-o", "jsonpath={.contexts[0].context.namespace}")
+	cmd, err := kubectlCommand(args...)
+	if err != nil {
+		return "", err
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // parseContextLine parses a line from `kubectl config get-contexts --no-headers`.
 // Format: CURRENT   NAME   CLUSTER   AUTHINFO   NAMESPACE
 // CURRENT is * or empty.

@@ -124,13 +124,23 @@ func orUnknown(s string) string {
 func runBypass(args []string) error {
 	ui.PrintWarning("KUBECTL_GUARD_BYPASS set: guard disabled for this invocation (audited).")
 	// Best-effort audit: if a config exists, log the bypass so it's traceable.
+	// Attribute impersonation/token like the main path so the bypass record
+	// still shows who it ran as.
 	if exists, err := config.Exists(); err == nil && exists {
 		if cfg, err := config.Load(); err == nil {
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+			e := guard.AuditEntry{
 				Command: strings.Join(args, " "),
 				Outcome: guard.OutcomeBypassed,
 				Reason:  "KUBECTL_GUARD_BYPASS",
-			})
+			}
+			p := guard.ParseArgs(args)
+			if p.AsUser != "" {
+				e.Impersonate = p.AsUser
+			}
+			if p.HasToken {
+				e.Token = true
+			}
+			_ = guard.AppendAudit(cfg, e)
 		}
 	}
 	return guard.ExecKubectl(args)
@@ -161,6 +171,33 @@ func runGuard(args []string) error {
 	result, ctx, cfg, err := guard.Check(forwarded)
 	cmdStr := strings.Join(forwarded, " ")
 
+	// Parse once to attribute impersonation (--as) and credential overrides
+	// (--token) in the audit log, so the record shows who a command ran AS,
+	// not just who invoked the guard.
+	parsed := guard.ParseArgs(forwarded)
+
+	// audit writes an attributed audit entry for this invocation. It is a
+	// thin wrapper so every decision path records impersonation/token the same
+	// way. cfg may be nil (Deny before config load); in that case it is a no-op.
+	audit := func(outcome, reason string) {
+		if cfg == nil {
+			return
+		}
+		e := guard.AuditEntry{
+			Context: ctx,
+			Command: cmdStr,
+			Outcome: outcome,
+			Reason:  reason,
+		}
+		if parsed.AsUser != "" {
+			e.Impersonate = parsed.AsUser
+		}
+		if parsed.HasToken {
+			e.Token = true
+		}
+		_ = guard.AppendAudit(cfg, e)
+	}
+
 	// emitDecision writes the structured JSON decision object to stderr. Used
 	// only in --json mode for non-Allow results; for Allow nothing is emitted so
 	// kubectl's stdout stays clean for the agent.
@@ -186,13 +223,7 @@ func runGuard(args []string) error {
 			ui.PrintInfo("Fix the issue above, or run kubectl directly if you understand the risk.")
 		}
 		// cfg is non-nil when context resolution failed but config loaded; log it.
-		if cfg != nil {
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
-				Context: ctx,
-				Command: cmdStr,
-				Outcome: guard.OutcomeDenied,
-			})
-		}
+		audit(guard.OutcomeDenied, "")
 		os.Exit(guard.ExitDenied)
 
 	case guard.SetupRequired:
@@ -243,12 +274,7 @@ func runGuard(args []string) error {
 				ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
 			}
 		}
-		_ = guard.AppendAudit(cfg, guard.AuditEntry{
-			Context: ctx,
-			Command: cmdStr,
-			Outcome: guard.OutcomeBlocked,
-			Reason:  "protected-resource",
-		})
+		audit(guard.OutcomeBlocked, "protected-resource")
 		os.Exit(guard.ExitBlocked)
 
 	case guard.RequireConfirmation:
@@ -262,12 +288,7 @@ func runGuard(args []string) error {
 			if !jsonMode {
 				ui.PrintWarning("Auto-confirming gated command (--yes / KUBECTL_GUARD_CONFIRM=yes); logged as auto-confirmed.")
 			}
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
-				Context: ctx,
-				Command: cmdStr,
-				Outcome: guard.OutcomeAutoConfirmed,
-				Reason:  "yes-flag",
-			})
+			audit(guard.OutcomeAutoConfirmed, "yes-flag")
 			return guard.ExecKubectl(forwarded)
 		}
 
@@ -275,11 +296,7 @@ func runGuard(args []string) error {
 			// An agent framework cannot answer an interactive prompt; abort
 			// immediately with structured output instead of blocking on stdin.
 			emitDecision()
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
-				Context: ctx,
-				Command: cmdStr,
-				Outcome: guard.OutcomeAborted,
-			})
+			audit(guard.OutcomeAborted, "")
 			os.Exit(guard.ExitNeedsConfirm)
 		}
 
@@ -294,30 +311,18 @@ func runGuard(args []string) error {
 		}
 
 		if confirmed {
-			_ = guard.AppendAudit(cfg, guard.AuditEntry{
-				Context: ctx,
-				Command: cmdStr,
-				Outcome: guard.OutcomeConfirmed,
-			})
+			audit(guard.OutcomeConfirmed, "")
 			return guard.ExecKubectl(forwarded)
 		}
 
-		_ = guard.AppendAudit(cfg, guard.AuditEntry{
-			Context: ctx,
-			Command: cmdStr,
-			Outcome: guard.OutcomeAborted,
-		})
+		audit(guard.OutcomeAborted, "")
 		fmt.Fprintln(os.Stderr, "Aborted.")
 		os.Exit(guard.ExitNeedsConfirm)
 
 	case guard.Allow:
 		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so
 		// anything after the call never runs.
-		_ = guard.AppendAudit(cfg, guard.AuditEntry{
-			Context: ctx,
-			Command: cmdStr,
-			Outcome: guard.OutcomeAllowed,
-		})
+		audit(guard.OutcomeAllowed, "")
 		return guard.ExecKubectl(forwarded)
 	}
 

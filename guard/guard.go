@@ -115,6 +115,16 @@ func checkWith(args []string, current CurrentContextFunc) (Result, string, *conf
 		return Blocked, ctx, cfg, nil
 	}
 
+	p := ParseArgs(args)
+
+	// --server points at an arbitrary API server the guard cannot map to a
+	// context name. When context protection is configured, fail closed rather
+	// than allow a command against an unverified (possibly production) cluster.
+	// Use --context pointing at a named context instead.
+	if p.HasServer && len(cfg.ProtectedContexts) > 0 {
+		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts are configured (use --context instead)")
+	}
+
 	// If we cannot resolve the context, we cannot confirm it is unprotected.
 	// When protected contexts exist, fail closed; otherwise there is nothing
 	// to enforce beyond resources.
@@ -128,8 +138,14 @@ func checkWith(args []string, current CurrentContextFunc) (Result, string, *conf
 		return Allow, "", cfg, nil
 	}
 
-	if cfg.IsContextProtected(ctx) && IsStateAltering(args) {
-		return RequireConfirmation, ctx, cfg, nil
+	if cfg.IsContextProtected(ctx) {
+		// Optional policy: deny any impersonation (--as*) on a protected context.
+		if cfg.BlockImpersonation && p.HasImpersonation() {
+			return Deny, ctx, cfg, fmt.Errorf("impersonation (--as) is blocked on protected context %q", ctx)
+		}
+		if IsStateAltering(args) {
+			return RequireConfirmation, ctx, cfg, nil
+		}
 	}
 
 	return Allow, ctx, cfg, nil

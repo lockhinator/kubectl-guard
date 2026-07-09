@@ -55,6 +55,11 @@ type Config struct {
 	// "ci-deploy"), stamped into audit entries when KUBECTL_GUARD_ACTOR is
 	// unset. Empty falls back to the OS username.
 	Actor string `yaml:"actor,omitempty"`
+
+	// BlockImpersonation, when true, denies any command carrying --as / --as-group
+	// / --as-uid on a protected context. Impersonation is a common
+	// privilege-escalation and audit-evasion vector. Off by default.
+	BlockImpersonation bool `yaml:"block_impersonation,omitempty"`
 }
 
 // ApplyDefaults fills in zero-value fields with sensible defaults.

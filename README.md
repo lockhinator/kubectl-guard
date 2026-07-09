@@ -217,6 +217,12 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
   access to secrets, for example.
 - **No bypass** — the `--context` and `--kubeconfig` flags are honored, so
   `kubectl --context=prod delete pod x` is still gated.
+- **Targeting & identity flags** — `--server` (which points at a different
+  cluster the guard can't map to a context) is **denied** when context
+  protection is configured (fail-closed). `--as`/`--as-group`/`--as-uid`
+  impersonation and `--token` credential overrides are **recorded in the
+  audit log** for attribution, and optionally **blocked** on protected
+  contexts via `block_impersonation`.
 - **Case-insensitive verbs** — Commands with uppercase verbs (`DELETE`, `APPLY`)
   are normalized and treated the same as lowercase, preventing bypass attempts.
 - **Clean output** — Guard messages route to stderr, keeping stdout clean for
@@ -284,6 +290,7 @@ confirm_mode: type-name   # simple (y/N) or type-name (type the context name)
 audit_mode: all           # all (default) | gated | off
 audit_log: ~/.kubectl-guard-audit.log   # optional; defaults to this path
 actor: ci-deploy          # optional static default actor (overridden by KUBECTL_GUARD_ACTOR)
+block_impersonation: true # optional: deny --as* on protected contexts
 ```
 
 Fields:

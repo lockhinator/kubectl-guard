@@ -269,6 +269,89 @@ func ParseArgs(args []string) ParsedArgs {
 	return p
 }
 
+// StripGuardFlags removes guard-only flags from args and reports whether the
+// --json flag was requested. These flags belong to the guard, not kubectl, and
+// must never be forwarded. --json is recognized as "--json", "--json=true",
+// or "--json=false" and is only honored before the "--" separator (after it,
+// tokens are positional kubectl args such as exec payloads).
+func StripGuardFlags(args []string) (filtered []string, jsonMode bool) {
+	seenSep := false
+	for _, a := range args {
+		if a == "--" {
+			seenSep = true
+			filtered = append(filtered, a)
+			continue
+		}
+		if !seenSep {
+			switch a {
+			case "--json", "--json=true":
+				jsonMode = true
+				continue
+			case "--json=false":
+				jsonMode = false
+				continue
+			}
+		}
+		filtered = append(filtered, a)
+	}
+	return filtered, jsonMode
+}
+
+// StripNoPrompt removes the guard-only --no-prompt flag from args and reports
+// whether headless/no-prompt mode was requested. Like --json, it belongs to the
+// guard and must never be forwarded to kubectl. Recognized as "--no-prompt",
+// "--no-prompt=true", or "--no-prompt=false", and only before the "--"
+// separator (after it, tokens are positional kubectl args).
+func StripNoPrompt(args []string) (filtered []string, noPrompt bool) {
+	seenSep := false
+	for _, a := range args {
+		if a == "--" {
+			seenSep = true
+			filtered = append(filtered, a)
+			continue
+		}
+		if !seenSep {
+			switch a {
+			case "--no-prompt", "--no-prompt=true":
+				noPrompt = true
+				continue
+			case "--no-prompt=false":
+				noPrompt = false
+				continue
+			}
+		}
+		filtered = append(filtered, a)
+	}
+	return filtered, noPrompt
+}
+
+// StripYes removes the guard-only --yes flag from args and reports whether
+// audited auto-confirm was requested. Like --json/--no-prompt, it belongs to
+// the guard and must never be forwarded to kubectl. Recognized as "--yes",
+// "--yes=true", or "--yes=false", and only before the "--" separator.
+func StripYes(args []string) (filtered []string, yes bool) {
+	seenSep := false
+	for _, a := range args {
+		if a == "--" {
+			seenSep = true
+			filtered = append(filtered, a)
+			continue
+		}
+		if !seenSep {
+			switch a {
+			case "--yes", "--yes=true":
+				yes = true
+				continue
+			case "--yes=false":
+				yes = false
+				continue
+			}
+		}
+		filtered = append(filtered, a)
+	}
+	return filtered, yes
+}
+
 // PositionalArgs returns the non-flag arguments before "--". Thin wrapper over
 // ParseArgs kept for callers/tests.
 func PositionalArgs(args []string) []string {

@@ -10,13 +10,24 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
 
 - **🔒 Secret protection** — Block all secret access across your entire cluster. Secrets never leave the cluster, so they can never enter LLM context windows or logs.
 - **🚦 Production gating** — Require explicit confirmation for state-altering commands on production contexts. Type the context name to confirm — something autonomous agents can't do.
-- **📋 Comprehensive audit logging** — Every command is logged with timestamps, context, and outcome. Full visibility into what your agents (or you) tried to do.
-- **🛡️ No bypass** — Respects `--context` and `--kubeconfig` flags, so even explicit context switches are gated.
+- **📋 Comprehensive audit logging** — Every command is logged with timestamps, context, outcome, and *who drove it* (the actor). Full visibility into what your agents (or you) tried to do.
+- **🤖 Agent-native output** — Distinct exit codes (0/1/2/3/4) and a `--json` mode let agent frameworks parse guard decisions programmatically instead of scraping warning text.
+- **🛡️ Hard to bypass** — Honors `--context`/`--kubeconfig`, and a PATH-shadowing install (`make install-shim`) intercepts `kubectl` even in non-interactive shells and agent subprocesses where an alias can't reach.
+- **🤫 Headless-friendly** — Configure without a TTY via env vars, `config init`, or `--no-prompt`, so CI and agents bootstrap deterministically.
+- **🔓 Audited escape hatch** — `--yes`/`KUBECTL_GUARD_CONFIRM` auto-confirms gated commands for automation while still logging them (protected-resource blocks are never bypassed).
 - **⚡ Drop-in replacement** — Works as a kubectl alias. No changes to your workflows or agent prompts.
 - **🔧 Reliable configuration** — Atomic config writes and concurrent-safe audit logging prevent corruption.
 - **🎯 Smart command classification** — Automatically distinguishes safe reads from dangerous mutations, even with uppercase verbs or plugins.
 
 ## What's New
+
+### v0.3.0 — Agent-native safety
+
+- **Structured exit codes + JSON output** — Guard decisions now exit with distinct codes (`0` allow, `1` kubectl error, `2` blocked, `3` denied, `4` needs-confirmation) so an agent framework can tell a guard intervention from a kubectl failure. A guard-only `--json` flag emits a structured decision object on stderr for non-allow decisions (and nothing for allow, so kubectl's stdout stays clean).
+- **Actor identity** — Each audit entry now records *who drove* the command (`actor`), sourced from `KUBECTL_GUARD_ACTOR` (e.g. `claude-code`), alongside the OS `user`. Agent activity is finally distinguishable from human activity in the log.
+- **PATH-shadowing install + `doctor`** — `make install-shim` places a `kubectl` shim earlier in `PATH` than the real kubectl, intercepting calls even in non-interactive shells and agent subprocesses (an alias only covers interactive shells). `kubectl-guard doctor` verifies interception is active.
+- **Headless / non-TTY setup** — Configure without a TTY via `KUBECTL_GUARD_PROTECTED_*` env vars, `kubectl-guard config init`, or `--no-prompt`/`KUBECTL_GUARD_NO_PROMPT`. CI and agents bootstrap deterministically instead of hitting a wizard they can't answer.
+- **Audited automation escape hatch** — `--yes` / `KUBECTL_GUARD_CONFIRM=yes` auto-confirms gated commands for pipelines while logging them as `auto-confirmed` (protected-resource blocks are never bypassed). `KUBECTL_GUARD_BYPASS` is a discouraged full bypass, logged as `bypassed`.
 
 ### v0.2.1 — Reliability & Security Fixes
 
@@ -68,6 +79,37 @@ Verify the installation:
 kubectl-guard --version  # or -V
 ```
 
+#### PATH-shadowing install (agents & non-interactive shells)
+
+The alias above only applies in **interactive** shells. An AI agent or script
+that execs `kubectl` by name (or by absolute path) in a non-interactive shell
+**bypasses the alias entirely**. For the agent use case, install a
+`kubectl` shim that sits **earlier in `PATH`** than the real kubectl:
+
+```bash
+make install-shim
+```
+
+This installs the guard and a `kubectl` symlink pointing at it under
+`~/.local/share/kubectl-guard/shims/`, then prints the `PATH` line to add to
+your shell config (`~/.zshrc` or `~/.bashrc`):
+
+```bash
+export PATH="$HOME/.local/share/kubectl-guard/shims:$PATH"
+```
+
+Reload your shell, then confirm interception is active:
+
+```bash
+kubectl-guard doctor
+```
+
+When invoked as `kubectl`, the guard runs its protection logic and `exec`s the
+**real** kubectl (found by skipping itself on `PATH`), so stdout, stdin, and
+exit codes are preserved and there is no infinite loop. This intercepts
+`kubectl get secret` even from `bash -c 'kubectl get secret'` or an agent
+subprocess.
+
 On first run, kubectl-guard presents an interactive setup wizard to select which contexts to protect:
 
 ```
@@ -84,6 +126,31 @@ Select contexts to protect (space to toggle, enter to confirm):
 
 ✓ Saved to ~/.kubectl-guard.yaml
 ```
+
+##### Headless / non-interactive setup (CI, agents, no TTY)
+
+The wizard requires a TTY, so in a headless context (CI, a container, an agent
+subprocess) it cancels and the command doesn't run. Bootstrap the guard
+without a prompt using either **environment variables** or `config init`:
+
+```bash
+# Option 1: env vars (take effect on first run when no config exists)
+export KUBECTL_GUARD_PROTECTED_CONTEXTS=prod-*,prod-cluster
+export KUBECTL_GUARD_PROTECTED_RESOURCES=secret
+export KUBECTL_GUARD_CONFIRM_MODE=type-name   # optional: simple|type-name
+
+# Option 2: write the config in one shot
+kubectl-guard config init \
+  --protected-contexts 'prod-*,prod-cluster' \
+  --protected-resources secret \
+  --confirm-mode type-name
+```
+
+If no config exists and you just want the guard to get out of the way
+deterministically (e.g. a CI step that hasn't been configured yet), pass
+`--no-prompt` or set `KUBECTL_GUARD_NO_PROMPT=yes`: the guard writes an empty
+config (no protection) and proceeds with a stderr warning. A headless
+`bash -c 'kubectl-guard get pods'` will not hang or fail.
 
 ## Using kubectl-guard with AI agents
 
@@ -117,6 +184,29 @@ Every attempt — blocked, aborted, or confirmed — is appended to the audit lo
 
 By default the audit log captures **every** command the agent runs — including the ones it was allowed to run — not just the ones that were gated. So when Claude shells into your cluster, you get a complete, timestamped record of everything it executed, which is invaluable for post-incident review. Tune this with `config audit-mode` (`all` | `gated` | `off`).
 
+### Identifying who drove a command
+
+Every audit entry records an **`actor`** — *who* drove the command — alongside the OS `user` whose account ran it. Without this, `kubectl get secret` run by Claude and typed by a human look identical in the log. Set `KUBECTL_GUARD_ACTOR` to a short label so agent activity is distinguishable:
+
+```bash
+# In your shell, CI step, or agent framework's env config:
+export KUBECTL_GUARD_ACTOR=claude-code
+# For Claude Code, add it to settings.json under "env"; for Cursor/other
+# tools, export it in the session that launches the agent.
+```
+
+```jsonl
+{"time":"2026-07-09T10:00:00Z","user":"cameron","actor":"claude-code","command":"get secret stripe-keys","outcome":"blocked","reason":"protected-resource"}
+```
+
+The actor is resolved in priority order:
+
+1. `KUBECTL_GUARD_ACTOR` env var (explicit opt-in — the clean, portable path).
+2. The `actor` field in `~/.kubectl-guard.yaml` (a static default, e.g. for a shared CI host).
+3. The OS username (fallback — current behavior).
+
+The OS `user` is always recorded regardless, so you keep full attribution. `config audit` shows the `actor` in recent entries automatically.
+
 ## Protection model
 
 - **Protected contexts** — state-altering commands (`apply`, `delete`, `scale`,
@@ -147,8 +237,8 @@ kubectl-guard config add-resource secret      # block all secret access
 kubectl-guard config remove-resource secret
 ```
 
-Once enabled, every command targeting that resource is refused with exit 1 —
-reads, writes, and applies alike:
+Once enabled, every command targeting that resource is refused with exit code 2
+(`blocked`) — reads, writes, and applies alike:
 
 ```bash
 $ kubectl get secret                          # blocked
@@ -193,6 +283,7 @@ protected_resources:
 confirm_mode: type-name   # simple (y/N) or type-name (type the context name)
 audit_mode: all           # all (default) | gated | off
 audit_log: ~/.kubectl-guard-audit.log   # optional; defaults to this path
+actor: ci-deploy          # optional static default actor (overridden by KUBECTL_GUARD_ACTOR)
 ```
 
 Fields:
@@ -205,6 +296,8 @@ Fields:
   passthrough), `gated` (only interventions: blocked/confirmed/aborted/denied),
   or `off` (logs nothing)
 - **`audit_log`** — optional override for the audit log path
+- **`actor`** — optional static default for the audit `actor` field (overridden
+  by `KUBECTL_GUARD_ACTOR` when set); useful for a shared CI host
 
 Manage via CLI:
 
@@ -219,8 +312,51 @@ kubectl-guard config confirm-mode type-name  # Stronger confirmation prompt
 kubectl-guard config audit-mode all          # Log every command (default)
 kubectl-guard config audit                # Show audit log path + recent entries
 kubectl-guard config setup                # Re-run setup wizard
+kubectl-guard config init                 # Write config non-interactively (headless)
 kubectl-guard config path                 # Print config file path
 ```
+
+### Diagnostics
+
+```bash
+kubectl-guard doctor                      # Check PATH-shadowing interception
+```
+
+`doctor` reports whether `kubectl` on `PATH` resolves to the guard (i.e.
+interception is **ACTIVE**), lists every `kubectl` found on `PATH` in order
+(like `which -a kubectl`), and prints the resolved path of the **real**
+kubectl the guard forwards to. Use it after `make install-shim` to confirm
+agents and non-interactive shells are covered.
+
+### Automation escape hatch (audited)
+
+For legitimate automation — a CI/CD pipeline or deploy script that needs to
+run a gated command on a protected context — the guard offers a deliberate,
+**audited** bypass:
+
+```bash
+# Auto-confirm a gated command (state-altering on a protected context).
+# Runs without prompting and is logged as "auto-confirmed" with the actor.
+kubectl delete pod nginx --yes
+# or via env var (handy for CI):
+KUBECTL_GUARD_CONFIRM=yes kubectl delete pod nginx
+```
+
+**`--yes` / `KUBECTL_GUARD_CONFIRM=yes` only auto-confirms `RequireConfirmation`
+(state-altering on a protected context). It does NOT bypass a protected-resource
+`Blocked` — that stays a hard block.** If you need to apply a secret in CI,
+remove it from `protected_resources` or scope it. The bypass is recorded with a
+distinct `auto-confirmed` outcome (not `confirmed`) so the audit trail shows
+exactly which runs were auto-approved.
+
+```bash
+# Hard bypass (discouraged): disable the guard entirely for one invocation.
+# Even protected-resource blocks are skipped. Logged as "bypassed".
+KUBECTL_GUARD_BYPASS=1 kubectl apply -f emergency.yaml
+```
+
+`KUBECTL_GUARD_BYPASS` is the nuclear option — use it only when you must drop
+protection wholesale, and expect it to stand out in the audit log.
 
 ## How it works
 
@@ -242,6 +378,55 @@ pass through — then replaces its own process with the real `kubectl` via
 - Context matching uses glob patterns; resource matching treats
   singular/plural/short-name forms as equivalent.
 
+### Exit codes
+
+Guard decisions use distinct exit codes so an agent framework (or a script)
+can tell a guard intervention apart from an ordinary kubectl failure. kubectl
+itself uses `0`/`1`, so the guard uses higher codes:
+
+| Code | Meaning |
+|------|---------|
+| `0`  | allowed / ran successfully (kubectl's own code is preserved via `exec`) |
+| `1`  | kubectl error (passthrough) |
+| `2`  | blocked (protected resource) |
+| `3`  | denied (fail-closed: config/context could not be verified) |
+| `4`  | needs confirmation but aborted (no TTY / agent / declined) |
+
+### JSON output mode (`--json`)
+
+Add the guard-only `--json` flag (recognized by the guard, **stripped before
+forwarding to kubectl**) to get a structured decision object on **stderr** for
+any non-allow decision. For an allowed command nothing is emitted, so kubectl's
+stdout stays clean for the agent to consume:
+
+```bash
+$ kubectl get secret --json   # blocked
+{"decision":"blocked","reason":"protected-resource","context":"prod-cluster","command":"get secret","resource":"secret"}
+# exit code 2
+
+$ kubectl get pods --json     # allowed
+# (no stderr output; kubectl's normal stdout flows through)
+# exit code 0
+```
+
+The object fields: `decision` (`blocked` | `denied` | `needs-confirmation`),
+`reason`, `context`, `command`, and `resource` (the protected-resource token,
+for `blocked`). In `--json` mode a `needs-confirmation` decision aborts
+immediately with exit `4` (an agent cannot answer an interactive prompt) rather
+than blocking on stdin.
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `KUBECTL_GUARD_ACTOR` | Labels *who* drove the command in the audit log (e.g. `claude-code`). |
+| `KUBECTL_GUARD_PROTECTED_CONTEXTS` | Comma-separated context patterns for headless first-run config. |
+| `KUBECTL_GUARD_PROTECTED_RESOURCES` | Comma-separated resources to block everywhere for headless first-run config. |
+| `KUBECTL_GUARD_CONFIRM_MODE` | `simple` \| `type-name`, applied on headless first-run config. |
+| `KUBECTL_GUARD_NO_PROMPT` | Truthy: skip the setup wizard, write an empty config, and proceed (headless). |
+| `KUBECTL_GUARD_CONFIRM` | Truthy (`yes`): auto-confirm gated commands (audited as `auto-confirmed`). |
+| `KUBECTL_GUARD_BYPASS` | Truthy: disable the guard entirely for one invocation (audited as `bypassed`; discouraged). |
+
 ## Limitations
 
 kubectl-guard is a **client-side guardrail for accidental and unsupervised
@@ -249,9 +434,12 @@ commands**, not a substitute for Kubernetes RBAC or network policy. Worth
 knowing:
 
 - **Not an access-control boundary.** A determined user can bypass it by
-  running the real `kubectl` binary directly or un-aliasing. Use RBAC for
-  real enforcement; use kubectl-guard for the "are you sure?" and the audit
-  trail.
+  running the real `kubectl` binary directly or un-aliasing. The
+  [PATH-shadowing install](#path-shadowing-install-agents--non-interactive-shells)
+  closes the common gap (non-interactive shells and agents that call `kubectl`
+  by name), but a user can still invoke the real binary by absolute path. Use
+  RBAC for real enforcement; use kubectl-guard for the "are you sure?" and the
+  audit trail.
 - **TOCTOU on `-f` files.** There is a small window between the guard
   scanning a manifest and `kubectl` re-reading it. The threat model is
   accidents and unsupervised agents, not an adversary swapping a symlink

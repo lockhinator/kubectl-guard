@@ -150,7 +150,7 @@ func (m multiSelectModel) View() string {
 			name = selectedStyle.Render(item.Name)
 		}
 
-		b.WriteString(fmt.Sprintf("%s%s %s\n", cursor, checkbox, name))
+		fmt.Fprintf(&b, "%s%s %s\n", cursor, checkbox, name)
 	}
 
 	b.WriteString("\n")

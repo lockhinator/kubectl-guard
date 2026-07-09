@@ -5,10 +5,62 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 
 	"github.com/lockhinator/kubectl-guard/config"
 )
+
+// Exit codes for guard decisions. kubectl itself uses 0 (success) and 1
+// (error); guard decisions use higher codes so an agent framework can
+// distinguish a guard intervention from an ordinary kubectl failure. When the
+// guard allows a command it replaces its own process with kubectl via
+// syscall.Exec, so kubectl's real exit code is preserved (ExitSuccess/ExitKubectlError).
+const (
+	ExitSuccess      = 0 // allowed / ran successfully (kubectl's own code is preserved)
+	ExitKubectlError = 1 // kubectl itself errored (passthrough)
+	ExitBlocked      = 2 // blocked: command targets a protected resource
+	ExitDenied       = 3 // denied: fail-closed (config/context could not be verified)
+	ExitNeedsConfirm = 4 // needs confirmation but aborted (no TTY / agent / declined)
+)
+
+// JSONResult is the structured decision object emitted on stderr when the
+// guard runs with --json and the decision is not Allow. Agent frameworks
+// parse this instead of scraping human-facing warning text.
+type JSONResult struct {
+	Decision string `json:"decision"`           // blocked | denied | needs-confirmation
+	Reason   string `json:"reason,omitempty"`   // machine-readable reason
+	Context  string `json:"context,omitempty"`  // resolved or declared context
+	Command  string `json:"command"`            // the kubectl command string
+	Resource string `json:"resource,omitempty"` // protected resource token (Blocked)
+}
+
+// JSONForResult builds the structured decision object for a non-Allow result.
+// commandStr is the joined kubectl argument string; args is the raw arg list
+// (used to best-effort surface the protected resource token for Blocked).
+// denyErr is the error returned by Check for a Deny result.
+func JSONForResult(result Result, ctx, commandStr string, args []string, denyErr error) JSONResult {
+	jr := JSONResult{Context: ctx, Command: commandStr}
+	switch result {
+	case Blocked:
+		jr.Decision = "blocked"
+		jr.Reason = "protected-resource"
+		if cands := ExtractResourceCandidates(args); len(cands) > 0 {
+			jr.Resource = cands[0]
+		}
+	case Deny:
+		jr.Decision = "denied"
+		if denyErr != nil {
+			jr.Reason = denyErr.Error()
+		} else {
+			jr.Reason = "fail-closed"
+		}
+	case RequireConfirmation:
+		jr.Decision = "needs-confirmation"
+		jr.Reason = "aborted"
+	}
+	return jr
+}
 
 // Result represents the outcome of checking a command.
 type Result int
@@ -83,9 +135,12 @@ func checkWith(args []string, current CurrentContextFunc) (Result, string, *conf
 	return Allow, ctx, cfg, nil
 }
 
-// ExecKubectl replaces the current process with kubectl.
+// ExecKubectl replaces the current process with the REAL kubectl. It resolves
+// the real binary via RealKubectlPath so that a PATH-shadowing install (where
+// a shim named "kubectl" points at the guard) cannot make the guard exec itself
+// in a loop.
 func ExecKubectl(args []string) error {
-	kubectl, err := exec.LookPath("kubectl")
+	kubectl, err := RealKubectlPath()
 	if err != nil {
 		return err
 	}
@@ -96,8 +151,127 @@ func ExecKubectl(args []string) error {
 	return syscall.Exec(kubectl, fullArgs, os.Environ())
 }
 
-// RunKubectl runs kubectl and returns its output.
+// RunKubectl runs the REAL kubectl and returns its output. It uses
+// RealKubectlPath so internal lookups don't recurse into a PATH-shadowing shim.
 func RunKubectl(args ...string) ([]byte, error) {
-	cmd := exec.Command("kubectl", args...)
+	cmd, err := kubectlCommand(args...)
+	if err != nil {
+		return nil, err
+	}
 	return cmd.Output()
+}
+
+// kubectlCommand builds an exec.Cmd targeting the REAL kubectl (never the
+// guard's own shim). All internal kubectl invocations must go through here, or
+// through RealKubectlPath directly, so a PATH-shadowing install does not cause
+// the guard to recurse into itself when resolving contexts.
+func kubectlCommand(args ...string) (*exec.Cmd, error) {
+	path, err := RealKubectlPath()
+	if err != nil {
+		return nil, err
+	}
+	return exec.Command(path, args...), nil
+}
+
+// RealKubectlPath resolves the path to the real kubectl binary by walking PATH
+// in order and skipping any directory whose "kubectl" entry is the guard itself
+// (e.g. a PATH-shadowing shim that symlinks "kubectl" to this binary). This
+// prevents the guard from exec'ing or querying itself in a loop. It returns the
+// first non-self kubectl, or falls back to exec.LookPath when PATH contains no
+// self-shadow (the common alias install).
+func RealKubectlPath() (string, error) {
+	self, selfErr := os.Executable()
+
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, "kubectl")
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		// Skip our own binary: the shim is typically a symlink to the guard.
+		if selfErr == nil && sameExecutable(candidate, self) {
+			continue
+		}
+		return candidate, nil
+	}
+
+	// No self-shadow on PATH (plain alias install): defer to the standard
+	// lookup so the common case keeps working.
+	return exec.LookPath("kubectl")
+}
+
+// sameExecutable reports whether path and other refer to the same executable
+// file, following symlinks (the shim is a symlink to the guard binary) and
+// comparing inodes via os.SameFile.
+func sameExecutable(path, other string) bool {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(other); err == nil {
+		other = resolved
+	}
+	a, errA := os.Stat(path)
+	b, errB := os.Stat(other)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return os.SameFile(a, b)
+}
+
+// findAllOnPath returns every executable named name found on PATH, in PATH
+// order (mirrors `which -a`).
+func findAllOnPath(name string) []string {
+	var found []string
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, name)
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		found = append(found, candidate)
+	}
+	return found
+}
+
+// DoctorReport summarizes whether PATH-shadowing interception is active. It is
+// the data behind `kubectl-guard doctor`.
+type DoctorReport struct {
+	// GuardPath is the absolute path of this guard binary (best-effort).
+	GuardPath string
+	// Intercepted reports whether the first kubectl on PATH resolves to the
+	// guard, i.e. PATH-shadowing is active.
+	Intercepted bool
+	// RealKubectlPath is the resolved path of the real kubectl binary (the
+	// first kubectl on PATH that is not the guard), or empty if not found.
+	RealKubectlPath string
+	// KubectlOnPath lists every kubectl found on PATH, in PATH order (like
+	// `which -a kubectl`).
+	KubectlOnPath []string
+	// Err is non-nil if the real kubectl could not be resolved.
+	Err error
+}
+
+// Doctor inspects PATH to report whether PATH-shadowing interception is active
+// and where the real kubectl lives. It powers `kubectl-guard doctor`.
+func Doctor() DoctorReport {
+	var report DoctorReport
+	if self, err := os.Executable(); err == nil {
+		report.GuardPath = self
+	}
+	report.KubectlOnPath = findAllOnPath("kubectl")
+	if len(report.KubectlOnPath) > 0 && report.GuardPath != "" {
+		report.Intercepted = sameExecutable(report.KubectlOnPath[0], report.GuardPath)
+	}
+	if real, err := RealKubectlPath(); err != nil {
+		report.Err = err
+	} else {
+		report.RealKubectlPath = real
+	}
+	return report
 }

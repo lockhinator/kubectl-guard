@@ -18,7 +18,7 @@ func TestVersionFlags(t *testing.T) {
 	if err := buildCmd.Run(); err != nil {
 		t.Fatalf("failed to build guard: %v", err)
 	}
-	defer os.Remove("kubectl-guard-test")
+	defer func() { _ = os.Remove("kubectl-guard-test") }()
 
 	tests := []struct {
 		name           string
@@ -77,7 +77,7 @@ func TestVersionFormat(t *testing.T) {
 	if err := buildCmd.Run(); err != nil {
 		t.Fatalf("failed to build guard with version: %v", err)
 	}
-	defer os.Remove("kubectl-guard-version-test")
+	defer func() { _ = os.Remove("kubectl-guard-version-test") }()
 
 	cmd := exec.Command("./kubectl-guard-version-test", "--version")
 	output, err := cmd.CombinedOutput()
@@ -103,7 +103,7 @@ func TestVersionDevDefault(t *testing.T) {
 	if err := buildCmd.Run(); err != nil {
 		t.Fatalf("failed to build guard: %v", err)
 	}
-	defer os.Remove("kubectl-guard-dev-test")
+	defer func() { _ = os.Remove("kubectl-guard-dev-test") }()
 
 	cmd := exec.Command("./kubectl-guard-dev-test", "--version")
 	output, err := cmd.CombinedOutput()

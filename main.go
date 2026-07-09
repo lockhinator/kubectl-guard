@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -20,6 +21,7 @@ var version = "dev"
 // command and must be forwarded through the guard rather than intercepted.
 var guardConfigSubcommands = map[string]bool{
 	"setup":           true,
+	"init":            true,
 	"list":            true,
 	"add":             true,
 	"remove":          true,
@@ -41,6 +43,16 @@ func main() {
 }
 
 func run() error {
+	// KUBECTL_GUARD_BYPASS is a full, audited escape hatch: it disables the
+	// guard for this invocation entirely (the command runs against the real
+	// kubectl). It is discouraged — prefer --yes for gated commands — but
+	// documented for cases where protection must be dropped wholesale (e.g. an
+	// emergency deploy). It is logged as "bypassed" so the audit trail records
+	// exactly what happened and who (actor) did it.
+	if boolEnv(config.EnvBypass) {
+		return runBypass(os.Args[1:])
+	}
+
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "config":
@@ -51,6 +63,8 @@ func run() error {
 				return runConfigCommand()
 			}
 			return runGuard(os.Args[1:])
+		case "doctor":
+			return runDoctor()
 		case "--version", "-V":
 			fmt.Printf("kubectl-guard %s\n", version)
 			return nil
@@ -64,17 +78,113 @@ func run() error {
 	return runGuard(os.Args[1:])
 }
 
+// runDoctor reports whether PATH-shadowing interception is active and where
+// the real kubectl lives. Output is human-readable and routed to stderr to
+// keep stdout clean (consistent with the guard's other user-facing messages).
+func runDoctor() error {
+	r := guard.Doctor()
+
+	ui.PrintInfo("guard binary:  " + orUnknown(r.GuardPath))
+
+	ui.PrintInfo("kubectl on PATH (in order):")
+	if len(r.KubectlOnPath) == 0 {
+		fmt.Fprintln(os.Stderr, "  (none - kubectl is not on PATH)")
+	} else {
+		for _, p := range r.KubectlOnPath {
+			fmt.Fprintf(os.Stderr, "  - %s\n", p)
+		}
+	}
+
+	if r.Intercepted {
+		ui.PrintSuccess("interception: ACTIVE - kubectl resolves to the guard")
+	} else {
+		ui.PrintWarning("interception: INACTIVE - kubectl does NOT resolve to the guard")
+		ui.PrintInfo("Run 'make install-shim' and prepend the shim directory to PATH to intercept non-interactive/agent calls.")
+	}
+
+	if r.RealKubectlPath != "" {
+		ui.PrintInfo("real kubectl:  " + r.RealKubectlPath)
+	} else if r.Err != nil {
+		ui.PrintWarning("could not resolve the real kubectl: " + r.Err.Error())
+	}
+
+	return nil
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "(unknown)"
+	}
+	return s
+}
+
+// runBypass executes the command against the real kubectl with the guard fully
+// disabled, after writing a loud "bypassed" audit entry (best-effort). It is
+// the KUBECTL_GUARD_BYPASS escape hatch.
+func runBypass(args []string) error {
+	ui.PrintWarning("KUBECTL_GUARD_BYPASS set: guard disabled for this invocation (audited).")
+	// Best-effort audit: if a config exists, log the bypass so it's traceable.
+	if exists, err := config.Exists(); err == nil && exists {
+		if cfg, err := config.Load(); err == nil {
+			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+				Command: strings.Join(args, " "),
+				Outcome: guard.OutcomeBypassed,
+				Reason:  "KUBECTL_GUARD_BYPASS",
+			})
+		}
+	}
+	return guard.ExecKubectl(args)
+}
+
+// boolEnv reports whether the env var is set to a truthy value (1, t, true,
+// yes, y, case-insensitive). Empty/unset is false.
+func boolEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "t", "true", "yes", "y":
+		return true
+	}
+	return false
+}
+
 func runGuard(args []string) error {
-	result, ctx, cfg, err := guard.Check(args)
-	cmdStr := strings.Join(args, " ")
+	// --json is a guard-only flag: parse and strip it before anything reaches
+	// kubectl or Check, so it is never forwarded to kubectl.
+	forwarded, jsonMode := guard.StripGuardFlags(args)
+	// --no-prompt is also guard-only (headless bootstrap); strip it too.
+	forwarded, noPrompt := guard.StripNoPrompt(forwarded)
+	if !noPrompt {
+		noPrompt = boolEnv(config.EnvNoPrompt)
+	}
+	// --yes is a guard-only audited auto-confirm of RequireConfirmation.
+	forwarded, yesFlag := guard.StripYes(forwarded)
+
+	result, ctx, cfg, err := guard.Check(forwarded)
+	cmdStr := strings.Join(forwarded, " ")
+
+	// emitDecision writes the structured JSON decision object to stderr. Used
+	// only in --json mode for non-Allow results; for Allow nothing is emitted so
+	// kubectl's stdout stays clean for the agent.
+	emitDecision := func() {
+		jr := guard.JSONForResult(result, ctx, cmdStr, forwarded, err)
+		b, mErr := json.Marshal(jr)
+		if mErr != nil {
+			return
+		}
+		fmt.Fprintln(os.Stderr, string(b))
+	}
+
 	switch result {
 	case guard.Deny:
-		msg := "the guard cannot verify this command is safe"
-		if err != nil {
-			msg = err.Error()
+		if jsonMode {
+			emitDecision()
+		} else {
+			msg := "the guard cannot verify this command is safe"
+			if err != nil {
+				msg = err.Error()
+			}
+			ui.PrintWarning("Refusing to run: " + msg)
+			ui.PrintInfo("Fix the issue above, or run kubectl directly if you understand the risk.")
 		}
-		ui.PrintWarning("Refusing to run: " + msg)
-		ui.PrintInfo("Fix the issue above, or run kubectl directly if you understand the risk.")
 		// cfg is non-nil when context resolution failed but config loaded; log it.
 		if cfg != nil {
 			_ = guard.AppendAudit(cfg, guard.AuditEntry{
@@ -83,9 +193,33 @@ func runGuard(args []string) error {
 				Outcome: guard.OutcomeDenied,
 			})
 		}
-		os.Exit(1)
+		os.Exit(guard.ExitDenied)
 
 	case guard.SetupRequired:
+		// Headless / non-interactive bootstrap: prefer env-var config, then
+		// --no-prompt, before falling back to the interactive wizard. This lets
+		// agents and CI configure the guard without a TTY.
+		if envCfg, ok := config.InitFromEnv(); ok {
+			if err := config.Save(envCfg); err != nil {
+				ui.PrintWarning("Failed to save config from environment: " + err.Error())
+				return nil
+			}
+			if p, perr := config.Path(); perr == nil {
+				ui.PrintInfo("Wrote initial config from KUBECTL_GUARD_* env vars: " + p)
+			}
+			// Proceed to run the command against the freshly written config.
+			return runGuard(args)
+		}
+		if noPrompt {
+			empty := &config.Config{}
+			empty.ApplyDefaults()
+			if err := config.Save(empty); err != nil {
+				ui.PrintWarning("Failed to save config: " + err.Error())
+				return nil
+			}
+			ui.PrintWarning("--no-prompt set with no env config: wrote an empty config (no protection) and proceeding.")
+			return runGuard(args)
+		}
 		contexts, err := guard.GetAllContexts()
 		if err != nil {
 			ui.PrintWarning("Could not get kubectl contexts: " + err.Error())
@@ -100,10 +234,14 @@ func runGuard(args []string) error {
 		return nil
 
 	case guard.Blocked:
-		cmdDesc := guard.GetCommandDescription(args)
-		ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
-		if guard.HasUninspectableSource(args) {
-			ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+		if jsonMode {
+			emitDecision()
+		} else {
+			cmdDesc := guard.GetCommandDescription(forwarded)
+			ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
+			if guard.HasUninspectableSource(forwarded) {
+				ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+			}
 		}
 		_ = guard.AppendAudit(cfg, guard.AuditEntry{
 			Context: ctx,
@@ -111,10 +249,41 @@ func runGuard(args []string) error {
 			Outcome: guard.OutcomeBlocked,
 			Reason:  "protected-resource",
 		})
-		os.Exit(1)
+		os.Exit(guard.ExitBlocked)
 
 	case guard.RequireConfirmation:
-		cmdDesc := guard.GetCommandDescription(args)
+		// Audited escape hatch: --yes / KUBECTL_GUARD_CONFIRM=yes auto-confirms
+		// RequireConfirmation (state-altering on a protected context) as if the
+		// user typed yes, but logs it as a distinct "auto-confirmed" outcome so
+		// the audit trail records the bypass. Protected-resource Blocks are NOT
+		// affected by this (they stay a hard block in their own branch).
+		autoConfirm := yesFlag || boolEnv(config.EnvConfirm)
+		if autoConfirm {
+			if !jsonMode {
+				ui.PrintWarning("Auto-confirming gated command (--yes / KUBECTL_GUARD_CONFIRM=yes); logged as auto-confirmed.")
+			}
+			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+				Context: ctx,
+				Command: cmdStr,
+				Outcome: guard.OutcomeAutoConfirmed,
+				Reason:  "yes-flag",
+			})
+			return guard.ExecKubectl(forwarded)
+		}
+
+		if jsonMode {
+			// An agent framework cannot answer an interactive prompt; abort
+			// immediately with structured output instead of blocking on stdin.
+			emitDecision()
+			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+				Context: ctx,
+				Command: cmdStr,
+				Outcome: guard.OutcomeAborted,
+			})
+			os.Exit(guard.ExitNeedsConfirm)
+		}
+
+		cmdDesc := guard.GetCommandDescription(forwarded)
 		message := fmt.Sprintf("%s on protected context: %s", cmdDesc, ctx)
 
 		confirmed := false
@@ -130,7 +299,7 @@ func runGuard(args []string) error {
 				Command: cmdStr,
 				Outcome: guard.OutcomeConfirmed,
 			})
-			return guard.ExecKubectl(args)
+			return guard.ExecKubectl(forwarded)
 		}
 
 		_ = guard.AppendAudit(cfg, guard.AuditEntry{
@@ -139,7 +308,7 @@ func runGuard(args []string) error {
 			Outcome: guard.OutcomeAborted,
 		})
 		fmt.Fprintln(os.Stderr, "Aborted.")
-		os.Exit(1)
+		os.Exit(guard.ExitNeedsConfirm)
 
 	case guard.Allow:
 		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so
@@ -149,7 +318,7 @@ func runGuard(args []string) error {
 			Command: cmdStr,
 			Outcome: guard.OutcomeAllowed,
 		})
-		return guard.ExecKubectl(args)
+		return guard.ExecKubectl(forwarded)
 	}
 
 	return nil
@@ -177,6 +346,38 @@ func runConfigCommand() error {
 			return nil
 		},
 	})
+
+	initCmd := &cobra.Command{
+		Use:   "init",
+		Short: "Write a config non-interactively (headless / CI / agents)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			contexts, _ := cmd.Flags().GetString("protected-contexts")
+			resources, _ := cmd.Flags().GetString("protected-resources")
+			confirm, _ := cmd.Flags().GetString("confirm-mode")
+			cfg := config.InitFromFlags(contexts, resources, confirm)
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			path, err := config.Path()
+			if err != nil {
+				return err
+			}
+			ui.PrintSuccess("Wrote config: " + path)
+			if len(cfg.ProtectedContexts) > 0 {
+				ui.PrintInfo("Protected contexts: " + strings.Join(cfg.ProtectedContexts, ", "))
+			}
+			if len(cfg.ProtectedResources) > 0 {
+				ui.PrintInfo("Protected resources: " + strings.Join(cfg.ProtectedResources, ", "))
+			}
+			ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
+			return nil
+		},
+	}
+	initCmd.Flags().String("protected-contexts", "", "comma-separated context patterns to protect (e.g. 'prod-*,prod-cluster')")
+	initCmd.Flags().String("protected-resources", "", "comma-separated resources to block on every context (e.g. 'secret')")
+	initCmd.Flags().String("confirm-mode", "", "confirmation mode for protected contexts (simple|type-name)")
+	rootCmd.AddCommand(initCmd)
+
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "list",

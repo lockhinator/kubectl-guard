@@ -50,6 +50,11 @@ type Config struct {
 	// AuditMode controls what is written to the audit log: "all" (default,
 	// every command), "gated" (only interventions), or "off".
 	AuditMode string `yaml:"audit_mode,omitempty"`
+
+	// Actor is a static default identity for who drove a command (e.g.
+	// "ci-deploy"), stamped into audit entries when KUBECTL_GUARD_ACTOR is
+	// unset. Empty falls back to the OS username.
+	Actor string `yaml:"actor,omitempty"`
 }
 
 // ApplyDefaults fills in zero-value fields with sensible defaults.
@@ -165,14 +170,14 @@ func Save(cfg *Config) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op if rename succeeded
+	defer func() { _ = os.Remove(tmpName) }() // no-op if rename succeeded
 
 	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

@@ -4,19 +4,27 @@ import (
 	"encoding/json"
 	"os"
 	"os/user"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/lockhinator/kubectl-guard/config"
 )
 
+// ActorEnvVar is the environment variable that identifies who drove a command
+// (e.g. "claude-code", "cursor", "ci-deploy"). Agent frameworks and users set
+// it for clean, portable attribution in the audit log.
+const ActorEnvVar = "KUBECTL_GUARD_ACTOR"
+
 // Outcome constants for audit entries.
 const (
-	OutcomeAllowed   = "allowed"   // command passed through ungated
-	OutcomeConfirmed = "confirmed" // gated command, user confirmed
-	OutcomeAborted   = "aborted"   // gated command, user declined
-	OutcomeBlocked   = "blocked"   // protected resource, refused
-	OutcomeDenied    = "denied"    // fail-closed (config/context error)
+	OutcomeAllowed        = "allowed"        // command passed through ungated
+	OutcomeConfirmed      = "confirmed"      // gated command, user confirmed
+	OutcomeAborted        = "aborted"        // gated command, user declined
+	OutcomeBlocked        = "blocked"        // protected resource, refused
+	OutcomeDenied         = "denied"         // fail-closed (config/context error)
+	OutcomeAutoConfirmed  = "auto-confirmed" // gated command, auto-approved via --yes/KUBECTL_GUARD_CONFIRM (audited)
+	OutcomeBypassed       = "bypassed"       // guard fully bypassed via KUBECTL_GUARD_BYPASS (audited, discouraged)
 )
 
 // AuditEntry is a single line in the audit log.
@@ -27,7 +35,8 @@ const (
 // blocked, or prompted for the command.
 type AuditEntry struct {
 	Time    string `json:"time"`
-	User    string `json:"user"`
+	User    string `json:"user"`            // OS user (kept for attribution)
+	Actor   string `json:"actor,omitempty"` // who drove it: claude-code, ci, human, etc.
 	Context string `json:"context,omitempty"`
 	Command string `json:"command"`
 	Outcome string `json:"outcome"` // allowed | confirmed | aborted | blocked | denied
@@ -53,6 +62,7 @@ func AppendAudit(cfg *config.Config, entry AuditEntry) error {
 
 	entry.Time = time.Now().UTC().Format(time.RFC3339)
 	entry.User = currentUser()
+	entry.Actor = resolveActor(cfg, entry.User)
 
 	b, err := json.Marshal(entry)
 	if err != nil {
@@ -64,7 +74,7 @@ func AppendAudit(cfg *config.Config, entry AuditEntry) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Acquire exclusive lock to prevent concurrent writes from interleaving.
 	// flock is advisory and works across processes on the same host.
@@ -85,4 +95,23 @@ func currentUser() string {
 		return u.Username
 	}
 	return ""
+}
+
+// resolveActor determines who drove the command, in priority order:
+//  1. KUBECTL_GUARD_ACTOR env var (explicit opt-in, e.g. "claude-code")
+//  2. config.Actor static default
+//  3. the OS username (current behavior)
+//
+// The OS user is always recorded separately in AuditEntry.User, so Actor is
+// purely about *who drove it* rather than *whose account ran it*.
+func resolveActor(cfg *config.Config, osUser string) string {
+	if v := strings.TrimSpace(os.Getenv(ActorEnvVar)); v != "" {
+		return v
+	}
+	if cfg != nil {
+		if v := strings.TrimSpace(cfg.Actor); v != "" {
+			return v
+		}
+	}
+	return osUser
 }

@@ -734,26 +734,49 @@ func printHelp() {
 Usage:
   kubectl-guard [kubectl args...]     Run kubectl with protection
   kubectl-guard config <subcommand>   Manage configuration
-  kubectl-guard --version             Print version
+  kubectl-guard doctor                Check PATH-shadowing interception
+  kubectl-guard --version             Print version (or -V)
   kubectl-guard --help                Print this help
 
 Protection model:
-  - Protected CONTEXTS: state-altering commands require confirmation.
+  - Protected CONTEXTS: state-altering commands require confirmation (or are
+    hard-blocked in context_mode: block).
+  - Protected NAMESPACES: state-altering commands are gated when the target
+    namespace (--namespace/-n, the context's namespace, or "default", and any
+    namespace under --all-namespaces/-A) matches (or blocked in
+    namespace_mode: block).
   - Protected RESOURCES: any command touching the resource is blocked
     everywhere (reads included), e.g. block all secret access.
-  - The --context / --kubeconfig flags are honored, so you cannot bypass the
-    guard by pointing at a protected context explicitly.
+  - Dry-run (--dry-run=client|server) skips the prompt; real-mutation forms
+    (--dry-run=none|false, plain apply) still gate. Resource blocks still apply.
+  - The --context / --kubeconfig / --namespace flags are honored; --server
+    (unverifiable cluster) is denied when contexts are protected; --as/--token
+    are recorded in the audit log (and --as optionally blocked).
+
+Guard-only flags (stripped before forwarding to kubectl):
+  --json         Emit a structured decision object on stderr for non-allow
+  --yes          Auto-confirm a gated command (audited; block mode not bypassed)
+  --no-prompt    Headless: no interactive setup wizard
 
 Config subcommands:
   setup                      Run the setup wizard
-  list                       Show protected contexts, resources, and modes
+  init                       Write config non-interactively (headless / CI)
+  list                       Show protected contexts, resources, namespaces,
+                             confirm mode, and audit log path
   add-context <pattern>      Protect matching contexts (glob)
   remove-context <pattern>   Stop protecting matching contexts
   add-resource <name>        Block a resource everywhere (e.g. secret)
   remove-resource <name>     Stop blocking a resource
+  add-namespace <pattern>    Gate state changes in matching namespaces (glob)
+  remove-namespace <pattern> Stop protecting matching namespaces
   confirm-mode [simple|type-name]
                              Show or set the confirmation prompt style
-                             (type-name requires typing the context name)
+                             (type-name requires typing the context/namespace name)
+  context-mode [confirm|block]
+                             Show or set how protected contexts are enforced
+  namespace-mode [confirm|block]
+                             Show or set how protected namespaces are enforced
+  audit-mode [all|gated|off] Show or set what the audit log records
   audit                      Show the audit log path and recent entries
   path                       Print the config file path
 
@@ -763,6 +786,10 @@ Examples:
 
   # Block all secret access on every cluster
   kubectl-guard config add-resource secret
+
+  # Gate state changes in a protected namespace, or hard-block them
+  kubectl-guard config add-namespace kube-system
+  kubectl-guard config namespace-mode block
 
   # Require typing the context name to confirm dangerous commands
   kubectl-guard config confirm-mode type-name
@@ -774,6 +801,8 @@ Examples:
 Environment:
   Config file: ~/.kubectl-guard.yaml
   Audit log:   ~/.kubectl-guard-audit.log
+  See the README for KUBECTL_GUARD_* variables (actor, headless bootstrap,
+  CONFIRM, BYPASS).
 `
 	fmt.Print(strings.TrimSpace(help) + "\n")
 }

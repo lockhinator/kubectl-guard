@@ -1,9 +1,11 @@
 package guard
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -97,5 +99,47 @@ func TestAppendAuditStampsTimeAndUser(t *testing.T) {
 	}
 	if !strings.Contains(s, `"user":"`) {
 		t.Error("audit entry missing user field")
+	}
+}
+
+func TestAppendAuditConcurrent(t *testing.T) {
+	path := withTempAuditHome(t)
+	cfg := &config.Config{AuditMode: config.AuditModeAll}
+
+	const N = 100
+	var wg sync.WaitGroup
+	wg.Add(N)
+
+	for i := 0; i < N; i++ {
+		go func(i int) {
+			defer wg.Done()
+			// Create a long command to test PIPE_BUF boundary
+			cmd := strings.Repeat("kubectl ", 100) + "get pods -n " + strings.Repeat("very-long-namespace-", 10)
+			_ = AppendAudit(cfg, AuditEntry{
+				Command: cmd,
+				Outcome: OutcomeBlocked,
+				Reason:  "protected resource",
+			})
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify line count == N
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != N {
+		t.Errorf("expected %d lines, got %d", N, len(lines))
+	}
+
+	// Verify every line is valid JSON
+	for i, line := range lines {
+		var entry AuditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Errorf("line %d is not valid JSON: %v", i, err)
+		}
 	}
 }

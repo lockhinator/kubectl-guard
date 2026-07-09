@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/user"
+	"syscall"
 	"time"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -64,6 +65,16 @@ func AppendAudit(cfg *config.Config, entry AuditEntry) error {
 		return err
 	}
 	defer f.Close()
+
+	// Acquire exclusive lock to prevent concurrent writes from interleaving.
+	// flock is advisory and works across processes on the same host.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() {
+		// Unlock failure is non-fatal: auditing is best-effort.
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	}()
 
 	_, err = f.Write(b)
 	return err

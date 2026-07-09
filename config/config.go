@@ -81,6 +81,11 @@ type Config struct {
 	// / --as-uid on a protected context. Impersonation is a common
 	// privilege-escalation and audit-evasion vector. Off by default.
 	BlockImpersonation bool `yaml:"block_impersonation,omitempty"`
+
+	// DiffBeforeConfirm, when true, runs `kubectl diff` (server-side) and shows
+	// the result on stderr before the confirmation prompt for diffable commands.
+	// Off by default (diff adds latency and needs server-side dry-run RBAC).
+	DiffBeforeConfirm bool `yaml:"diff_before_confirm,omitempty"`
 }
 
 // ApplyDefaults fills in zero-value fields with sensible defaults.

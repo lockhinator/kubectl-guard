@@ -101,6 +101,9 @@ type ParsedArgs struct {
 	Filenames       []string
 	Kustomize       string // value of -k / --kustomize
 	ExplicitContext bool
+	// VerbIndex is the index of the kubectl verb (first positional) in the
+	// original args, or -1 if none was found before the "--" separator.
+	VerbIndex int
 
 	// Targeting & identity flags. --server points at a different API server
 	// (a different cluster) the guard cannot map to a context; --as* impersonate
@@ -268,6 +271,7 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 // (the S1 bypass), and it stops positional collection there to match kubectl.
 func ParseArgs(args []string) ParsedArgs {
 	var p ParsedArgs
+	p.VerbIndex = -1
 	skipNext := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -378,6 +382,9 @@ func ParseArgs(args []string) ParsedArgs {
 				skipNext = true
 			}
 		default:
+			if p.VerbIndex < 0 {
+				p.VerbIndex = i
+			}
 			p.Positional = append(p.Positional, arg)
 		}
 	}
@@ -539,6 +546,35 @@ func IsStateAltering(args []string) bool {
 	}
 
 	return stateAlteringCommands[cmd]
+}
+
+// IsDiffable reports whether a command can be previewed with `kubectl diff`:
+// it must apply a manifest (apply/create/replace with a -f/-k source), so there
+// is something to diff. delete/scale/exec/patch have no manifest to diff and
+// are skipped.
+func IsDiffable(args []string) bool {
+	cmd, _ := ExtractCommand(args)
+	switch cmd {
+	case "apply", "create", "replace":
+	default:
+		return false
+	}
+	p := ParseArgs(args)
+	return len(p.Filenames) > 0 || p.Kustomize != ""
+}
+
+// DiffArgs returns a copy of args with the kubectl verb replaced by "diff",
+// preserving global flags (--context, -n, -f, ...), suitable for `kubectl diff`.
+// It returns nil if no verb token is found before the "--" separator.
+func DiffArgs(args []string) []string {
+	p := ParseArgs(args)
+	if p.VerbIndex < 0 {
+		return nil
+	}
+	out := make([]string, len(args))
+	copy(out, args)
+	out[p.VerbIndex] = "diff"
+	return out
 }
 
 // GetCommandDescription returns a human-readable description of the command.

@@ -306,6 +306,7 @@ audit_mode: all           # all (default) | gated | off
 audit_log: ~/.kubectl-guard-audit.log   # optional; defaults to this path
 actor: ci-deploy          # optional static default actor (overridden by KUBECTL_GUARD_ACTOR)
 block_impersonation: true # optional: deny --as* on protected contexts
+diff_before_confirm: true # optional: show `kubectl diff` before the confirm prompt
 ```
 
 Fields:
@@ -324,6 +325,10 @@ Fields:
 - **`audit_log`** — optional override for the audit log path
 - **`actor`** — optional static default for the audit `actor` field (overridden
   by `KUBECTL_GUARD_ACTOR` when set); useful for a shared CI host
+- **`diff_before_confirm`** — when true, run `kubectl diff` (server-side) and
+  show the result on stderr before the confirmation prompt for diffable commands
+  (`apply`/`create`/`replace -f`). Off by default (adds latency and needs
+  server-side dry-run RBAC; a failed diff warns and prompts anyway)
 
 Manage via CLI:
 

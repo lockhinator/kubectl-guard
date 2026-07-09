@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/lockhinator/kubectl-guard/compare/v0.2.2...v0.2.3) (2026-07-09)
+
+
+### Bug Fixes
+
+* drop Windows build targets to fix GoReleaser release ([#50](https://github.com/lockhinator/kubectl-guard/issues/50)) ([a339780](https://github.com/lockhinator/kubectl-guard/commit/a339780016029ef8e5a15049f61f95a8d113e2ed))
+
 ## [0.2.2](https://github.com/lockhinator/kubectl-guard/compare/v0.2.1...v0.2.2) (2026-07-09)
 
 

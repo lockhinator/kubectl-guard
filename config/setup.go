@@ -16,6 +16,8 @@ const (
 	EnvProtectedResources = "KUBECTL_GUARD_PROTECTED_RESOURCES"
 	EnvConfirmMode        = "KUBECTL_GUARD_CONFIRM_MODE"
 	EnvNoPrompt           = "KUBECTL_GUARD_NO_PROMPT"
+	EnvConfirm            = "KUBECTL_GUARD_CONFIRM"  // audited auto-confirm of RequireConfirmation
+	EnvBypass             = "KUBECTL_GUARD_BYPASS"   // audited full bypass (discouraged)
 )
 
 // InitFromEnv builds a Config from the KUBECTL_GUARD_* environment variables.

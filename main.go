@@ -43,6 +43,16 @@ func main() {
 }
 
 func run() error {
+	// KUBECTL_GUARD_BYPASS is a full, audited escape hatch: it disables the
+	// guard for this invocation entirely (the command runs against the real
+	// kubectl). It is discouraged — prefer --yes for gated commands — but
+	// documented for cases where protection must be dropped wholesale (e.g. an
+	// emergency deploy). It is logged as "bypassed" so the audit trail records
+	// exactly what happened and who (actor) did it.
+	if boolEnv(config.EnvBypass) {
+		return runBypass(os.Args[1:])
+	}
+
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "config":
@@ -108,6 +118,24 @@ func orUnknown(s string) string {
 	return s
 }
 
+// runBypass executes the command against the real kubectl with the guard fully
+// disabled, after writing a loud "bypassed" audit entry (best-effort). It is
+// the KUBECTL_GUARD_BYPASS escape hatch.
+func runBypass(args []string) error {
+	ui.PrintWarning("KUBECTL_GUARD_BYPASS set: guard disabled for this invocation (audited).")
+	// Best-effort audit: if a config exists, log the bypass so it's traceable.
+	if exists, err := config.Exists(); err == nil && exists {
+		if cfg, err := config.Load(); err == nil {
+			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+				Command: strings.Join(args, " "),
+				Outcome: guard.OutcomeBypassed,
+				Reason:  "KUBECTL_GUARD_BYPASS",
+			})
+		}
+	}
+	return guard.ExecKubectl(args)
+}
+
 // boolEnv reports whether the env var is set to a truthy value (1, t, true,
 // yes, y, case-insensitive). Empty/unset is false.
 func boolEnv(name string) bool {
@@ -127,6 +155,8 @@ func runGuard(args []string) error {
 	if !noPrompt {
 		noPrompt = boolEnv(config.EnvNoPrompt)
 	}
+	// --yes is a guard-only audited auto-confirm of RequireConfirmation.
+	forwarded, yesFlag := guard.StripYes(forwarded)
 
 	result, ctx, cfg, err := guard.Check(forwarded)
 	cmdStr := strings.Join(forwarded, " ")
@@ -222,6 +252,25 @@ func runGuard(args []string) error {
 		os.Exit(guard.ExitBlocked)
 
 	case guard.RequireConfirmation:
+		// Audited escape hatch: --yes / KUBECTL_GUARD_CONFIRM=yes auto-confirms
+		// RequireConfirmation (state-altering on a protected context) as if the
+		// user typed yes, but logs it as a distinct "auto-confirmed" outcome so
+		// the audit trail records the bypass. Protected-resource Blocks are NOT
+		// affected by this (they stay a hard block in their own branch).
+		autoConfirm := yesFlag || boolEnv(config.EnvConfirm)
+		if autoConfirm {
+			if !jsonMode {
+				ui.PrintWarning("Auto-confirming gated command (--yes / KUBECTL_GUARD_CONFIRM=yes); logged as auto-confirmed.")
+			}
+			_ = guard.AppendAudit(cfg, guard.AuditEntry{
+				Context: ctx,
+				Command: cmdStr,
+				Outcome: guard.OutcomeAutoConfirmed,
+				Reason:  "yes-flag",
+			})
+			return guard.ExecKubectl(forwarded)
+		}
+
 		if jsonMode {
 			// An agent framework cannot answer an interactive prompt; abort
 			// immediately with structured output instead of blocking on stdin.

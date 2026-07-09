@@ -325,6 +325,33 @@ func StripNoPrompt(args []string) (filtered []string, noPrompt bool) {
 	return filtered, noPrompt
 }
 
+// StripYes removes the guard-only --yes flag from args and reports whether
+// audited auto-confirm was requested. Like --json/--no-prompt, it belongs to
+// the guard and must never be forwarded to kubectl. Recognized as "--yes",
+// "--yes=true", or "--yes=false", and only before the "--" separator.
+func StripYes(args []string) (filtered []string, yes bool) {
+	seenSep := false
+	for _, a := range args {
+		if a == "--" {
+			seenSep = true
+			filtered = append(filtered, a)
+			continue
+		}
+		if !seenSep {
+			switch a {
+			case "--yes", "--yes=true":
+				yes = true
+				continue
+			case "--yes=false":
+				yes = false
+				continue
+			}
+		}
+		filtered = append(filtered, a)
+	}
+	return filtered, yes
+}
+
 // PositionalArgs returns the non-flag arguments before "--". Thin wrapper over
 // ParseArgs kept for callers/tests.
 func PositionalArgs(args []string) []string {

@@ -31,8 +31,8 @@ func TestMessagesGoToStderr(t *testing.T) {
 	PrintWarning("test warning message")
 
 	// Close writers to flush
-	stdoutW.Close()
-	stderrW.Close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
 	// Read captured output
 	var stdoutBuf, stderrBuf bytes.Buffer
@@ -75,8 +75,8 @@ func TestPrintSuccessAndInfoGoToStderr(t *testing.T) {
 	PrintInfo("test info message")
 
 	// Close writers to flush
-	stdoutW.Close()
-	stderrW.Close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
 	// Read captured output
 	var stdoutBuf, stderrBuf bytes.Buffer

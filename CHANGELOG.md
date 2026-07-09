@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/lockhinator/kubectl-guard/compare/v0.2.1...v0.2.2) (2026-07-09)
+
+
+### Bug Fixes
+
+* ensure version is properly injected in release builds ([#48](https://github.com/lockhinator/kubectl-guard/issues/48)) ([425f979](https://github.com/lockhinator/kubectl-guard/commit/425f97962ead7c45a3b27959a3525c45e19854d3))
+
 ## [0.2.0](https://github.com/lockhinator/kubectl-guard/compare/v0.1.1...v0.2.0) (2026-07-08)
 
 

@@ -229,6 +229,10 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
   `exec`, `config use-context`, …) require confirmation (or are hard-blocked in
   `context_mode: block`). Read-only commands (`get`, `describe`, `logs`,
   `config view`, …) pass through.
+- **Gated access vectors** — `port-forward` and `proxy` mutate nothing, but they
+  open a live channel into the cluster with your credentials (a tunnel to a prod
+  database; the whole API server bound locally). They are gated exactly like
+  state-altering commands, alongside `exec`, `attach`, and `cp`.
 - **Protected namespaces** — glob patterns of namespaces that gate
   state-altering commands when the target namespace matches. The target
   namespace is resolved from `--namespace`/`-n`, then the namespace baked into
@@ -435,11 +439,21 @@ are preserved exactly.
   contexts **or namespaces** (or are hard-blocked in `context_mode`/
   `namespace_mode: block`). Verbs are case-insensitive (uppercase `DELETE` is
   treated the same as lowercase `delete`).
+- **Access vectors** (`port-forward`, `proxy`, `exec`, `attach`, `cp`) are gated
+  the same way. They change no cluster state, so nothing about them is
+  "read-only" in the sense that matters: they reach production data directly.
 - **Dry-run commands** (`apply --dry-run=client|server`) change no state and
-  skip the prompt (audited as `dry-run`).
+  skip the prompt (audited as `dry-run`). Verbs that have no `--dry-run` flag
+  (`exec`, `port-forward`, `proxy`, …) are always gated: a `--dry-run` token on
+  such a command never buys an ungated pass.
 - **Protected resources** are blocked on every context, including reads.
 - **Targeting/identity** — `--server` is denied when contexts are protected;
   `--as`/`--token` are recorded in the audit log.
+- **Verb resolution** — the guard consumes the values of kubectl's global flags
+  before deciding which token is the verb, so `kubectl -v 3 delete pod x` and
+  `kubectl --request-timeout 30 port-forward …` gate exactly like their plain
+  forms. If a verb still cannot be recognized, the guard falls back to the first
+  recognized verb in the command rather than treating it as unknown (fail-closed).
 - **Guard messages** route to stderr, keeping stdout clean for kubectl output
   and piping to other tools.
 - Context and namespace matching use glob patterns; resource matching treats

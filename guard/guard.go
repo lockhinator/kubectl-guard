@@ -138,7 +138,11 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// none) changes no cluster state, so skip context/namespace gating. This
 	// reduces cry-wolf prompts on safe operations. Protected-resource blocks
 	// above still apply: a dry-run of a protected resource is still blocked.
-	if IsStateAltering(args) && p.IsDryRun() {
+	//
+	// Verbs with no --dry-run flag (exec, port-forward, proxy, ...) are excluded:
+	// they cannot be dry-run, so a --dry-run token on such a command must never
+	// buy an ungated pass.
+	if IsStateAltering(args) && p.IsDryRun() && SupportsDryRun(args) {
 		return Allow, ctx, cfg, nil
 	}
 

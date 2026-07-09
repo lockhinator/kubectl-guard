@@ -26,30 +26,70 @@ var safeCommands = map[string]bool{
 	"diff":          true,
 }
 
-// stateAlteringCommands modify cluster state and require confirmation on
-// protected contexts.
+// stateAlteringCommands are the gated verbs: they require confirmation on
+// protected contexts/namespaces (or are refused in block mode).
+//
+// Most mutate cluster state in the CRUD sense. The rest are high-risk *access*
+// vectors that mutate nothing but hand the caller a live channel into the
+// cluster with the caller's credentials — exec/attach/cp into a running pod,
+// and port-forward/proxy, which open a tunnel to a production workload or
+// expose the whole API server locally. The guard's premise is gating production
+// access, not just production writes, so these gate too.
 var stateAlteringCommands = map[string]bool{
-	"apply":     true,
-	"create":    true,
-	"delete":    true,
-	"patch":     true,
-	"replace":   true,
-	"edit":      true,
-	"scale":     true,
-	"autoscale": true,
-	"expose":    true,
-	"run":       true,
-	"set":       true,
-	"label":     true,
-	"annotate":  true,
-	"taint":     true,
-	"drain":     true,
-	"cordon":    true,
-	"uncordon":  true,
-	"exec":      true,
-	"cp":        true,
-	"debug":     true,
-	"attach":    true,
+	"apply":        true,
+	"create":       true,
+	"delete":       true,
+	"patch":        true,
+	"replace":      true,
+	"edit":         true,
+	"scale":        true,
+	"autoscale":    true,
+	"expose":       true,
+	"run":          true,
+	"set":          true,
+	"label":        true,
+	"annotate":     true,
+	"taint":        true,
+	"drain":        true,
+	"cordon":       true,
+	"uncordon":     true,
+	"exec":         true,
+	"cp":           true,
+	"debug":        true,
+	"attach":       true,
+	"port-forward": true,
+	"proxy":        true,
+}
+
+// noDryRunCommands are gated verbs that kubectl gives no --dry-run flag.
+// A dry-run of a gated command normally skips context/namespace gating because
+// it changes nothing; for these verbs there is no such thing as a dry run, so a
+// --dry-run token on the command line must not be allowed to skip gating.
+//
+// Today kubectl rejects the unknown flag, so nothing would run anyway — but the
+// guard must not depend on kubectl's flag validation to stay closed.
+// Membership verified against `kubectl <verb> --help` (v1.33).
+var noDryRunCommands = map[string]bool{
+	"exec": true, "cp": true, "attach": true, "debug": true,
+	"port-forward": true, "proxy": true, "edit": true, "config": true,
+}
+
+// noDryRunSubcommands is noDryRunCommands at subcommand granularity, for verbs
+// where support is mixed. `rollout undo` really does take --dry-run; its
+// siblings restart/pause/resume do not, so only those are excluded.
+var noDryRunSubcommands = map[string]map[string]bool{
+	"rollout": {"restart": true, "pause": true, "resume": true},
+}
+
+// SupportsDryRun reports whether the command's verb has a meaningful --dry-run.
+// Callers use it to decide whether a --dry-run flag may skip gating. Verbs with
+// no such flag can never be dry-run, so they must always gate.
+func SupportsDryRun(args []string) bool {
+	cmd, subCmd := ExtractCommand(args)
+	if subs, ok := noDryRunSubcommands[cmd]; ok {
+		return !subs[strings.ToLower(subCmd)]
+	}
+	return !noDryRunCommands[cmd]
 }
 
 // safeSubcommands maps a command to the subset of its subcommands that are
@@ -71,17 +111,45 @@ var safeSubcommands = map[string]map[string]bool{
 // handled specially by parseShortCluster. Every other short flag is treated as
 // boolean. This replaces the old exact-match knownShortFlags set, which could
 // not recognize clustered flags like "-Rf" or "-nf" (the G1 gap).
+//
+// 'v' is kubectl's global verbosity shorthand (-v 3). It MUST be here: if its
+// value is not consumed, "3" lands in verb position and a gated verb after it
+// is never seen (the S3 verb-shift bypass).
 var shortTakesValue = map[byte]bool{
-	'n': true, 'l': true, 'o': true, 'c': true, 's': true, 'p': true,
+	'n': true, 'l': true, 'o': true, 'c': true, 's': true, 'p': true, 'v': true,
 }
 
 // knownLongFlags are kubectl long flags that take a separate value
-// (not --flag=value style). --context/--kubeconfig/--filename/--kustomize are
-// handled explicitly in ParseArgs and intentionally omitted here.
+// (not --flag=value style). --context/--kubeconfig/--filename/--kustomize and
+// the identity flags (--as*, --token, --server, --namespace) are handled
+// explicitly in ParseArgs and intentionally omitted here.
+//
+// This set must be a superset of kubectl's global (persistent) value-taking
+// flags, because those are the only flags that may legally precede the verb.
+// Any such flag missing here leaves its value in verb position, hiding the real
+// verb from classification and silently failing open (the S3 verb-shift
+// bypass). kubectl's four boolean globals — --disable-compression,
+// --insecure-skip-tls-verify, --match-server-version, --warnings-as-errors —
+// consume no value and must NOT be listed, or they would swallow the verb.
+// Verified against `kubectl options` (v1.33).
 var knownLongFlags = map[string]bool{
-	"--selector": true,
-	"--output":   true, "--container": true,
-	"--cluster": true, "--user": true,
+	// Command-scoped value flags.
+	"--selector": true, "--output": true, "--container": true,
+	// kubectl global (persistent) value-taking flags.
+	"--cluster": true, "--user": true, "--username": true, "--password": true,
+	"--cache-dir": true, "--certificate-authority": true,
+	"--client-certificate": true, "--client-key": true,
+	"--tls-server-name": true, "--request-timeout": true,
+	"--profile": true, "--profile-output": true,
+	"--v": true, "--vmodule": true, "--log-flush-frequency": true,
+}
+
+// recognizedVerb reports whether v is a kubectl verb the guard can classify.
+func recognizedVerb(v string) bool {
+	if _, ok := safeSubcommands[v]; ok {
+		return true
+	}
+	return safeCommands[v] || stateAlteringCommands[v]
 }
 
 // ProtectedResourceChecker is satisfied by *config.Config; kept as an interface
@@ -557,15 +625,43 @@ func PositionalArgs(args []string) []string {
 // ExtractCommand extracts the kubectl command and its first subcommand from
 // args, ignoring flags. The verb is normalized to lowercase to prevent
 // uppercase bypass (e.g., "DELETE" should match "delete").
+//
+// Normally the verb is the first positional. If that token is not a verb the
+// guard recognizes, the parser may have failed to consume the value of a global
+// flag it does not know about, leaving that value sitting in verb position and
+// hiding the real verb — an ungated fail-open. So when the leading positional is
+// unrecognized, fall back to the first recognized verb later in the positional
+// stream. Relative to trusting pos[0] this can only ever add gating, never
+// remove it. A command with no recognized verb anywhere (a plugin,
+// `completion`, ...) keeps its leading token and is classified as before.
+//
+// The fallback is a backstop, NOT the primary defense: it does not fire when
+// pos[0] happens to be a recognized *safe* verb. A future kubectl global flag
+// that takes a value AND is missing from knownLongFlags could put a safe verb
+// name in verb position (`--future-flag get delete pod x` -> resolves "get")
+// and hide a gated verb. The real invariant is that knownLongFlags/shortTakesValue
+// stay a superset of kubectl's persistent value-taking flags; see their doc
+// comments. Verified complete against `kubectl options` (v1.33).
 func ExtractCommand(args []string) (cmd string, subCmd string) {
 	pos := PositionalArgs(args)
-	if len(pos) >= 1 {
-		cmd = strings.ToLower(pos[0])
+	if len(pos) == 0 {
+		return "", ""
 	}
-	if len(pos) >= 2 {
-		subCmd = pos[1]
+	if first := strings.ToLower(pos[0]); recognizedVerb(first) {
+		if len(pos) >= 2 {
+			return first, pos[1]
+		}
+		return first, ""
 	}
-	return
+	for i := 1; i < len(pos); i++ {
+		if v := strings.ToLower(pos[i]); recognizedVerb(v) {
+			if i+1 < len(pos) {
+				return v, pos[i+1]
+			}
+			return v, ""
+		}
+	}
+	return strings.ToLower(pos[0]), ""
 }
 
 // ExtractResourceCandidates returns the positional arguments after the verb.

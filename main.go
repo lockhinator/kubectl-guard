@@ -32,6 +32,8 @@ var guardConfigSubcommands = map[string]bool{
 	"add-namespace":   true,
 	"remove-namespace": true,
 	"confirm-mode":    true,
+	"context-mode":    true,
+	"namespace-mode":  true,
 	"audit-mode":     true,
 	"audit":           true,
 	"path":            true,
@@ -267,16 +269,45 @@ func runGuard(args []string) error {
 		return nil
 
 	case guard.Blocked:
-		if jsonMode {
-			emitDecision()
-		} else {
-			cmdDesc := guard.GetCommandDescription(forwarded)
-			ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
-			if guard.HasUninspectableSource(forwarded) {
-				ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+		// A Blocked result is either a protected-resource block or a block-mode
+		// refusal (context_mode/namespace_mode: block). Determine which so the
+		// message and audit reason are accurate.
+		blockReason := "protected-resource"
+		if !guard.MatchesProtectedResource(cfg, forwarded) {
+			if cfg != nil && cfg.IsContextProtected(ctx) && cfg.ContextMode == config.ContextModeBlock {
+				blockReason = "protected-context-block-mode"
+			} else {
+				blockReason = "protected-namespace-block-mode"
 			}
 		}
-		audit(guard.OutcomeBlocked, "protected-resource")
+		if jsonMode {
+			jr := guard.JSONForResult(result, ctx, cmdStr, forwarded, err)
+			jr.Reason = blockReason
+			if blockReason != "protected-resource" {
+				jr.Resource = "" // block-mode is not about a specific resource
+			}
+			if b, mErr := json.Marshal(jr); mErr == nil {
+				fmt.Fprintln(os.Stderr, string(b))
+			}
+		} else {
+			cmdDesc := guard.GetCommandDescription(forwarded)
+			switch blockReason {
+			case "protected-resource":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
+				if guard.HasUninspectableSource(forwarded) {
+					ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
+				}
+			case "protected-context-block-mode":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
+			default: // protected-namespace-block-mode
+				ns := parsed.ResolvedNamespace()
+				if parsed.AllNamespaces {
+					ns = "all namespaces"
+				}
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected namespace %q (block mode: no confirmation offered)", cmdDesc, ns))
+			}
+		}
+		audit(guard.OutcomeBlocked, blockReason)
 		os.Exit(guard.ExitBlocked)
 
 	case guard.RequireConfirmation:
@@ -475,6 +506,54 @@ func runConfigCommand() error {
 				return err
 			}
 			ui.PrintSuccess("Audit mode set: " + cfg.AuditMode)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "context-mode [confirm|block]",
+		Short: "Show or set how protected contexts treat state-altering commands",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Context mode: " + cfg.ContextMode)
+				return nil
+			}
+			if !cfg.SetContextMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.ContextModeConfirm, config.ContextModeBlock)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Context mode set: " + cfg.ContextMode)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "namespace-mode [confirm|block]",
+		Short: "Show or set how protected namespaces treat state-altering commands",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Namespace mode: " + cfg.NamespaceMode)
+				return nil
+			}
+			if !cfg.SetNamespaceMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.NamespaceModeConfirm, config.NamespaceModeBlock)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Namespace mode set: " + cfg.NamespaceMode)
 			return nil
 		},
 	})

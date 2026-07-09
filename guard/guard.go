@@ -149,6 +149,14 @@ func checkWith(args []string, current CurrentContextFunc) (Result, string, *conf
 	}
 
 	if (contextProtected || namespaceProtected) && IsStateAltering(args) {
+		// Block mode: hard-refuse state-altering commands with no prompt. If
+		// either the matching context or namespace is in block mode, block wins
+		// (most restrictive). --yes cannot bypass this: it only auto-confirms
+		// RequireConfirmation, and Blocked is a separate result.
+		if (contextProtected && cfg.ContextMode == config.ContextModeBlock) ||
+			(namespaceProtected && cfg.NamespaceMode == config.NamespaceModeBlock) {
+			return Blocked, ctx, cfg, nil
+		}
 		return RequireConfirmation, ctx, cfg, nil
 	}
 

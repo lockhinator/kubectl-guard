@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -352,5 +353,73 @@ func TestShouldAudit(t *testing.T) {
 				t.Errorf("ShouldAudit(%q) in mode %q = %v, want %v", tt.outcome, tt.mode, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSaveIsAtomic(t *testing.T) {
+	// Create temp directory
+	tmpDir, err := os.MkdirTemp("", "kubectl-guard-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Override home directory for test
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+
+	// Write initial config
+	cfg := &Config{
+		ProtectedContexts: []string{"prod-cluster"},
+	}
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the initial content
+	path := filepath.Join(tmpDir, configFileName)
+	originalContent, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make directory read-only to simulate write failure
+	if err := os.Chmod(tmpDir, 0500); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attempt to save a modified config (should fail)
+	cfg2 := &Config{
+		ProtectedContexts: []string{"prod-cluster", "staging-cluster"},
+	}
+	err = Save(cfg2)
+	if err == nil {
+		t.Error("Save should fail when directory is read-only")
+	}
+
+	// Restore directory permissions for cleanup
+	if err := os.Chmod(tmpDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify original config is unchanged
+	currentContent, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(currentContent) != string(originalContent) {
+		t.Error("Original config was modified after failed save")
+	}
+
+	// Verify no temp files remain
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".kubectl-guard-") && strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Errorf("Temp file remains after failed save: %s", entry.Name())
+		}
 	}
 }

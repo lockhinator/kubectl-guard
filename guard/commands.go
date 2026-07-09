@@ -276,11 +276,12 @@ func PositionalArgs(args []string) []string {
 }
 
 // ExtractCommand extracts the kubectl command and its first subcommand from
-// args, ignoring flags.
+// args, ignoring flags. The verb is normalized to lowercase to prevent
+// uppercase bypass (e.g., "DELETE" should match "delete").
 func ExtractCommand(args []string) (cmd string, subCmd string) {
 	pos := PositionalArgs(args)
 	if len(pos) >= 1 {
-		cmd = pos[0]
+		cmd = strings.ToLower(pos[0])
 	}
 	if len(pos) >= 2 {
 		subCmd = pos[1]

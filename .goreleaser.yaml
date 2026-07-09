@@ -23,8 +23,6 @@ builds:
       - linux_arm64
       - darwin_amd64
       - darwin_arm64
-      - windows_amd64
-      - windows_arm64
 
 archives:
   - formats: [tar.gz]
@@ -33,9 +31,6 @@ archives:
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_
       {{- if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}_{{ .Arch }}
-    format_overrides:
-      - goos: windows
-        formats: [zip]
 
 checksum:
   name_template: 'checksums.txt'

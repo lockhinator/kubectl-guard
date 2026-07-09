@@ -71,7 +71,10 @@ func AppendAudit(cfg *config.Config, entry AuditEntry) error {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	defer func() {
+		// Unlock failure is non-fatal: auditing is best-effort.
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	}()
 
 	_, err = f.Write(b)
 	return err

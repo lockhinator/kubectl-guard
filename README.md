@@ -212,6 +212,11 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
 - **Protected contexts** — state-altering commands (`apply`, `delete`, `scale`,
   `exec`, `config use-context`, …) require confirmation. Read-only commands
   (`get`, `describe`, `logs`, `config view`, …) pass through.
+- **Protected namespaces** — glob patterns of namespaces that gate
+  state-altering commands when the target namespace matches (resolved from
+  `--namespace`/`-n`, or `default`). `--all-namespaces`/`-A` is gated whenever
+  any namespace is protected. Composes with context protection: a command is
+  gated if *either* the context or the namespace is protected.
 - **Protected resources** — any command touching the resource is **blocked
   everywhere** (reads included), regardless of context. Use this to block all
   access to secrets, for example.
@@ -286,6 +291,11 @@ protected_contexts:
   - prod-*           # Glob patterns supported
 protected_resources:
   - secret           # Blocked on every context
+protected_namespaces:
+  - kube-system      # State changes gated in these namespaces
+  - prod-*           # Glob patterns supported
+context_mode: confirm     # confirm (default) | block
+namespace_mode: confirm   # confirm (default) | block
 confirm_mode: type-name   # simple (y/N) or type-name (type the context name)
 audit_mode: all           # all (default) | gated | off
 audit_log: ~/.kubectl-guard-audit.log   # optional; defaults to this path
@@ -296,7 +306,11 @@ block_impersonation: true # optional: deny --as* on protected contexts
 Fields:
 - **`protected_contexts`** — glob patterns of contexts that gate
   state-altering commands (require confirmation)
+- **`protected_namespaces`** — glob patterns of namespaces that gate
+  state-altering commands (resolved from `--namespace`/`-n`, or `default`)
 - **`protected_resources`** — resources blocked everywhere, reads included
+- **`context_mode`** — `confirm` (default, prompts) or `block` (hard-refuse)
+- **`namespace_mode`** — `confirm` (default) or `block`, for protected namespaces
 - **`confirm_mode`** — `simple` (y/N prompt) or `type-name` (type the
   context name to confirm)
 - **`audit_mode`** — `all` (default, logs every command including allowed
@@ -315,6 +329,9 @@ kubectl-guard config add-context prod-*   # Protect matching contexts
 kubectl-guard config remove-context staging
 kubectl-guard config add-resource secret  # Block a resource everywhere
 kubectl-guard config remove-resource secret
+kubectl-guard config add-namespace kube-system  # Gate state changes in a namespace
+kubectl-guard config add-namespace 'prod-*'      # Glob patterns supported
+kubectl-guard config remove-namespace kube-system
 kubectl-guard config confirm-mode type-name  # Stronger confirmation prompt
 kubectl-guard config audit-mode all          # Log every command (default)
 kubectl-guard config audit                # Show audit log path + recent entries

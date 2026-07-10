@@ -528,6 +528,23 @@ Fields:
   passthrough), `gated` (only interventions: blocked/confirmed/aborted/denied),
   or `off` (logs nothing)
 - **`audit_log`** — optional override for the audit log path
+- **`audit_max_size_mb`** — enable size-based rotation of the audit log: when the
+  file would exceed this many megabytes it is rotated to `<log>.1` (older archives
+  shift to `.2`, `.3`, …). `0` (default) disables rotation. Set with
+  `kubectl-guard config audit-rotation <mb> [max-files]`
+- **`audit_max_files`** — how many rotated archives to keep (`<log>.1 … .N`); the
+  oldest is dropped on each rotation. Default `5` when rotation is on. Rotation is
+  concurrency-safe (serialized by a dedicated `<log>.lock`, so a rename never
+  races a concurrent append)
+- **`audit_webhook_url`** — POST each audited entry as a JSON body to this
+  `http(s)` URL (a SIEM, Slack, etc.). Synchronous and best-effort with a short
+  timeout, so a slow/dead webhook adds at most that delay and never fails the
+  command; local file logging still happens. Set with
+  `kubectl-guard config audit-webhook <url|off>`
+- **`audit_syslog`** — also write each audited entry to the local syslog
+  (`LOG_USER`/`LOG_INFO`, tag `kubectl-guard`). Set with
+  `kubectl-guard config audit-syslog on`. Shipping sinks respect `audit_mode`: a
+  filtered-out entry is neither logged nor shipped
 - **`actor`** — optional static default for the audit `actor` field (overridden
   by `KUBECTL_GUARD_ACTOR` when set); useful for a shared CI host
 - **`diff_before_confirm`** — when true, run `kubectl diff` (server-side) and

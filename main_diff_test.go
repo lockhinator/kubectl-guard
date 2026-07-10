@@ -44,8 +44,9 @@ func TestDiffBeforeConfirmShowsDiff(t *testing.T) {
 	}
 	bin := buildGuardBin(t)
 	home := t.TempDir()
-	// prod-cluster is the current context (fake kubectl reports it); protect it.
+	// prod-cluster is the current context (kubeconfig sets it); protect it.
 	writeConfig(t, home, "protected_contexts:\n  - prod-*\ndiff_before_confirm: true\n")
+	writeKubeconfig(t, home, "prod-cluster", nil)
 	kubectlDir := writeDiffKubectl(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -75,6 +76,7 @@ func TestDiffSkippedForNonDiffable(t *testing.T) {
 	bin := buildGuardBin(t)
 	home := t.TempDir()
 	writeConfig(t, home, "protected_contexts:\n  - prod-*\ndiff_before_confirm: true\n")
+	writeKubeconfig(t, home, "prod-cluster", nil)
 	kubectlDir := writeDiffKubectl(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -99,6 +101,7 @@ func TestDiffBeforeConfirmOffByDefault(t *testing.T) {
 	bin := buildGuardBin(t)
 	home := t.TempDir()
 	writeConfig(t, home, "protected_contexts:\n  - prod-*\n")
+	writeKubeconfig(t, home, "prod-cluster", nil)
 	kubectlDir := writeDiffKubectl(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

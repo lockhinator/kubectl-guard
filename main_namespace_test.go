@@ -10,11 +10,12 @@ import (
 	"time"
 )
 
-// writeNamespacedKubectl installs a fake kubectl that reports a context whose
-// baked-in namespace is `ns`, so the guard's tier-2 namespace resolution (via
-// `config view --minify`) can be exercised without a real cluster. It answers
-// `config current-context` and `config view ... jsonpath...` and echoes any
-// other invocation (so a forwarded command is observable on stdout).
+// writeNamespacedKubectl installs a fake kubectl for COMMAND EXECUTION: it
+// echoes any forwarded invocation to stdout so it is observable. Since issue #31
+// the guard resolves the context namespace from the kubeconfig via clientcmd
+// (see writeKubeconfig), not from this fake — the retained `config
+// current-context`/`config view` answers are only a harmless legacy-path
+// fallback and are ignored on the clientcmd path.
 func writeNamespacedKubectl(t *testing.T, ns string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -44,6 +45,9 @@ func TestBlockMessageUsesContextDerivedNamespace(t *testing.T) {
 	bin := buildGuardBin(t)
 	home := t.TempDir()
 	writeConfig(t, home, "protected_namespaces:\n  - kube-system\nnamespace_mode: block\n")
+	// The namespace must come from the CURRENT context (tier 2): clientcmd reads
+	// it from this kubeconfig, so bake kube-system into fake-context.
+	writeKubeconfig(t, home, "fake-context", map[string]string{"fake-context": "kube-system"})
 	kubectlDir := writeNamespacedKubectl(t, "kube-system")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

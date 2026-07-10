@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -49,6 +50,64 @@ func writeConfig(t *testing.T, home, body string) {
 	}
 }
 
+// writeKubeconfig writes a valid kubeconfig to $home/.kube/config so the guard's
+// clientcmd-based context/namespace resolution (issue #31) resolves without a
+// real cluster. This is the NEW path: clientcmd reads this file directly, so the
+// fake kubectl on PATH no longer answers `config current-context`/`config view`
+// — it only handles COMMAND EXECUTION (get/delete/etc.).
+//
+// currentContext becomes the kubeconfig's current-context. The fixture always
+// includes the contexts the subprocess tests reference via --context
+// (fake-context, dev-cluster, prod-cluster) so explicit --context lookups
+// resolve. nsByContext bakes a namespace into the named context — matching what
+// `kubectl config view --minify` used to report for tier-2 namespace derivation;
+// a context absent from the map carries no namespace (kubectl then defaults to
+// "default").
+func writeKubeconfig(t *testing.T, home, currentContext string, nsByContext map[string]string) {
+	t.Helper()
+	kubeDir := filepath.Join(home, ".kube")
+	if err := os.MkdirAll(kubeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	names := []string{"fake-context", "dev-cluster", "prod-cluster"}
+	if currentContext != "" {
+		names = append(names, currentContext)
+	}
+	for name := range nsByContext {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString("apiVersion: v1\n")
+	b.WriteString("kind: Config\n")
+	b.WriteString("current-context: " + currentContext + "\n")
+	b.WriteString("clusters:\n")
+	b.WriteString("- cluster:\n    server: https://127.0.0.1:6443\n  name: fake-cluster\n")
+	b.WriteString("users:\n")
+	b.WriteString("- name: fake-user\n  user: {}\n")
+	b.WriteString("contexts:\n")
+	seen := map[string]bool{}
+	for _, name := range names {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		b.WriteString("- context:\n")
+		b.WriteString("    cluster: fake-cluster\n")
+		b.WriteString("    user: fake-user\n")
+		if ns := nsByContext[name]; ns != "" {
+			b.WriteString("    namespace: " + ns + "\n")
+		}
+		b.WriteString("  name: " + name + "\n")
+	}
+
+	if err := os.WriteFile(filepath.Join(kubeDir, "config"), []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // runGuardWithConfig builds the guard, installs a fake kubectl, writes the
 // config into a temp HOME, and runs the guard with args. Returns stdout,
 // stderr, and exit code.
@@ -59,6 +118,7 @@ func runGuardWithConfig(t *testing.T, cfgYAML string, args ...string) (stdout, s
 	if cfgYAML != "" {
 		writeConfig(t, home, cfgYAML)
 	}
+	writeKubeconfig(t, home, "fake-context", nil)
 	kubectlDir := writeFakeKubectl(t)
 
 	cmd := exec.Command(bin, args...)

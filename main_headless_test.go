@@ -22,6 +22,7 @@ func runHeadless(t *testing.T, extraEnv []string, args ...string) (stdout, stder
 	}
 	bin := buildGuardBin(t)
 	home := t.TempDir()
+	writeKubeconfig(t, home, "fake-context", nil)
 	kubectlDir := writeFakeKubectl(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -56,6 +57,7 @@ func TestHeadlessEnvBootstrapWritesConfig(t *testing.T) {
 	}
 	bin := buildGuardBin(t)
 	home := t.TempDir()
+	writeKubeconfig(t, home, "fake-context", nil)
 	kubectlDir := writeFakeKubectl(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -22,6 +22,7 @@ func runGuardAudit(t *testing.T, cfgYAML, stdin string, args ...string) (code in
 	bin := buildGuardBin(t)
 	home := t.TempDir()
 	writeConfig(t, home, cfgYAML)
+	writeKubeconfig(t, home, "fake-context", nil)
 	kubectlDir := writeFakeKubectl(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

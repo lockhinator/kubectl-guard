@@ -23,6 +23,7 @@ func runBootstrap(t *testing.T, extraEnv []string, args ...string) (stdout, stde
 	}
 	bin := buildGuardBin(t)
 	home := t.TempDir()
+	writeKubeconfig(t, home, "fake-context", nil)
 	kubectlDir := writeFakeKubectl(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

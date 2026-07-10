@@ -63,6 +63,46 @@ func TestUnknownVerbNotLaunderedByArgVerb(t *testing.T) {
 	}
 }
 
+// TestUnknownVerbInClusterComposition pins the intended (by-design) composition
+// of unknown_verb with in_cluster: unknown_verb rides the context/namespace
+// protection axis, so `in_cluster: allow` (a documented full passthrough of that
+// axis) lets an unknown verb through even under unknown_verb: deny — exactly as a
+// known state-altering verb passes there — while `in_cluster: namespace` (the
+// default) still gates it by the serviceaccount namespace. (sensitive_access and
+// blast_radius are every-context axes and are NOT bypassed by in_cluster: allow;
+// those are pinned in their own tests.)
+func TestUnknownVerbInClusterComposition(t *testing.T) {
+	// in_cluster: allow — unknown verb passes (allow opts out of the axis).
+	cleanup := withTempHome(t, &config.Config{
+		ProtectedContexts: []string{"prod-*"}, // so the in-cluster branch is entered
+		InCluster:         config.InClusterAllow,
+		UnknownVerb:       config.UnknownVerbDeny,
+	})
+	res, _, _, _ := checkWithResolvers([]string{"my-plugin", "sync"},
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("kube-system"))
+	cleanup()
+	if res != Allow {
+		t.Errorf("unknown verb in-cluster under in_cluster=allow = %v, want Allow (allow opts out of the protected-target axis)", res)
+	}
+
+	// in_cluster: namespace (default) — unknown verb in a protected SA namespace
+	// is still denied. protected_contexts must be set for the in-cluster branch to
+	// be entered at all (the in-cluster policy is scoped to protected contexts,
+	// per #83); the SA namespace is then the gating target.
+	cleanup2 := withTempHome(t, &config.Config{
+		ProtectedContexts:   []string{"prod-*"},
+		ProtectedNamespaces: []string{"kube-system"},
+		InCluster:           config.InClusterNamespace,
+		UnknownVerb:         config.UnknownVerbDeny,
+	})
+	defer cleanup2()
+	res, _, _, _ = checkWithResolvers([]string{"my-plugin", "sync"},
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("kube-system"))
+	if res != Deny {
+		t.Errorf("unknown verb in-cluster (namespace mode) in a protected SA namespace = %v, want Deny", res)
+	}
+}
+
 // TestUnknownVerbGate: with unknown_verb: gate, an unrecognized verb requires
 // confirmation on a protected context but passes on an unprotected one.
 func TestUnknownVerbGate(t *testing.T) {

@@ -71,6 +71,17 @@ func (c *Config) Validate() []string {
 	if c.AuditWebhookURL != "" && !ValidWebhookURL(c.AuditWebhookURL) {
 		problems = append(problems, fmt.Sprintf("audit_webhook_url: %q is not a valid http(s) URL", c.AuditWebhookURL))
 	}
+	for field, list := range map[string][]string{
+		"safe":           c.CommandOverrides.Safe,
+		"state_altering": c.CommandOverrides.StateAltering,
+		"unsafe_safe":    c.CommandOverrides.UnsafeSafe,
+	} {
+		for i, v := range list {
+			if strings.TrimSpace(v) == "" {
+				problems = append(problems, fmt.Sprintf("command_overrides.%s: entry %d is empty", field, i))
+			}
+		}
+	}
 	for i, ap := range c.ActorPolicies {
 		if strings.TrimSpace(ap.Actor) == "" {
 			problems = append(problems, fmt.Sprintf("actor_policies: entry %d has an empty actor", i))

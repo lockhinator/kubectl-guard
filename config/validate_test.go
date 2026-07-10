@@ -37,6 +37,8 @@ func TestValidate(t *testing.T) {
 		{"bare audit_webhook_url", Config{AuditWebhookURL: "notaurl"}, "audit_webhook_url"},
 		{"valid audit_webhook_url", Config{AuditWebhookURL: "https://siem.example/hook"}, ""},
 		{"valid audit rotation", Config{AuditMaxSizeMB: 100, AuditMaxFiles: 5}, ""},
+		{"empty command override entry", Config{CommandOverrides: CommandOverrides{StateAltering: []string{"x", " "}}}, "command_overrides"},
+		{"valid command overrides", Config{CommandOverrides: CommandOverrides{Safe: []string{"my-read"}, StateAltering: []string{"my-plugin"}}}, ""},
 		{"empty actor policy actor", Config{ActorPolicies: []ActorPolicy{{Actor: ""}}}, "actor_policies"},
 		{"invalid actor policy mode", Config{ActorPolicies: []ActorPolicy{{Actor: "x", ContextMode: "blck"}}}, "context_mode"},
 		{"valid actor policy", Config{ActorPolicies: []ActorPolicy{{Actor: "ci-*", ContextMode: ContextModeBlock}}}, ""},

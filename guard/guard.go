@@ -206,7 +206,7 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// buy an ungated pass. A sensitive-access verb is also excluded: dry-run is
 	// about the state-mutation axis, but sensitive-access is about reading/
 	// reaching, which a dry-run does not prevent.
-	if IsStateAltering(args) && p.IsDryRun() && SupportsDryRun(args) && !sensitiveActive {
+	if IsStateAlteringWith(cfg, args) && p.IsDryRun() && SupportsDryRun(args) && !sensitiveActive {
 		return Allow, ctx, cfg, nil
 	}
 
@@ -268,9 +268,17 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// namespace, per tier 2) is deferred until we know the verb mutates state.
 	// This keeps read-only commands (get/describe/logs/...) from spawning a
 	// kubectl subprocess just because namespace protection is configured. A
-	// non-state-altering command that is NOT sensitive passes through here.
-	stateAltering := IsStateAltering(args)
-	if !stateAltering && !sensitiveActive {
+	// non-state-altering command that is NOT sensitive AND NOT a wide/bulk mutation
+	// passes through here. blastActive must be checked too: sensitive-access and
+	// blast-radius are ORTHOGONAL policies (about what a verb can reach / how much
+	// it destroys) that compose most-restrictive regardless of the safe/dangerous
+	// classification. A `command_overrides.safe` downgrade makes stateAltering
+	// false, so without this a safe-overridden bulk verb (e.g. `delete` marked
+	// safe) would slip past a blast-radius BLOCK — inconsistent with the sensitive
+	// case and with "block is un-bypassable". (When no override is in play,
+	// blastActive already implies stateAltering, so this is a no-op.)
+	stateAltering := IsStateAlteringWith(cfg, args)
+	if !stateAltering && !sensitiveActive && !blastActive {
 		return Allow, ctx, cfg, nil
 	}
 

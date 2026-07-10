@@ -916,8 +916,17 @@ func ExtractFilenames(args []string) []string {
 	return ParseArgs(args).Filenames
 }
 
-// IsSafeCommand returns true if the command is read-only.
+// IsSafeCommand returns true if the command is read-only, using the built-in
+// classification only. Callers that have a config should prefer
+// IsSafeCommandWith so a team's command_overrides are honored.
 func IsSafeCommand(args []string) bool {
+	return IsSafeCommandWith(nil, args)
+}
+
+// IsSafeCommandWith reports whether the command is read-only, consulting a
+// config's command_overrides first (a verb marked `safe` is read-only; one
+// marked `state_altering`/`unsafe_safe` is not), then the built-in classification.
+func IsSafeCommandWith(cfg *config.Config, args []string) bool {
 	if len(args) == 0 {
 		return true
 	}
@@ -925,6 +934,15 @@ func IsSafeCommand(args []string) bool {
 	cmd, subCmd := ExtractCommand(args)
 	if cmd == "" {
 		return true
+	}
+
+	if cfg != nil {
+		switch cfg.ClassifyOverride(cmd) {
+		case config.ClassSafe:
+			return true
+		case config.ClassStateAltering:
+			return false
+		}
 	}
 
 	if subs, ok := safeSubcommands[cmd]; ok {
@@ -943,8 +961,19 @@ func IsDryRun(args []string) bool {
 	return ParseArgs(args).IsDryRun()
 }
 
-// IsStateAltering returns true if the command modifies cluster state.
+// IsStateAltering returns true if the command modifies cluster state, using the
+// built-in classification only. Callers that have a config should prefer
+// IsStateAlteringWith so a team's command_overrides are honored.
 func IsStateAltering(args []string) bool {
+	return IsStateAlteringWith(nil, args)
+}
+
+// IsStateAlteringWith reports whether the command modifies cluster state,
+// consulting a config's command_overrides first (a verb marked
+// `state_altering`/`unsafe_safe` is state-altering; one marked `safe` is not),
+// then the built-in classification. It is the exact complement of
+// IsSafeCommandWith for any classified verb, so the two never disagree.
+func IsStateAlteringWith(cfg *config.Config, args []string) bool {
 	if len(args) == 0 {
 		return false
 	}
@@ -952,6 +981,15 @@ func IsStateAltering(args []string) bool {
 	cmd, subCmd := ExtractCommand(args)
 	if cmd == "" {
 		return false
+	}
+
+	if cfg != nil {
+		switch cfg.ClassifyOverride(cmd) {
+		case config.ClassStateAltering:
+			return true
+		case config.ClassSafe:
+			return false
+		}
 	}
 
 	if subs, ok := safeSubcommands[cmd]; ok {

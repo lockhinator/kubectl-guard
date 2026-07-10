@@ -210,6 +210,11 @@ type Config struct {
 	// gated (it changes nothing). See guard.BlastRadius for the classifier.
 	BlastRadius string `yaml:"blast_radius,omitempty"`
 
+	// CommandOverrides lets a team tailor the built-in safe/state-altering verb
+	// classification without forking: mark a custom/plugin verb dangerous, or a
+	// default-safe verb (e.g. logs) as requiring confirmation. See ClassifyOverride.
+	CommandOverrides CommandOverrides `yaml:"command_overrides,omitempty"`
+
 	// InCluster is the policy for running with no named context (in a pod, or CI
 	// with an in-cluster kubeconfig): "namespace" (default) gates by the resolved
 	// serviceaccount namespace, "deny" fails closed, "allow" passes through. Empty
@@ -269,6 +274,114 @@ func (c *Config) IsSensitiveVerb(verb string) bool {
 		}
 	}
 	return false
+}
+
+// CommandOverrides tailors command classification. safe moves a verb to
+// read-only (pass-through); state_altering and unsafe_safe both move a verb to
+// state-altering (gated) — the two names distinguish intent (add a custom
+// dangerous verb vs. promote a default-safe one like logs), but resolve
+// identically. All matching is case-insensitive and whitespace-trimmed.
+type CommandOverrides struct {
+	// Safe verbs are treated as read-only, passing through even if a built-in
+	// classifies them as state-altering (a deliberate, documented downgrade).
+	Safe []string `yaml:"safe,omitempty"`
+	// StateAltering verbs are treated as state-altering (gated on protected
+	// contexts/namespaces) — for a custom or plugin verb the guard cannot know.
+	StateAltering []string `yaml:"state_altering,omitempty"`
+	// UnsafeSafe promotes a DEFAULT-SAFE verb (e.g. logs, if apps log secrets) to
+	// state-altering, so it requires confirmation. Resolves the same as
+	// StateAltering; kept separate to document the "this was safe, make it gated"
+	// intent.
+	UnsafeSafe []string `yaml:"unsafe_safe,omitempty"`
+}
+
+// CommandClass is the classification a command-override assigns to a verb.
+type CommandClass int
+
+const (
+	// ClassNone means no override applies; the built-in classification is used.
+	ClassNone CommandClass = iota
+	// ClassSafe means the verb is treated as read-only (pass-through).
+	ClassSafe
+	// ClassStateAltering means the verb is treated as state-altering (gated).
+	ClassStateAltering
+)
+
+// ClassifyOverride returns the override class for a verb, or ClassNone when no
+// override applies. State-altering (including unsafe_safe) wins a contradiction
+// with safe — the most-restrictive resolution, so a verb listed in both is gated
+// rather than passed. Case-insensitive and whitespace-trimmed.
+func (c *Config) ClassifyOverride(verb string) CommandClass {
+	verb = strings.ToLower(strings.TrimSpace(verb))
+	if verb == "" {
+		return ClassNone
+	}
+	if containsFold(c.CommandOverrides.StateAltering, verb) || containsFold(c.CommandOverrides.UnsafeSafe, verb) {
+		return ClassStateAltering
+	}
+	if containsFold(c.CommandOverrides.Safe, verb) {
+		return ClassSafe
+	}
+	return ClassNone
+}
+
+// containsFold reports whether list contains verb, comparing case-insensitively
+// after trimming whitespace on each entry.
+func containsFold(list []string, verb string) bool {
+	for _, v := range list {
+		if strings.EqualFold(strings.TrimSpace(v), verb) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetCommandOverride classifies verb as ClassSafe or ClassStateAltering, removing
+// it from any other override list first so the two never contradict. It returns
+// false for an empty verb or an unusable class. A verb set to ClassStateAltering
+// lands in the state_altering list (unsafe_safe is a hand-authored alias only).
+func (c *Config) SetCommandOverride(verb string, class CommandClass) bool {
+	verb = strings.ToLower(strings.TrimSpace(verb))
+	if verb == "" || (class != ClassSafe && class != ClassStateAltering) {
+		return false
+	}
+	c.removeCommandOverride(verb)
+	switch class {
+	case ClassSafe:
+		c.CommandOverrides.Safe = append(c.CommandOverrides.Safe, verb)
+	case ClassStateAltering:
+		c.CommandOverrides.StateAltering = append(c.CommandOverrides.StateAltering, verb)
+	}
+	return true
+}
+
+// RemoveCommandOverride deletes verb from every override list, reporting whether
+// it was present in any.
+func (c *Config) RemoveCommandOverride(verb string) bool {
+	verb = strings.ToLower(strings.TrimSpace(verb))
+	present := containsFold(c.CommandOverrides.Safe, verb) ||
+		containsFold(c.CommandOverrides.StateAltering, verb) ||
+		containsFold(c.CommandOverrides.UnsafeSafe, verb)
+	c.removeCommandOverride(verb)
+	return present
+}
+
+// removeCommandOverride strips verb from all three override lists.
+func (c *Config) removeCommandOverride(verb string) {
+	c.CommandOverrides.Safe = withoutFold(c.CommandOverrides.Safe, verb)
+	c.CommandOverrides.StateAltering = withoutFold(c.CommandOverrides.StateAltering, verb)
+	c.CommandOverrides.UnsafeSafe = withoutFold(c.CommandOverrides.UnsafeSafe, verb)
+}
+
+// withoutFold returns list with every case-insensitive match of verb removed.
+func withoutFold(list []string, verb string) []string {
+	out := list[:0:0]
+	for _, v := range list {
+		if !strings.EqualFold(strings.TrimSpace(v), verb) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // BlastRadiusMode returns the blast-radius policy, defaulting to off. An invalid

@@ -43,6 +43,7 @@ var guardConfigSubcommands = map[string]bool{
 	"audit-rotation":   true,
 	"audit-webhook":    true,
 	"audit-syslog":     true,
+	"command-override": true,
 	"audit":            true,
 	"path":             true,
 	"validate":         true,
@@ -935,6 +936,54 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "command-override [safe <verb> | dangerous <verb> | remove <verb>]",
+		Short: "Override the built-in safe/state-altering classification of a verb",
+		Long: "Tailor command classification without forking. `safe` makes a verb\n" +
+			"pass through as read-only; `dangerous` makes it require confirmation on\n" +
+			"protected contexts (e.g. a custom plugin, or `logs` if apps log secrets).\n\n" +
+			"  command-override                    list overrides\n" +
+			"  command-override safe <verb>        classify <verb> as read-only\n" +
+			"  command-override dangerous <verb>   classify <verb> as state-altering\n" +
+			"  command-override remove <verb>      drop any override for <verb>",
+		Args: cobra.MaximumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				printCommandOverrides(cfg)
+				return nil
+			}
+			if len(args) != 2 {
+				return fmt.Errorf("usage: config command-override <safe|dangerous|remove> <verb>")
+			}
+			action, verb := args[0], args[1]
+			switch action {
+			case "safe":
+				if !cfg.SetCommandOverride(verb, config.ClassSafe) {
+					return fmt.Errorf("invalid verb %q", verb)
+				}
+			case "dangerous":
+				if !cfg.SetCommandOverride(verb, config.ClassStateAltering) {
+					return fmt.Errorf("invalid verb %q", verb)
+				}
+			case "remove":
+				if !cfg.RemoveCommandOverride(verb) {
+					return fmt.Errorf("no override for %q", verb)
+				}
+			default:
+				return fmt.Errorf("expected 'safe', 'dangerous', or 'remove', got %q", action)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess(fmt.Sprintf("Command override updated: %s %s", action, strings.ToLower(strings.TrimSpace(verb))))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "audit",
 		Short: "Show the audit log path and recent entries",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1087,6 +1136,7 @@ func printConfig() error {
 	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
 
 	printActorPolicies(cfg)
+	printCommandOverrides(cfg)
 
 	auditPath, _ := config.AuditPath(cfg)
 	ui.PrintInfo("Audit log: " + auditPath)
@@ -1173,6 +1223,22 @@ func displayMode(m string) string {
 		return "(inherit)"
 	}
 	return m
+}
+
+// printCommandOverrides lists the configured command classification overrides.
+func printCommandOverrides(cfg *config.Config) {
+	ui.PrintInfo("Command overrides:")
+	o := cfg.CommandOverrides
+	if len(o.Safe) == 0 && len(o.StateAltering) == 0 && len(o.UnsafeSafe) == 0 {
+		fmt.Println("  (none)")
+		return
+	}
+	for _, v := range o.Safe {
+		fmt.Printf("  - %s: safe (read-only)\n", v)
+	}
+	for _, v := range append(append([]string{}, o.StateAltering...), o.UnsafeSafe...) {
+		fmt.Printf("  - %s: state-altering (gated)\n", v)
+	}
 }
 
 // printActorPolicies lists the configured per-actor mode overrides.
@@ -1275,6 +1341,10 @@ Config subcommands:
                              archives (0 mb disables; default n is 5)
   audit-webhook [<url>|off]  POST each audit entry as JSON to a webhook
   audit-syslog [on|off]      Also write each audit entry to local syslog
+  command-override [safe <verb> | dangerous <verb> | remove <verb>]
+                             Override the built-in safe/state-altering
+                             classification of a verb (e.g. a plugin, or treat
+                             logs as requiring confirmation)
   audit                      Show the audit log path and recent entries
   validate                   Check the config for problems (exit non-zero if any;
                              an invalid config also fails closed at runtime)

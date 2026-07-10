@@ -131,6 +131,17 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	}
 	cfg.ApplyDefaults()
 
+	// A group/world-writable config is a tamper signal: anyone who can rewrite
+	// ~/.kubectl-guard.yaml can disable protection by emptying the protected lists.
+	// In strict mode (strict_config_perms or KUBECTL_GUARD_STRICT) this fails
+	// CLOSED — refuse every command until the mode is fixed — so a tampered or
+	// exposed config can never run with silently-weakened protection. The
+	// non-strict WARNING is surfaced by the caller (main), which owns user-facing
+	// output; the decision core only enforces the strict deny.
+	if insecure, detail, permErr := config.InsecureConfigPerms(); permErr == nil && insecure && cfg.StrictPerms() {
+		return Deny, "", cfg, fmt.Errorf("strict mode is set and %s; refusing until fixed (secure the config: chmod 600 the file and 700 its directory)", detail)
+	}
+
 	// A config with an invalid known-field value silently downgrades protection:
 	// e.g. context_mode: "blck" is not "block", so the runtime falls back to
 	// confirm (bypassable with --yes) while the user believes they set block. For

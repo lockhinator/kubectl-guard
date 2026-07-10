@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0](https://github.com/lockhinator/kubectl-guard/compare/v0.4.0...v0.5.0) (2026-07-10)
+
+
+### Features
+
+* agent-relayable approval flow (needs-confirmation signal) ([f771ce7](https://github.com/lockhinator/kubectl-guard/commit/f771ce7b34e13b8524d22fc72b25453dfbaa645c))
+* agent-relayable approval flow (needs-confirmation signal) ([1461432](https://github.com/lockhinator/kubectl-guard/commit/146143208dd0596c6635ba02f778556584ad08de)), closes [#23](https://github.com/lockhinator/kubectl-guard/issues/23)
+* secure-default headless bootstrap (no silent fail-open) ([02ae7f5](https://github.com/lockhinator/kubectl-guard/commit/02ae7f525384e269508cc0eb885ceb210f8d820c))
+* secure-default headless bootstrap (no silent fail-open) ([cee3a58](https://github.com/lockhinator/kubectl-guard/commit/cee3a588be0c7cc117f9be4b17df49faed8aa43c)), closes [#74](https://github.com/lockhinator/kubectl-guard/issues/74)
+
+
+### Bug Fixes
+
+* gate kubectl --raw API paths past resource protection ([66771bf](https://github.com/lockhinator/kubectl-guard/commit/66771bf218b2d788baf003bbc4d3fd975d3dc0a7))
+* gate kubectl --raw API paths past resource protection ([210947a](https://github.com/lockhinator/kubectl-guard/commit/210947a277fd08dbc1543f8dbf4c2071fab5210d)), closes [#80](https://github.com/lockhinator/kubectl-guard/issues/80)
+* gate kubectl port-forward and proxy (and close the verb-shift bypass) ([6f01573](https://github.com/lockhinator/kubectl-guard/commit/6f015732de3a4367743c494fc093044ea827d157))
+* gate port-forward and proxy, and close the verb-shift bypass ([480970e](https://github.com/lockhinator/kubectl-guard/commit/480970e3494907c7045eee27f6537ca05a2bcb43)), closes [#71](https://github.com/lockhinator/kubectl-guard/issues/71)
+* redact secret values from the audit log, --json, and messages ([0b202b3](https://github.com/lockhinator/kubectl-guard/commit/0b202b3c807110843ca6c85b0cfa961e2d016a73)), closes [#89](https://github.com/lockhinator/kubectl-guard/issues/89)
+* redact secret values from the audit log, --json, and prompts ([8ef411a](https://github.com/lockhinator/kubectl-guard/commit/8ef411ae9a4900b875e42e242dd37c28ef8bc4f1))
+
 ## [0.4.0](https://github.com/lockhinator/kubectl-guard/compare/v0.3.0...v0.4.0) (2026-07-09)
 
 

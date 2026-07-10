@@ -19,6 +19,7 @@ func TestConfigPermWarningIntegration(t *testing.T) {
 	bin := buildGuardBin(t)
 	home := t.TempDir()
 	writeConfig(t, home, "protected_contexts:\n  - prod-*\n")
+	writeKubeconfig(t, home, "fake-context", nil)
 	path := filepath.Join(home, ".kubectl-guard.yaml")
 	kubectlDir := writeFakeKubectl(t)
 
@@ -82,6 +83,7 @@ func TestConfigParentDirTamperIntegration(t *testing.T) {
 	bin := buildGuardBin(t)
 	home := t.TempDir()
 	writeConfig(t, home, "protected_contexts:\n  - prod-*\n") // file is 0600
+	writeKubeconfig(t, home, "fake-context", nil)
 	path := filepath.Join(home, ".kubectl-guard.yaml")
 	if err := os.Chmod(path, 0o600); err != nil {
 		t.Fatal(err)

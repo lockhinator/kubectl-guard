@@ -2,10 +2,12 @@
 package guard
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -89,21 +91,31 @@ const (
 // loaded config (non-nil for Allow/Blocked/RequireConfirmation) so callers do
 // not need to re-read the file.
 func Check(args []string) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace)
+	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace, DiscoverShortNames, defaultInCluster)
 }
+
+// ShortNameDiscoverer returns discovered CRD short names for the command's
+// target cluster (or nil to fall back to built-ins). Injected so the decision
+// core can be tested without shelling out to `kubectl api-resources`.
+type ShortNameDiscoverer func(cfg *config.Config, args []string) map[string]string
+
+// noShortNames is the discoverer used by checkWith: it discovers nothing, so
+// existing tests never spawn a kubectl api-resources subprocess.
+func noShortNames(*config.Config, []string) map[string]string { return nil }
 
 // checkWith is the test seam for the current-context lookup. It uses the no-op
-// context-namespace resolver so existing tests never spawn a kubectl
-// subprocess; tier-2 namespace resolution (from a context's baked-in namespace)
-// is exercised via checkWithResolvers with an injected fake.
+// context-namespace resolver AND the no-op short-name discoverer so existing
+// tests never spawn a kubectl subprocess; tier-2 namespace resolution and CRD
+// short-name discovery are exercised via checkWithResolvers with injected fakes.
 func checkWith(args []string, current CurrentContextFunc) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, current, noContextNamespace)
+	return checkWithResolvers(args, current, noContextNamespace, noShortNames, notInCluster)
 }
 
-// checkWithResolvers is the testable core of Check: both the current-context
-// lookup and the context-namespace lookup are injected so the protection
-// decision can be exercised without kubectl.
-func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc) (Result, string, *config.Config, error) {
+// checkWithResolvers is the testable core of Check: the current-context lookup,
+// the context-namespace lookup, the CRD short-name discovery, and the in-cluster
+// detection are all injected so the protection decision can be exercised without
+// kubectl or a real pod.
+func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer, inCluster InClusterFunc) (Result, string, *config.Config, error) {
 	// Config must be readable; if we cannot tell what is protected we refuse.
 	exists, err := config.Exists()
 	if err != nil {
@@ -119,8 +131,28 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	}
 	cfg.ApplyDefaults()
 
+	// A config with an invalid known-field value silently downgrades protection:
+	// e.g. context_mode: "blck" is not "block", so the runtime falls back to
+	// confirm (bypassable with --yes) while the user believes they set block. For
+	// a security tool that is the wrong default, so an invalid config fails
+	// CLOSED: refuse every command until it is fixed, rather than run with
+	// protection weaker than configured. `kubectl-guard config validate` lists the
+	// problems, and the config-mutation subcommands still work so it can be fixed.
+	if problems := cfg.Validate(); len(problems) > 0 {
+		return Deny, "", cfg, fmt.Errorf("config is invalid: %s (run 'kubectl-guard config validate')", strings.Join(problems, "; "))
+	}
+
 	// Best-effort context for messaging; failures are handled below.
 	ctx, ctxErr := resolveContextWith(args, current)
+
+	// Enrich resource matching with discovered CRD short names (cached), so that
+	// protecting a CRD by kind also blocks its short name (e.g. "secretstore"
+	// blocks `get ss`). Best-effort and additive: on any failure it is a no-op and
+	// matching stays on the built-in short names. Only worth doing when resource
+	// protection is configured.
+	if cfg.HasProtectedResources() {
+		cfg.SetDiscoveredShortNames(discover(cfg, args))
+	}
 
 	// Protected resources are blocked globally, regardless of context or verb.
 	if MatchesProtectedResource(cfg, args) {
@@ -128,6 +160,25 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	}
 
 	p := ParseArgs(args)
+
+	// Sensitive-access policy: the sensitive verbs (exec/cp/attach/… or the
+	// configured sensitive_verbs) reach into a workload with the caller's
+	// credentials, so their risk is about what they can read/reach, not WHERE
+	// they run or whether they mutate state. Computed up front because it must
+	// override BOTH the dry-run skip below (a dry-run still reads/reaches — e.g.
+	// `create secret --dry-run=client -o yaml` echoes the secret) and the
+	// read-only early return further down.
+	sensitiveActive := cfg.SensitiveAccessMode() != config.SensitiveAccessOff &&
+		cfg.IsSensitiveVerb(commandVerb(args))
+
+	// Blast-radius policy: a wide-scope / bulk mutation (delete --all, apply
+	// --prune, a selector or --all-namespaces on a destructive verb, a force
+	// delete) is gated on EVERY context because its danger is about how much it
+	// destroys, not where it runs. Unlike sensitive-access it is about the
+	// state-mutation axis, so a genuine --dry-run (which changes nothing) is NOT
+	// gated: it is deliberately excluded from the dry-run skip below, letting that
+	// early return pass a dry-run of a wide mutation through.
+	blastActive := IsBlastRadiusActive(cfg, args)
 
 	// --server points at an arbitrary API server the guard cannot map to a
 	// context name. When context protection is configured, fail closed rather
@@ -137,6 +188,14 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts are configured (use --context instead)")
 	}
 
+	// --cluster retargets the API server via a named kubeconfig cluster, decoupled
+	// from the context NAME the guard gates on: `--context=dev --cluster=prod`
+	// gates on "dev" while the command hits prod. Refuse it under protected
+	// contexts, like --server.
+	if p.HasClusterOverride && len(cfg.ProtectedContexts) > 0 {
+		return Deny, ctx, cfg, fmt.Errorf("--cluster overrides the cluster target independently of the context name; refusing because protected contexts are configured (use --context instead)")
+	}
+
 	// A state-altering command in dry-run mode (--dry-run=client|server, not
 	// none) changes no cluster state, so skip context/namespace gating. This
 	// reduces cry-wolf prompts on safe operations. Protected-resource blocks
@@ -144,21 +203,59 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	//
 	// Verbs with no --dry-run flag (exec, port-forward, proxy, ...) are excluded:
 	// they cannot be dry-run, so a --dry-run token on such a command must never
-	// buy an ungated pass.
-	if IsStateAltering(args) && p.IsDryRun() && SupportsDryRun(args) {
+	// buy an ungated pass. A sensitive-access verb is also excluded: dry-run is
+	// about the state-mutation axis, but sensitive-access is about reading/
+	// reaching, which a dry-run does not prevent.
+	if IsStateAlteringWith(cfg, args) && p.IsDryRun() && SupportsDryRun(args) && !sensitiveActive {
 		return Allow, ctx, cfg, nil
 	}
 
 	// Context protection. If we cannot resolve the context while protected
-	// contexts are configured, fail closed (we can't confirm it's unprotected).
+	// contexts are configured, we normally fail closed. But in-cluster (running
+	// in a pod on the serviceaccount config, or CI with an in-cluster kubeconfig)
+	// there is no context NAME to evaluate, so a blanket deny makes the guard
+	// unusable there. The in_cluster policy decides what to do instead.
 	contextProtected := false
+	inClusterNamespace := "" // SA namespace to use as the namespace fallback (in-cluster namespace mode)
 	if ctx != "" && cfg.IsContextProtected(ctx) {
 		contextProtected = true
 	} else if (ctxErr != nil || ctx == "") && len(cfg.ProtectedContexts) > 0 {
-		if ctxErr != nil {
-			return Deny, "", cfg, fmt.Errorf("cannot resolve current context: %w", ctxErr)
+		saNS, isInCluster := inCluster()
+		if !isInCluster {
+			// Out-of-cluster: fail closed, unchanged.
+			if ctxErr != nil {
+				return Deny, "", cfg, fmt.Errorf("cannot resolve current context: %w", ctxErr)
+			}
+			return Deny, "", cfg, fmt.Errorf("cannot resolve current context")
 		}
-		return Deny, "", cfg, fmt.Errorf("cannot resolve current context")
+		switch cfg.InClusterMode() {
+		case config.InClusterDeny:
+			return Deny, "", cfg, fmt.Errorf("running in-cluster with no named context and in_cluster=deny; refusing (set in_cluster: namespace to gate by the serviceaccount namespace instead)")
+		case config.InClusterAllow:
+			// in_cluster: allow passes the (unevaluable) context protection
+			// through, but sensitive-access and blast-radius are orthogonal — they
+			// gate on what the verb can read/reach and on how much it destroys, not
+			// on the context — so a sensitive verb or a wide/bulk mutation must
+			// still be gated even in-cluster. Fall through to the unified gate below
+			// (contextProtected stays false); only a command that is neither gets
+			// the blanket allow here.
+			if !sensitiveActive && !blastActive {
+				return Allow, "", cfg, nil
+			}
+		default: // InClusterNamespace: context protection cannot be evaluated
+			// in-cluster, so gate by the serviceaccount namespace instead of the
+			// unresolvable context. contextProtected stays false.
+			if saNS == "" {
+				// We are in-cluster but cannot determine the serviceaccount
+				// namespace, so we cannot evaluate namespace protection either.
+				// Fail closed rather than pass through: an unknowable identity must
+				// not silently disable protection. (defaultInCluster already refuses
+				// to report in-cluster without a readable SA namespace, so this is a
+				// belt-and-suspenders guard against any other InClusterFunc.)
+				return Deny, "", cfg, fmt.Errorf("running in-cluster but the serviceaccount namespace is unreadable; refusing (set in_cluster: allow to override, or use -n to name the namespace)")
+			}
+			inClusterNamespace = saNS
+		}
 	}
 
 	// Optional policy: deny any impersonation (--as*) on a protected context.
@@ -170,24 +267,62 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// namespace resolution (which may shell out for the context's baked-in
 	// namespace, per tier 2) is deferred until we know the verb mutates state.
 	// This keeps read-only commands (get/describe/logs/...) from spawning a
-	// kubectl subprocess just because namespace protection is configured.
-	if !IsStateAltering(args) {
+	// kubectl subprocess just because namespace protection is configured. A
+	// non-state-altering command that is NOT sensitive AND NOT a wide/bulk mutation
+	// passes through here. blastActive must be checked too: sensitive-access and
+	// blast-radius are ORTHOGONAL policies (about what a verb can reach / how much
+	// it destroys) that compose most-restrictive regardless of the safe/dangerous
+	// classification. A `command_overrides.safe` downgrade makes stateAltering
+	// false, so without this a safe-overridden bulk verb (e.g. `delete` marked
+	// safe) would slip past a blast-radius BLOCK — inconsistent with the sensitive
+	// case and with "block is un-bypassable". (When no override is in play,
+	// blastActive already implies stateAltering, so this is a no-op.)
+	// Unknown-verb strict policy (#72): a verb the guard cannot classify as safe
+	// or state-altering (a plugin, a future kubectl verb, or a gap in the lists) is
+	// normally allowed — "unknown ⇒ allowed". On a PROTECTED target that is the
+	// wrong default: the guard cannot prove the command is safe, so unknown_verb:
+	// gate/deny makes it fail toward gating. unknownStrict makes such a verb skip
+	// the read-only early return so its target's protection is evaluated; on an
+	// unprotected target it still falls through to Allow below.
+	unknownStrict := cfg.UnknownVerbMode() != config.UnknownVerbAllow && IsUnknownCommand(cfg, args)
+
+	stateAltering := IsStateAlteringWith(cfg, args)
+	if !stateAltering && !sensitiveActive && !blastActive && !unknownStrict {
 		return Allow, ctx, cfg, nil
 	}
 
 	// The target namespace comes from --namespace/-n, then the namespace baked
 	// into the resolved context, then kubectl's "default". --all-namespaces/-A
 	// spans every namespace, so it is gated when any namespace is protected
-	// (like "get all" spans resources).
-	namespaceProtected := namespaceTargetProtected(cfg, p, ctx, nsFor)
+	// (like "get all" spans resources). Evaluated for state-altering verbs, and
+	// for an unknown verb under a strict policy (so its namespace is checked too).
+	namespaceProtected := false
+	if stateAltering || unknownStrict {
+		namespaceProtected = namespaceTargetProtected(cfg, p, ctx, inClusterNamespace, nsFor)
+	}
 
-	if contextProtected || namespaceProtected {
-		// Block mode: hard-refuse state-altering commands with no prompt. If
-		// either the matching context or namespace is in block mode, block wins
-		// (most restrictive). --yes cannot bypass this: it only auto-confirms
-		// RequireConfirmation, and Blocked is a separate result.
-		if (contextProtected && cfg.ContextMode == config.ContextModeBlock) ||
-			(namespaceProtected && cfg.NamespaceMode == config.NamespaceModeBlock) {
+	// An unknown verb is only gated/denied when the target is actually protected;
+	// on an unprotected target it passes (plugins keep working elsewhere).
+	unknownProtected := unknownStrict && (contextProtected || namespaceProtected)
+	if unknownProtected && cfg.UnknownVerbMode() == config.UnknownVerbDeny {
+		return Deny, ctx, cfg, fmt.Errorf(
+			"unrecognized verb %q on a protected target and unknown_verb=deny; refusing (classify it with `config command-override`, or set unknown_verb: gate)",
+			LeadingVerb(args))
+	}
+
+	if contextProtected || namespaceProtected || sensitiveActive || blastActive {
+		// Per-actor policy: a matching actor policy can make context/namespace
+		// protection STRICTER for a known actor (e.g. an agent label gets block
+		// where a human gets confirm). It never weakens the global posture.
+		ctxMode, nsMode := cfg.EffectiveModesForActor(resolveActor(cfg, currentUser()))
+
+		// Block mode: hard-refuse with no prompt. If ANY matching signal is in
+		// block mode, block wins (most restrictive). --yes cannot bypass this: it
+		// only auto-confirms RequireConfirmation, and Blocked is a separate result.
+		if (contextProtected && ctxMode == config.ContextModeBlock) ||
+			(namespaceProtected && nsMode == config.NamespaceModeBlock) ||
+			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) ||
+			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) {
 			return Blocked, ctx, cfg, nil
 		}
 		return RequireConfirmation, ctx, cfg, nil
@@ -196,15 +331,83 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	return Allow, ctx, cfg, nil
 }
 
+// commandVerb returns the lower-cased kubectl verb the guard resolves for args,
+// or "" when none is found. It is a thin wrapper over ExtractCommand for callers
+// that only need the verb.
+func commandVerb(args []string) string {
+	cmd, _ := ExtractCommand(args)
+	return cmd
+}
+
+// IsSensitiveAccess reports whether the sensitive-access policy applies to args
+// under cfg (the policy is enabled and the verb is in the sensitive set). Used by
+// user-facing messages so a sensitive-access gate is named as such rather than as
+// a protected context.
+func IsSensitiveAccess(cfg *config.Config, args []string) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.SensitiveAccessMode() != config.SensitiveAccessOff && cfg.IsSensitiveVerb(commandVerb(args))
+}
+
 // namespaceTargetProtected reports whether the command targets a protected
-// namespace. --all-namespaces/-A spans every namespace, so it is treated as
-// protected whenever any namespace pattern is configured; otherwise the
-// resolved namespace is matched against the configured patterns.
-func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs, ctx string, nsFor NamespaceForContextFunc) bool {
+// namespace, by any of three routes (any match gates):
+//
+//  1. --all-namespaces/-A spans every namespace, so it is treated as protected
+//     whenever any namespace pattern is configured;
+//  2. the command's resource kind is `namespace` and one of the namespace NAMES
+//     it addresses is protected — `kubectl delete namespace kube-system` carries
+//     no -n flag, so route 3 would resolve "default" and miss it entirely;
+//  3. the namespace the command runs IN (from -n, the context, or "default")
+//     matches a protected pattern.
+//
+// This function is only reached for state-altering verbs: checkWith returns
+// Allow for reads before calling it, so `kubectl get namespace kube-system` is
+// never gated.
+func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs, ctx, fallbackNS string, nsFor NamespaceForContextFunc) bool {
 	if p.AllNamespaces && cfg.HasProtectedNamespaces() {
 		return true
 	}
-	return cfg.IsNamespaceProtected(resolveTargetNamespace(cfg, p, ctx, nsFor))
+	if _, ok := protectedNamespaceNameTarget(cfg, p); ok {
+		return true
+	}
+	return cfg.IsNamespaceProtected(resolveTargetNamespace(cfg, p, ctx, fallbackNS, nsFor))
+}
+
+// protectedNamespaceNameTarget reports whether a state-altering command targets
+// a protected namespace as its OBJECT (rather than as the namespace it runs in),
+// returning the matched target for messaging.
+//
+// A wide-scope namespace command (`delete namespace --all`, `delete ns -l x=y`)
+// names nothing the guard can check, so with any namespace protection configured
+// it fails closed: the guard cannot prove a protected namespace is not among the
+// targets.
+func protectedNamespaceNameTarget(cfg namespaceChecker, p ParsedArgs) (string, bool) {
+	t := namespaceTargetsFrom(p)
+	if !t.Kind || !cfg.HasProtectedNamespaces() {
+		return "", false
+	}
+	if t.Wide {
+		return "all namespaces", true
+	}
+	for _, name := range t.Names {
+		if cfg.IsNamespaceProtected(name) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// ProtectedNamespaceNameTarget is the exported form of
+// protectedNamespaceNameTarget, used by user-facing messages so they name the
+// namespace OBJECT that triggered gating (e.g. "kube-system" for
+// `delete namespace kube-system`) rather than the namespace the command would
+// otherwise be considered to run in (e.g. "default").
+func ProtectedNamespaceNameTarget(cfg *config.Config, args []string) (string, bool) {
+	if cfg == nil {
+		return "", false
+	}
+	return protectedNamespaceNameTarget(cfg, ParseArgs(args))
 }
 
 // resolveTargetNamespace determines the namespace a command targets for
@@ -217,7 +420,12 @@ func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs, ctx string, ns
 // configured, because it shells out; a lookup error falls back to "default"
 // rather than failing closed, so a transient kubeconfig read cannot block every
 // namespace-gated command. Explicit -n and -A protection are unaffected.
-func resolveTargetNamespace(cfg namespaceChecker, p ParsedArgs, ctx string, nsFor NamespaceForContextFunc) string {
+//
+// fallbackNS is the namespace used when neither an explicit -n nor the context's
+// baked-in namespace resolves: "default" out-of-cluster, or the serviceaccount
+// namespace in-cluster (namespace mode), where a command with no -n runs in the
+// pod's namespace rather than "default".
+func resolveTargetNamespace(cfg namespaceChecker, p ParsedArgs, ctx, fallbackNS string, nsFor NamespaceForContextFunc) string {
 	if p.HasNamespace && p.Namespace != "" {
 		return p.Namespace
 	}
@@ -226,17 +434,25 @@ func resolveTargetNamespace(cfg namespaceChecker, p ParsedArgs, ctx string, nsFo
 			return ns
 		}
 	}
+	if fallbackNS != "" {
+		return fallbackNS
+	}
 	return "default"
 }
 
 // ResolvedTargetNamespace returns the namespace a command targets, applying the
 // same resolution the guard decision used (--namespace/-n, then the context's
-// baked-in namespace, then "default"). It is used for user-facing messages so
-// they name the namespace that actually triggered gating, including one derived
-// from the context. It may shell out for the context lookup, so callers should
-// use it only on the (interactive) gated path, not the hot read path.
+// baked-in namespace, then the serviceaccount namespace in-cluster, then
+// "default"). It is used for user-facing messages so they name the namespace that
+// actually triggered gating. It may shell out for the context lookup and reads
+// the in-cluster signal, so callers should use it only on the (interactive) gated
+// path, not the hot read path.
 func ResolvedTargetNamespace(cfg *config.Config, args []string, ctx string) string {
-	return resolveTargetNamespace(cfg, ParseArgs(args), ctx, defaultContextNamespace)
+	fallbackNS := ""
+	if saNS, inCluster := defaultInCluster(); inCluster {
+		fallbackNS = saNS
+	}
+	return resolveTargetNamespace(cfg, ParseArgs(args), ctx, fallbackNS, defaultContextNamespace)
 }
 
 // namespaceChecker is satisfied by *config.Config; kept as an interface so the
@@ -282,6 +498,17 @@ func kubectlCommand(args ...string) (*exec.Cmd, error) {
 		return nil, err
 	}
 	return exec.Command(path, args...), nil
+}
+
+// kubectlCommandContext is kubectlCommand with a context, so a slow or hung
+// kubectl invocation (a stalled apiserver call, a hanging exec-credential auth
+// plugin) can be bounded by a deadline instead of blocking the guard forever.
+func kubectlCommandContext(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	path, err := RealKubectlPath()
+	if err != nil {
+		return nil, err
+	}
+	return exec.CommandContext(ctx, path, args...), nil
 }
 
 // RealKubectlPath resolves the path to the real kubectl binary by walking PATH

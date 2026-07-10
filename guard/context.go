@@ -4,6 +4,7 @@ package guard
 import (
 	"bufio"
 	"bytes"
+	"os"
 	"strings"
 	"sync"
 )
@@ -116,6 +117,52 @@ type NamespaceForContextFunc func(kubeconfig, context string) (string, error)
 // reports no context namespace, so resolution falls back to "default" and no
 // kubectl subprocess is spawned during unit tests that don't opt in.
 func noContextNamespace(_, _ string) (string, error) { return "", nil }
+
+// InClusterFunc reports whether the guard is running in-cluster (inside a pod on
+// the serviceaccount config, or CI with an in-cluster kubeconfig) and, if so, the
+// serviceaccount namespace it runs in. It is injected so the in-cluster decision
+// can be exercised without a real pod.
+type InClusterFunc func() (namespace string, inCluster bool)
+
+// notInCluster is the InClusterFunc used by checkWith (the test seam): it reports
+// not-in-cluster, preserving the out-of-cluster fail-closed behavior for tests
+// that do not opt in.
+func notInCluster() (string, bool) { return "", false }
+
+// saNamespacePath is the standard in-pod location of the serviceaccount
+// namespace. It is a var so tests can point it at a fixture.
+var saNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// defaultInCluster detects in-cluster execution and resolves the serviceaccount
+// namespace. It reports in-cluster ONLY when BOTH signals of a real pod are
+// present: KUBERNETES_SERVICE_HOST (injected by the kubelet) AND a readable,
+// non-empty serviceaccount namespace file (projected into the pod alongside the
+// token).
+//
+// Requiring the namespace file — not just the env var — is a security boundary.
+// KUBERNETES_SERVICE_HOST is an ordinary, user-settable env var; if it alone
+// entered in-cluster mode, an out-of-cluster caller could export it to flip the
+// guard's fail-closed "unresolvable context ⇒ deny" into the relaxed in-cluster
+// policy and slip a command past. The projected SA namespace file cannot be
+// fabricated under /var/run/secrets by an ordinary caller, so gating detection on
+// it keeps the relaxation to genuine pods. A pod that disables the SA mount
+// (automountServiceAccountToken: false) is likewise treated as not-in-cluster and
+// falls through to fail-closed — the conservative default; such a pod can opt in
+// with in_cluster: allow.
+func defaultInCluster() (string, bool) {
+	if os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
+		return "", false
+	}
+	data, err := os.ReadFile(saNamespacePath)
+	if err != nil {
+		return "", false
+	}
+	ns := strings.TrimSpace(string(data))
+	if ns == "" {
+		return "", false
+	}
+	return ns, true
+}
 
 // ctxNamespaceMemo caches context-namespace lookups for the lifetime of the
 // process. A kubectl invocation resolves at most one (kubeconfig, context)

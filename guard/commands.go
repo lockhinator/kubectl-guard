@@ -1,13 +1,17 @@
 package guard
 
 import (
+	"bufio"
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/lockhinator/kubectl-guard/config"
 )
 
 // safeCommands are read-only top-level commands that don't modify cluster
@@ -139,6 +143,15 @@ var shortTakesValue = map[byte]bool{
 var knownLongFlags = map[string]bool{
 	// Command-scoped value flags.
 	"--selector": true, "--output": true, "--container": true,
+	// Unambiguously value-taking flags of the previewable destructive verbs
+	// (scale/autoscale/patch/drain/...). Listed so their SPACE form
+	// (`scale --replicas 0 deploy/web`) consumes the value instead of leaking it
+	// into the positional stream, where PreviewArgs would read "0" as a resource
+	// target. None is ever boolean, so consuming their value cannot hide a verb or
+	// un-gate a command (it only removes a false-positive resource candidate).
+	"--replicas": true, "--current-replicas": true, "--min": true,
+	"--max": true, "--cpu-percent": true, "--timeout": true,
+	"--patch-file": true,
 	// kubectl global (persistent) value-taking flags.
 	"--cluster": true, "--user": true, "--username": true, "--password": true,
 	"--cache-dir": true, "--certificate-authority": true,
@@ -230,12 +243,28 @@ type ParsedArgs struct {
 	// audit log.
 	Server    string // --server / -s
 	HasServer bool
-	AsUser    string   // --as
-	AsGroups  []string // --as-group (repeatable)
-	AsUID     string   // --as-uid
-	HasAs     bool     // any --as / --as-group / --as-uid present
-	Token     string   // --token
-	HasToken  bool
+	// HasClusterOverride is set by --cluster, which selects a named cluster from
+	// kubeconfig and thereby RETARGETS the API server the command hits — decoupled
+	// from the context NAME the guard gates on. Like --server, it is refused when
+	// protected contexts are configured (the guard cannot verify which cluster the
+	// command actually reaches).
+	HasClusterOverride bool
+	AsUser             string   // --as
+	AsGroups           []string // --as-group (repeatable)
+	AsUID              string   // --as-uid
+	HasAs              bool     // any --as / --as-group / --as-uid present
+	Token              string   // --token
+	HasToken           bool
+	// HasUser is set by --user, which selects a different kubeconfig auth identity.
+	// Captured so the read-only preview (PreviewArgs) can skip rather than run
+	// against a different identity than the real command.
+	HasUser bool
+	// HasBasicAuth is set by --username/--password (HTTP basic-auth identity
+	// override). Like --user, it changes the identity the command runs as, so the
+	// preview skips rather than resolve against the invoking identity instead.
+	// (Basic auth was removed from the Kubernetes API server in v1.19; captured for
+	// parity with the other identity overrides.)
+	HasBasicAuth bool
 
 	// DryRun captures --dry-run (client|server|none). A bare --dry-run is
 	// treated as client. State-altering commands in dry-run mode change no
@@ -249,6 +278,45 @@ type ParsedArgs struct {
 	Namespace     string
 	HasNamespace  bool
 	AllNamespaces bool
+
+	// All is kubectl's --all flag: "select ALL resources of the given type in
+	// the namespace". It is distinct from --all-namespaces/-A. On `delete TYPE`
+	// it replaces the NAME argument, so the guard cannot enumerate what the
+	// command targets. Verified against `kubectl delete --help` (v1.33): --all is
+	// boolean and has no single-letter shorthand.
+	All bool
+
+	// HasSelector reports whether a selector flag was given that stands in for an
+	// explicit NAME: -l/--selector (label) OR --field-selector. On
+	// `delete TYPE -l label` / `delete TYPE --field-selector metadata.name=x` the
+	// affected objects are chosen server-side, so they are not knowable from argv.
+	HasSelector bool
+
+	// Selector and FieldSelector capture the VALUES of -l/--selector and
+	// --field-selector, so a read-only preview (PreviewArgs) can reconstruct the
+	// same selection with `kubectl get`. HasSelector stays the single "a selector
+	// was given" signal; these carry the values for that reconstruction.
+	Selector      string
+	FieldSelector string
+
+	// Prune is kubectl's `apply --prune`: after applying the manifest, DELETE any
+	// live resource (matching the selector/allowlist) that is not present in it.
+	// It is the widest possible delete, so it is a blast-radius signal. Boolean,
+	// like --all; --prune=false does not prune. Verified against
+	// `kubectl apply --help` (v1.33).
+	Prune bool
+
+	// Force is kubectl's `--force`. On delete it means force/immediate deletion
+	// (skip graceful termination); on apply/replace it means delete-and-recreate.
+	// Boolean; --force=false is not a force operation. It is distinct from
+	// --force-conflicts (server-side apply), which splitLong keeps separate.
+	Force bool
+
+	// GracePeriod captures --grace-period's value (a duration in seconds). On
+	// delete, --grace-period=0 is an immediate/force deletion. HasGracePeriod
+	// distinguishes an unset flag from an explicit "0".
+	GracePeriod    string
+	HasGracePeriod bool
 
 	// Raw is the value of --raw: a literal API-server path, e.g.
 	// "/api/v1/namespaces/default/secrets/db-creds". kubectl requests it
@@ -428,6 +496,21 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 				return true
 			}
 			return false
+		case c == 'l':
+			// -l / --selector stands in for a NAME argument; record that the
+			// command's targets cannot be enumerated from argv, and capture its
+			// value for the read-only preview. It consumes the rest of the token
+			// (e.g. "-lapp=x", with an optional "="), or the next argument.
+			p.HasSelector = true
+			if len(shorthands) > 1 {
+				p.Selector = strings.TrimPrefix(shorthands[1:], "=")
+				return false
+			}
+			if len(rest) > 0 {
+				p.Selector = rest[0]
+				return true
+			}
+			return false
 		case shortTakesValue[c]:
 			// consumes the rest of the token, or the next argument.
 			if len(shorthands) > 1 {
@@ -512,6 +595,14 @@ func ParseArgs(args []string) ParsedArgs {
 					p.Server = args[i+1]
 					skipNext = true
 				}
+			case "--cluster":
+				// --cluster retargets the API server via a named kubeconfig
+				// cluster. Consume its value (like knownLongFlags did) and record
+				// its presence so the guard can refuse it under protected contexts.
+				p.HasClusterOverride = true
+				if !hasInline && i+1 < len(args) {
+					skipNext = true
+				}
 			case "--as":
 				p.HasAs = true
 				if hasInline {
@@ -544,6 +635,21 @@ func ParseArgs(args []string) ParsedArgs {
 					p.Token = args[i+1]
 					skipNext = true
 				}
+			case "--user":
+				// --user selects a different kubeconfig auth identity. Record it so
+				// the preview can skip; consume its value (it is in knownLongFlags,
+				// but capture the presence here).
+				p.HasUser = true
+				if !hasInline && i+1 < len(args) {
+					skipNext = true
+				}
+			case "--username", "--password":
+				// HTTP basic-auth identity override — capture presence so the preview
+				// can skip. Value is consumed (both are in knownLongFlags).
+				p.HasBasicAuth = true
+				if !hasInline && i+1 < len(args) {
+					skipNext = true
+				}
 			case "--namespace":
 				p.HasNamespace = true
 				if hasInline {
@@ -565,6 +671,76 @@ func ParseArgs(args []string) ParsedArgs {
 					}
 				} else {
 					p.AllNamespaces = true
+				}
+			case "--all":
+				// Boolean, like --all-namespaces: it must NOT consume the next
+				// argument, or a following verb would be swallowed. --all=false
+				// selects nothing extra and must not be treated as wide-scope.
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.All = b
+					} else {
+						p.All = true
+					}
+				} else {
+					p.All = true
+				}
+			case "--prune":
+				// Boolean, like --all: honor --prune=false, and never consume the
+				// next argument (it would swallow a following token).
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.Prune = b
+					} else {
+						p.Prune = true
+					}
+				} else {
+					p.Prune = true
+				}
+			case "--force":
+				// Boolean. --force=false is not a force operation.
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.Force = b
+					} else {
+						p.Force = true
+					}
+				} else {
+					p.Force = true
+				}
+			case "--grace-period":
+				// Takes a value (seconds). Consume it in the space form so it does
+				// not land in verb/resource position.
+				p.HasGracePeriod = true
+				if hasInline {
+					p.GracePeriod = val
+				} else if i+1 < len(args) {
+					p.GracePeriod = args[i+1]
+					skipNext = true
+				}
+			case "--selector", "--field-selector":
+				// Both take a value and both stand in for the NAME argument:
+				// `delete ns -l env=prod` and `delete ns --field-selector
+				// metadata.name=kube-system` name no object positionally, so the
+				// affected namespaces are chosen server-side and cannot be read off
+				// argv. --field-selector must be consumed here too, or its value
+				// lands in the positional stream (a verb-shift / mis-parse) AND the
+				// namespace-name gate is bypassed (`delete namespace
+				// --field-selector metadata.name=kube-system` targets kube-system
+				// but names it nowhere the guard can check). Verified accepted on
+				// `kubectl delete` (v1.33).
+				p.HasSelector = true
+				var selVal string
+				if hasInline {
+					selVal = val
+				} else if i+1 < len(args) {
+					selVal = args[i+1]
+					skipNext = true
+				}
+				if name == "--field-selector" {
+					p.FieldSelector = selVal
+				} else {
+					p.Selector = selVal
 				}
 			case "--raw":
 				p.HasRaw = true
@@ -740,8 +916,17 @@ func ExtractFilenames(args []string) []string {
 	return ParseArgs(args).Filenames
 }
 
-// IsSafeCommand returns true if the command is read-only.
+// IsSafeCommand returns true if the command is read-only, using the built-in
+// classification only. Callers that have a config should prefer
+// IsSafeCommandWith so a team's command_overrides are honored.
 func IsSafeCommand(args []string) bool {
+	return IsSafeCommandWith(nil, args)
+}
+
+// IsSafeCommandWith reports whether the command is read-only, consulting a
+// config's command_overrides first (a verb marked `safe` is read-only; one
+// marked `state_altering`/`unsafe_safe` is not), then the built-in classification.
+func IsSafeCommandWith(cfg *config.Config, args []string) bool {
 	if len(args) == 0 {
 		return true
 	}
@@ -749,6 +934,15 @@ func IsSafeCommand(args []string) bool {
 	cmd, subCmd := ExtractCommand(args)
 	if cmd == "" {
 		return true
+	}
+
+	if cfg != nil {
+		switch cfg.ClassifyOverride(cmd) {
+		case config.ClassSafe:
+			return true
+		case config.ClassStateAltering:
+			return false
+		}
 	}
 
 	if subs, ok := safeSubcommands[cmd]; ok {
@@ -767,8 +961,19 @@ func IsDryRun(args []string) bool {
 	return ParseArgs(args).IsDryRun()
 }
 
-// IsStateAltering returns true if the command modifies cluster state.
+// IsStateAltering returns true if the command modifies cluster state, using the
+// built-in classification only. Callers that have a config should prefer
+// IsStateAlteringWith so a team's command_overrides are honored.
 func IsStateAltering(args []string) bool {
+	return IsStateAlteringWith(nil, args)
+}
+
+// IsStateAlteringWith reports whether the command modifies cluster state,
+// consulting a config's command_overrides first (a verb marked
+// `state_altering`/`unsafe_safe` is state-altering; one marked `safe` is not),
+// then the built-in classification. It is the exact complement of
+// IsSafeCommandWith for any classified verb, so the two never disagree.
+func IsStateAlteringWith(cfg *config.Config, args []string) bool {
 	if len(args) == 0 {
 		return false
 	}
@@ -776,6 +981,15 @@ func IsStateAltering(args []string) bool {
 	cmd, subCmd := ExtractCommand(args)
 	if cmd == "" {
 		return false
+	}
+
+	if cfg != nil {
+		switch cfg.ClassifyOverride(cmd) {
+		case config.ClassStateAltering:
+			return true
+		case config.ClassSafe:
+			return false
+		}
 	}
 
 	if subs, ok := safeSubcommands[cmd]; ok {
@@ -787,6 +1001,56 @@ func IsStateAltering(args []string) bool {
 	}
 
 	return stateAlteringCommands[cmd]
+}
+
+// IsUnknownCommand reports whether the LEADING verb — the actual command the user
+// invoked (the first positional token) — is one the guard cannot classify as a
+// built-in verb and that no command_override names. It is the third state of a
+// safe / state-altering / unknown classification, used by the unknown-verb strict
+// policy: a kubectl plugin, a future/renamed verb, or a gap in the built-in lists.
+//
+// It keys off the LEADING verb, NOT ExtractCommand's resolved verb, on purpose.
+// ExtractCommand's verb-shift fallback scans forward past an unrecognized leading
+// token to the first recognized verb — fail-safe for the safe/state-altering axis
+// (it can only add gating) but a BYPASS for the unknown axis: `my-plugin get pods`
+// would otherwise resolve `get` and be classified safe, laundering a plugin's
+// arguments into "known-safe" and escaping the strict policy. Keying off the
+// leading token fails CLOSED — a genuine unconsumed-global-flag case (its value
+// sitting in leading position) is also treated as unknown and gated, which is the
+// safe direction on a protected target.
+//
+// An empty command (no verb) is NOT unknown: it prints help / is treated as safe.
+// A recognized command with an UNRECOGNIZED subcommand (e.g. `config frobnicate`)
+// is not "unknown" either — its leading verb IS recognized, and IsStateAlteringWith
+// already classifies such a subcommand conservatively as state-altering.
+func IsUnknownCommand(cfg *config.Config, args []string) bool {
+	verb := leadingVerb(args)
+	if verb == "" {
+		return false // no verb (bare flags / help)
+	}
+	if cfg != nil && cfg.ClassifyOverride(verb) != config.ClassNone {
+		return false // the user classified it → known
+	}
+	return !recognizedVerb(verb)
+}
+
+// leadingVerb returns the lower-cased FIRST positional token — the command the
+// user actually invoked — or "" when there is none. Unlike commandVerb (which
+// uses ExtractCommand's verb-shift fallback), it never scans forward into a
+// plugin's arguments, so it names the real leading verb for the unknown-verb
+// policy and its messaging.
+func leadingVerb(args []string) string {
+	p := ParseArgs(args)
+	if len(p.Positional) == 0 {
+		return ""
+	}
+	return strings.ToLower(p.Positional[0])
+}
+
+// LeadingVerb is the exported form of leadingVerb, for callers surfacing the
+// user-invoked verb (e.g. the unknown-verb deny message).
+func LeadingVerb(args []string) string {
+	return leadingVerb(args)
 }
 
 // IsDiffable reports whether a command can be previewed with `kubectl diff`:
@@ -815,6 +1079,136 @@ func DiffArgs(args []string) []string {
 	out := make([]string, len(args))
 	copy(out, args)
 	out[p.VerbIndex] = "diff"
+	return out
+}
+
+// previewableVerbs are destructive verbs that act on EXISTING objects
+// addressable by `kubectl get`, so a read-only preview can list what they would
+// affect before the confirmation prompt. Verbs that CREATE an object
+// (run/expose/create) are excluded — there is nothing live to get — as are the
+// pure-access verbs and manifest-only flows (handled by `kubectl diff`).
+// `set` is deliberately excluded: it takes a subcommand (`set image …`) in the
+// first positional, which is not a resource type, so a `get`-preview cannot be
+// reconstructed from its positionals the way it can for the others.
+var previewableVerbs = map[string]bool{
+	"delete": true, "scale": true, "label": true, "annotate": true,
+	"patch": true, "taint": true, "cordon": true,
+	"uncordon": true, "drain": true, "autoscale": true,
+}
+
+// nodeTargetVerbs address a NODE by bare name with NO type token
+// (`kubectl drain NODE`, `cordon NODE`), so the preview must supply the implicit
+// `nodes` type — `get NODE` would read NODE as a resource TYPE and wrongly report
+// nothing. They also accept `-l` to select nodes by label.
+var nodeTargetVerbs = map[string]bool{
+	"cordon": true, "uncordon": true, "drain": true,
+}
+
+// isTargetToken reports whether a positional after the verb is a resource
+// reference, as opposed to a label/annotation/taint assignment that
+// label/annotate/taint take positionally:
+//   - add with value: `team=a`, `key=val:NoSchedule`      (contains "=")
+//   - taint add, no value: `key:NoSchedule`                (contains ":")
+//   - remove: `team-`, `key-`, `key:NoSchedule-`           (ends with "-")
+//
+// A resource NAME or type/name token can contain none of these: RFC 1123 names
+// are alphanumeric plus "-"/"." and must start and end alphanumeric (so no "="/
+// ":" and no trailing "-"), and a type/name uses "/" as its only separator. So a
+// token with "=", ":", or a trailing "-" is an assignment, not a target, and
+// target collection stops there.
+func isTargetToken(tok string) bool {
+	return !strings.Contains(tok, "=") && !strings.Contains(tok, ":") && !strings.HasSuffix(tok, "-")
+}
+
+// PreviewArgs builds a read-only `kubectl get <same targets/selector> -o name`
+// command that lists the objects a targeted destructive command would affect,
+// for a pre-confirmation preview. It preserves the target resource tokens, the
+// label/field selector, and the --namespace/--all-namespaces/--context/
+// --kubeconfig targeting flags, so the preview resolves the SAME objects the real
+// command would.
+//
+// It returns nil when no meaningful preview can be built: a non-previewable verb,
+// a manifest/-f/-k or --raw command (which names no object to get — those are
+// covered by `kubectl diff`), or a command with neither a target nor a selector.
+//
+// The preview is best-effort: an unusual space-form of a command-scoped value
+// flag not in knownLongFlags could still leak its value as a bogus target, at
+// worst yielding an inaccurate object list (never a mutation, never a gating
+// change) — the confirmation prompt still shows regardless.
+//
+// It ALSO returns nil when the command carries an API-server or identity override
+// the preview cannot faithfully reproduce — --server / --cluster (a different
+// cluster), or --as* / --token / --user / --username/--password (a different
+// identity). Forwarding only
+// --namespace/--context while dropping those would run the preview against the
+// WRONG cluster or as the WRONG identity, showing an object list that does not
+// match what the real command hits — worse than no preview (a `--server
+// https://prod` whose preview hits the operator's dev cluster could read as
+// "nothing there" and lull a reviewer into approving). Better to skip and prompt.
+func PreviewArgs(args []string) []string {
+	verb, _ := ExtractCommand(args)
+	if !previewableVerbs[verb] {
+		return nil
+	}
+	p := ParseArgs(args)
+	// Manifest/raw/kustomize-driven commands name no positional object to get.
+	if p.HasRaw || len(p.Filenames) > 0 || p.Kustomize != "" {
+		return nil
+	}
+	// An API-server or identity override cannot be faithfully reproduced in the
+	// read-only preview; skip rather than show a mismatched list (see doc above).
+	if p.HasServer || p.HasClusterOverride || p.HasAs || p.HasToken || p.HasUser || p.HasBasicAuth {
+		return nil
+	}
+	v := verbPositionalIndex(p.Positional)
+	if v < 0 {
+		return nil
+	}
+	// Resource tokens after the verb (TYPE, NAME..., or type/name), before the
+	// "--" separator so an exec-style payload is never read as a target. Stop at
+	// the first non-target token (isTargetToken): for label/annotate/taint the
+	// positionals after the resource are KEY=VALUE / KEY- assignments, not names.
+	var targets []string
+	if v+1 < p.PositionalsBeforeSep {
+		for _, tok := range p.Positional[v+1 : p.PositionalsBeforeSep] {
+			if !isTargetToken(tok) {
+				break
+			}
+			targets = append(targets, tok)
+		}
+	}
+	// Need at least a target OR a selector OR --all to list something.
+	if len(targets) == 0 && !p.HasSelector && !p.All {
+		return nil
+	}
+
+	out := []string{"get"}
+	// Node-name verbs (drain/cordon/uncordon) address a bare NODE with no type
+	// token; supply the implicit `nodes` type so `get` reads the positionals as
+	// node NAMES, not as a resource type.
+	if nodeTargetVerbs[verb] {
+		out = append(out, "nodes")
+	}
+	out = append(out, targets...)
+	if p.Selector != "" {
+		out = append(out, "--selector", p.Selector)
+	}
+	if p.FieldSelector != "" {
+		out = append(out, "--field-selector", p.FieldSelector)
+	}
+	if p.HasNamespace && p.Namespace != "" {
+		out = append(out, "--namespace", p.Namespace)
+	}
+	if p.AllNamespaces {
+		out = append(out, "--all-namespaces")
+	}
+	if p.Context != "" {
+		out = append(out, "--context", p.Context)
+	}
+	if p.Kubeconfig != "" {
+		out = append(out, "--kubeconfig", p.Kubeconfig)
+	}
+	out = append(out, "-o", "name")
 	return out
 }
 
@@ -1159,6 +1553,154 @@ func RedactArgs(args []string) []string {
 	return out
 }
 
+// namespaceKind is the canonical form config.NormalizeResource produces for
+// "namespace", "namespaces", "ns", and "ns.v1".
+const namespaceKind = "namespace"
+
+// dashDashPayloadVerbs are the verbs for which a "--" separator introduces a
+// FOREIGN command, not more kubectl arguments. `kubectl exec pod -- kubectl
+// delete ns/x` runs kubectl inside the pod; the tokens after "--" are that
+// container command's argv and must never be read as kubectl targets.
+//
+// Every OTHER verb — delete, edit, patch, label, ... — uses "--" only to end
+// flag parsing, so `kubectl delete -- namespace kube-system` still deletes the
+// namespace. Treating "--" as a payload boundary for those verbs let a protected
+// namespace be deleted ungated (a real bypass). Verified against kubectl v1.33:
+// exec/run/debug document `-- COMMAND`; delete/edit pass post-"--" tokens to the
+// resource builder as TYPE/NAME.
+var dashDashPayloadVerbs = map[string]bool{
+	"exec": true, "run": true, "debug": true,
+	"attach": true, "cp": true, "port-forward": true, "proxy": true,
+}
+
+// NamespaceTargets describes how a command addresses the `namespace` KIND, as
+// opposed to the namespace a command runs *in* (which comes from --namespace/-n
+// or the context). `kubectl delete namespace kube-system` carries no -n flag, so
+// namespace protection would otherwise resolve the target namespace to "default"
+// and never notice that the object being destroyed IS a protected namespace.
+type NamespaceTargets struct {
+	// Kind is true when the command's resource type is namespace/ns, in any of
+	// the forms kubectl accepts.
+	Kind bool
+	// Names are the namespace names addressed positionally, from either
+	// `namespace NAME...` or `ns/NAME` type/name tokens.
+	Names []string
+	// Wide is true when the command targets the namespace kind with --all or a
+	// label selector instead of names. kubectl's own usage is
+	// `delete TYPE [(NAME | -l label | --all)]`, so in that case the affected
+	// namespaces are NOT knowable from argv and the guard must fail closed.
+	Wide bool
+}
+
+// namespaceTargetsFrom extracts the namespace-kind targets from an already
+// parsed command.
+//
+// kubectl accepts several shapes, all of which must be recognized or the gate is
+// trivially bypassed. Verified against `kubectl delete --help` (v1.33), whose
+// usage line is `kubectl delete TYPE [(NAME | -l label | --all)]` and whose own
+// example is `kubectl delete pod,service baz foo`:
+//
+//	delete namespace kube-system        bare kind, one name
+//	delete ns kube-system               short name
+//	delete namespaces a b c             plural kind, several names
+//	delete ns/kube-system               type/name token
+//	delete pod/x ns/kube-system         type/name mixed with other kinds
+//	delete ns,pod foo                   COMMA TYPE LIST: names apply to every type
+//	delete namespace --all              wide: names unknowable
+//	delete ns -l env=prod               wide: names unknowable
+//
+// Only tokens before the "--" separator are resource tokens; an "ns/x" inside an
+// exec payload is a foreign command's argument, not a kubectl target.
+func namespaceTargetsFrom(p ParsedArgs) NamespaceTargets {
+	var out NamespaceTargets
+
+	v := verbPositionalIndex(p.Positional)
+	if v < 0 {
+		return out
+	}
+	// For a resource verb, tokens after "--" are still TYPE/NAME arguments, so
+	// scan through the end of the positional list. Only for the exec-family verbs
+	// is "--" a foreign-command boundary; there, clip at the separator so an
+	// `exec pod -- kubectl delete ns/x` payload is not read as a target.
+	end := len(p.Positional)
+	if dashDashPayloadVerbs[strings.ToLower(p.Positional[v])] {
+		end = p.PositionalsBeforeSep
+	}
+	if v+1 >= end {
+		return out
+	}
+	toks := p.Positional[v+1 : end]
+
+	// The first positional after the verb is the TYPE (or a comma-separated TYPE
+	// list). A bare namespace kind there means every later positional is a NAME
+	// of a namespace.
+	bareKindIsNamespace := false
+	for _, part := range strings.Split(toks[0], ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.Contains(part, "/") {
+			continue
+		}
+		if config.NormalizeResource(part) == namespaceKind {
+			bareKindIsNamespace = true
+		}
+	}
+
+	// Every token is comma-split. kubectl only comma-splits the TYPE argument, not
+	// a NAME, so this over-splits a name like "foo,kube-system" into two names.
+	// That is deliberately kept: it only ever adds candidate names (fail-CLOSED,
+	// it can gate more but never less), and a real namespace name cannot contain a
+	// comma anyway (RFC 1123 label). Splitting names also catches a comma list of
+	// type/name tokens (`ns/a,ns/b`) without needing to know kubectl's exact rule.
+	for i, tok := range toks {
+		for _, part := range strings.Split(tok, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// A "type/name" token names its own kind, wherever it appears — so
+			// `delete pod/x ns/kube-system` is caught even though the leading
+			// TYPE is not a namespace.
+			if slash := strings.IndexByte(part, '/'); slash >= 0 {
+				if config.NormalizeResource(part[:slash]) == namespaceKind && slash+1 < len(part) {
+					out.Kind = true
+					out.Names = append(out.Names, part[slash+1:])
+				}
+				continue
+			}
+			if i == 0 {
+				continue // the TYPE token itself, not a name
+			}
+			if bareKindIsNamespace {
+				out.Names = append(out.Names, part)
+			}
+		}
+	}
+
+	if bareKindIsNamespace {
+		out.Kind = true
+	}
+	if out.Kind && len(out.Names) == 0 && (p.All || p.HasSelector) {
+		// `delete namespace --all` / `delete ns -l env=prod`: the command targets
+		// namespaces but names none. We cannot prove a protected namespace is not
+		// among them.
+		out.Wide = true
+	}
+	return out
+}
+
+// NamespaceNameTargets returns the namespace names a command addresses by name,
+// or nil when it does not target the namespace kind.
+func NamespaceNameTargets(args []string) []string {
+	return namespaceTargetsFrom(ParseArgs(args)).Names
+}
+
+// NamespaceKindIsWide reports whether the command targets the namespace kind
+// with --all or a label selector, so the affected namespaces cannot be read off
+// the command line.
+func NamespaceKindIsWide(args []string) bool {
+	return namespaceTargetsFrom(ParseArgs(args)).Wide
+}
+
 // MatchesProtectedResource reports whether args target a protected resource,
 // either via an explicit resource token, an inspectable -f file/dir whose kind
 // is protected, an un-inspectable source (-f -, URL, -k), or a --raw API path —
@@ -1258,22 +1800,92 @@ func pathContainsProtectedKind(path string, cfg ProtectedResourceChecker) bool {
 	return fileContainsProtectedKind(path, cfg)
 }
 
+// maxManifestDocBytes caps a single YAML document during the streaming scan.
+// A Kubernetes object is bounded by etcd's ~1.5MB request limit, so 64MB is ~40x
+// headroom and no real manifest reaches it. If one document somehow exceeds it,
+// the scan cannot prove the document is free of a protected kind, so it fails
+// CLOSED (treats the file as protected) rather than reading unboundedly or
+// silently skipping the rest — matching the conservative stance elsewhere in
+// MatchesProtectedResource for un-inspectable sources.
+const maxManifestDocBytes = 64 * 1024 * 1024
+
+// splitYAMLDocs is a bufio.SplitFunc that yields one YAML document per token,
+// splitting on the literal "\n---" separator. This is byte-for-byte the same
+// document boundary the previous implementation used
+// (bytes.Split(data, []byte("\n---"))), so the streaming scan detects exactly the
+// same documents — including the robustness that split had for leading "---",
+// CRLF, consecutive separators, and a malformed document followed by a real one.
+// It is validated against that behavior by TestStreamingScanMatchesBytesSplit.
+func splitYAMLDocs(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if i := bytes.Index(data, []byte("\n---")); i >= 0 {
+		return i + len("\n---"), data[:i], nil
+	}
+	if atEOF {
+		if len(data) == 0 {
+			return 0, nil, nil
+		}
+		return len(data), data, nil
+	}
+	// Separator not yet in view: ask bufio.Scanner for more data.
+	return 0, nil, nil
+}
+
+// newDocScanner builds the streaming YAML-document scanner used by
+// fileContainsProtectedKind. The buffer starts small and grows only as a single
+// document requires, capped at maxManifestDocBytes so peak memory is the largest
+// single document rather than the whole file.
+func newDocScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxManifestDocBytes)
+	scanner.Split(splitYAMLDocs)
+	return scanner
+}
+
 // fileContainsProtectedKind reports whether a single regular file is a
 // YAML/JSON manifest (possibly multi-document) whose kind is protected.
+//
+// The file is scanned by STREAMING one document at a time rather than reading it
+// all into memory: a helm-generated manifest can be tens of MB across thousands
+// of resources, and the previous os.ReadFile + unmarshal-all approach held the
+// whole thing (and, via yaml.v3, a multiple of it) resident at once. Streaming
+// bounds memory to the largest single document, and — because it returns on the
+// first protected kind — a manifest whose protected resource is early (the common
+// case) is decided after reading only a few KB, never touching the rest.
 func fileContainsProtectedKind(path string, cfg ProtectedResourceChecker) bool {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
+		// Match the previous behavior: an unreadable file is not treated as a
+		// match here (MatchesProtectedResource handles un-inspectable SOURCES —
+		// stdin/URL/kustomize — separately and conservatively).
 		return false
 	}
-	for _, doc := range bytes.Split(data, []byte("\n---")) {
+	defer func() { _ = f.Close() }()
+	return readerContainsProtectedKind(f, cfg)
+}
+
+// readerContainsProtectedKind streams the YAML documents from r and reports
+// whether any document's kind is protected. It returns as soon as the first
+// protected kind is seen — so for the common case (a protected resource in an
+// early document) it reads only that far and never touches the rest of r. It is
+// separate from fileContainsProtectedKind so the short-circuit can be exercised
+// through a byte-counting reader in tests.
+func readerContainsProtectedKind(r io.Reader, cfg ProtectedResourceChecker) bool {
+	scanner := newDocScanner(r)
+	for scanner.Scan() {
 		var meta struct {
 			Kind string `yaml:"kind"`
 		}
-		if yaml.Unmarshal(doc, &meta) == nil && meta.Kind != "" {
+		if yaml.Unmarshal(scanner.Bytes(), &meta) == nil && meta.Kind != "" {
 			if cfg.IsResourceProtected(meta.Kind) {
 				return true
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		// The only expected error is bufio.ErrTooLong on a single document larger
+		// than the cap. We could not scan it, so we cannot prove it is safe: fail
+		// closed. This is unreachable for any real Kubernetes manifest.
+		return true
 	}
 	return false
 }

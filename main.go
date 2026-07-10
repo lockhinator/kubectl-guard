@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lockhinator/kubectl-guard/config"
 	"github.com/lockhinator/kubectl-guard/guard"
@@ -21,23 +23,32 @@ var version = "dev"
 // "config <subcommand>" (e.g. "config use-context", "config view") is a kubectl
 // command and must be forwarded through the guard rather than intercepted.
 var guardConfigSubcommands = map[string]bool{
-	"setup":            true,
-	"init":             true,
-	"list":             true,
-	"add":              true,
-	"remove":           true,
-	"add-context":      true,
-	"remove-context":   true,
-	"add-resource":     true,
-	"remove-resource":  true,
-	"add-namespace":    true,
-	"remove-namespace": true,
-	"confirm-mode":     true,
-	"context-mode":     true,
-	"namespace-mode":   true,
-	"audit-mode":       true,
-	"audit":            true,
-	"path":             true,
+	"setup":             true,
+	"init":              true,
+	"list":              true,
+	"add":               true,
+	"remove":            true,
+	"add-context":       true,
+	"remove-context":    true,
+	"add-resource":      true,
+	"remove-resource":   true,
+	"add-namespace":     true,
+	"remove-namespace":  true,
+	"confirm-mode":      true,
+	"context-mode":      true,
+	"namespace-mode":    true,
+	"blast-radius":      true,
+	"actor-policy":      true,
+	"audit-mode":        true,
+	"audit-rotation":    true,
+	"audit-webhook":     true,
+	"audit-syslog":      true,
+	"command-override":  true,
+	"unknown-verb":      true,
+	"confirm-weakening": true,
+	"audit":             true,
+	"path":              true,
+	"validate":          true,
 }
 
 func main() {
@@ -70,6 +81,8 @@ func run() error {
 			return runGuard(os.Args[1:])
 		case "doctor":
 			return runDoctor()
+		case "explain":
+			return runExplain(os.Args[2:])
 		case "--version", "-V":
 			fmt.Printf("kubectl-guard %s\n", version)
 			return nil
@@ -114,6 +127,56 @@ func runDoctor() error {
 	}
 
 	return nil
+}
+
+// runExplain answers "would this command be gated, and why?" by running the
+// guard's real decision logic (guard.Check) without exec'ing kubectl, prompting,
+// or auditing — a policy preflight for agents and humans. Output goes to stdout;
+// --json emits the runtime JSONResult shape so agents parse one schema.
+//
+//	kubectl-guard explain [--json] -- <kubectl args...>
+func runExplain(args []string) error {
+	forwarded, jsonMode := guard.StripGuardFlags(args)
+	// Strip a single leading "--" separating explain's flags from the command.
+	if len(forwarded) > 0 && forwarded[0] == "--" {
+		forwarded = forwarded[1:]
+	}
+	if len(forwarded) == 0 {
+		return fmt.Errorf("usage: kubectl-guard explain [--json] -- <kubectl args...>")
+	}
+
+	res := guard.Explain(forwarded)
+	cmdStr := strings.Join(guard.RedactArgs(forwarded), " ")
+
+	if jsonMode {
+		b, err := json.Marshal(res.JSONResult(cmdStr))
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+
+	fmt.Printf("decision:  %s\n", res.Decision)
+	fmt.Printf("reason:    %s\n", res.Reason)
+	fmt.Printf("verb:      %s (%s)\n", nonEmpty(res.Verb, "(none)"), res.Class)
+	if res.Context != "" {
+		fmt.Printf("context:   %s\n", res.Context)
+	}
+	if res.Namespace != "" {
+		fmt.Printf("namespace: %s\n", res.Namespace)
+	}
+	if res.Resource != "" {
+		fmt.Printf("resource:  %s\n", res.Resource)
+	}
+	return nil
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 func orUnknown(s string) string {
@@ -332,7 +395,9 @@ func runGuard(args []string) error {
 		for i, c := range contexts {
 			contextNames[i] = c.Name
 		}
-		config.RunSetup(contextNames)
+		// First-time setup: no prior config exists (Check returned SetupRequired),
+		// so there is nothing to weaken or audit — save directly.
+		config.RunSetup(contextNames, config.Save)
 		return nil
 
 	case guard.Blocked:
@@ -341,9 +406,21 @@ func runGuard(args []string) error {
 		// message and audit reason are accurate.
 		blockReason := "protected-resource"
 		if !guard.MatchesProtectedResource(cfg, forwarded) {
-			if cfg != nil && cfg.IsContextProtected(ctx) && cfg.ContextMode == config.ContextModeBlock {
+			// Use the actor-effective modes, so an actor-policy upgrade (confirm →
+			// block for a known agent) is labeled as a context/namespace block, the
+			// same decision the guard made.
+			ctxMode := config.ContextModeConfirm
+			if cfg != nil {
+				ctxMode, _ = cfg.EffectiveModesForActor(guard.CurrentActor(cfg))
+			}
+			switch {
+			case cfg != nil && cfg.IsContextProtected(ctx) && ctxMode == config.ContextModeBlock:
 				blockReason = "protected-context-block-mode"
-			} else {
+			case guard.IsSensitiveAccess(cfg, forwarded) && cfg != nil && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock:
+				blockReason = "sensitive-access-block"
+			case guard.IsBlastRadiusActive(cfg, forwarded) && cfg != nil && cfg.BlastRadiusMode() == config.BlastRadiusBlock:
+				blockReason = "blast-radius-block"
+			default:
 				blockReason = "protected-namespace-block-mode"
 			}
 		}
@@ -368,9 +445,24 @@ func runGuard(args []string) error {
 				}
 			case "protected-context-block-mode":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
+			case "sensitive-access-block":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s is a sensitive-access verb (sensitive_access: block; refused on every context)", cmdDesc))
+			case "blast-radius-block":
+				scope := "a wide-scope mutation"
+				if _, why := guard.BlastRadius(forwarded); why != "" {
+					scope = why
+				}
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s — %s (blast_radius: block; refused on every context)", cmdDesc, scope))
 			default: // protected-namespace-block-mode
-				ns := "all namespaces"
-				if !parsed.AllNamespaces {
+				// Prefer the namespace OBJECT the command targets by name
+				// (`delete namespace kube-system`) over the namespace it would
+				// be considered to run in, which is "default" and misleading.
+				ns, ok := guard.ProtectedNamespaceNameTarget(cfg, forwarded)
+				switch {
+				case ok:
+				case parsed.AllNamespaces:
+					ns = "all namespaces"
+				default:
 					ns = guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
 				}
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected namespace %q (block mode: no confirmation offered)", cmdDesc, ns))
@@ -401,13 +493,28 @@ func runGuard(args []string) error {
 		// message names whichever actually applies.
 		reason := "protected context"
 		target := ctx
-		switch {
+		wide, blastReason := guard.BlastRadius(forwarded)
+		switch nameTarget, byName := guard.ProtectedNamespaceNameTarget(cfg, forwarded); {
+		case guard.IsSensitiveAccess(cfg, forwarded) && !cfg.IsContextProtected(ctx) && !byName:
+			// Gated purely because it is a sensitive-access verb on an otherwise
+			// unprotected target — name that, not a "protected context".
+			reason, target = "sensitive access", "any context"
+		case byName:
+			// The command's OBJECT is a protected namespace (e.g.
+			// `delete namespace kube-system`). Name that, rather than the
+			// namespace the command would otherwise be considered to run in,
+			// which is "default" and would read as nonsense.
+			reason, target = "protected namespace", nameTarget
 		case parsed.AllNamespaces && cfg != nil && cfg.HasProtectedNamespaces():
 			reason, target = "protected namespace", "all namespaces"
 		case parsed.HasNamespace && parsed.Namespace != "" && cfg != nil && cfg.IsNamespaceProtected(parsed.Namespace):
 			reason, target = "protected namespace", parsed.Namespace
 		case cfg != nil && cfg.IsContextProtected(ctx):
 			reason, target = "protected context", ctx
+		case wide && cfg != nil && cfg.BlastRadiusMode() != config.BlastRadiusOff:
+			// Gated as a wide-scope / bulk mutation with no protected context or
+			// namespace in play — name the scope so the human sees WHY.
+			reason, target = "blast radius", blastReason
 		case cfg != nil && cfg.HasProtectedNamespaces():
 			// Namespace-driven gating from the context's baked-in namespace.
 			reason, target = "protected namespace", guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
@@ -444,10 +551,14 @@ func runGuard(args []string) error {
 			os.Exit(guard.ExitNeedsConfirm)
 		}
 
-		// Optional: preview the change with `kubectl diff` before prompting.
-		// Only for diffable commands (apply/create/replace -f). A failed diff
-		// (e.g. RBAC denies server-side dry-run) warns and prompts anyway.
-		if cfg != nil && cfg.DiffBeforeConfirm && guard.IsDiffable(forwarded) {
+		// Optional: preview what the command will affect before prompting.
+		// A diffable apply (apply/create/replace -f) is previewed with
+		// `kubectl diff`; a non-diffable destructive command (delete/scale/... with
+		// a target or selector) is previewed with a read-only `kubectl get … -o
+		// name`. diff_before_confirm covers only the diff; preview_before_confirm
+		// covers both. A failed preview warns and prompts anyway.
+		switch {
+		case cfg != nil && (cfg.DiffBeforeConfirm || cfg.PreviewBeforeConfirm) && guard.IsDiffable(forwarded):
 			if diffArgs := guard.DiffArgs(forwarded); diffArgs != nil {
 				out, derr := guard.RunKubectl(diffArgs...)
 				if derr != nil {
@@ -465,23 +576,39 @@ func runGuard(args []string) error {
 					fmt.Fprintln(os.Stderr, "--- end diff ---")
 				}
 			}
+		case cfg != nil && cfg.PreviewBeforeConfirm:
+			if previewArgs := guard.PreviewArgs(forwarded); previewArgs != nil {
+				printAffectedPreview(previewArgs)
+			}
 		}
 
-		confirmed := false
+		var timeout time.Duration
+		if cfg != nil && cfg.ConfirmTimeoutSeconds > 0 {
+			timeout = time.Duration(cfg.ConfirmTimeoutSeconds) * time.Second
+		}
+
+		var outcome ui.ConfirmOutcome
 		if cfg != nil && cfg.ConfirmMode == config.ConfirmModeTypeName {
-			confirmed = ui.ConfirmWithName(message, target)
+			outcome = ui.ConfirmWithName(message, target, timeout)
 		} else {
-			confirmed = ui.Confirm(message)
+			outcome = ui.Confirm(message, timeout)
 		}
 
-		if confirmed {
+		switch outcome {
+		case ui.ConfirmApproved:
 			audit(guard.OutcomeConfirmed, "")
 			return guard.ExecKubectl(forwarded)
+		case ui.ConfirmTimedOut:
+			// Fail-safe: an unanswered prompt is a decline, recorded distinctly so
+			// the audit trail shows the command was abandoned, not refused.
+			audit(guard.OutcomeAborted, "timeout")
+			fmt.Fprintln(os.Stderr, "Timed out — aborted (not confirmed).")
+			os.Exit(guard.ExitNeedsConfirm)
+		default: // ui.ConfirmDeclined
+			audit(guard.OutcomeAborted, "")
+			fmt.Fprintln(os.Stderr, "Aborted.")
+			os.Exit(guard.ExitNeedsConfirm)
 		}
-
-		audit(guard.OutcomeAborted, "")
-		fmt.Fprintln(os.Stderr, "Aborted.")
-		os.Exit(guard.ExitNeedsConfirm)
 
 	case guard.Allow:
 		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so
@@ -515,7 +642,10 @@ func runConfigCommand() error {
 			for i, c := range contexts {
 				contextNames[i] = c.Name
 			}
-			config.RunSetup(contextNames)
+			// Route the wizard's write through saveConfig, so re-running setup on an
+			// existing install (which rebuilds a contexts-only config, dropping other
+			// protection) is audited and gated as the weakening it is.
+			config.RunSetup(contextNames, saveConfig)
 			return nil
 		},
 	})
@@ -528,7 +658,7 @@ func runConfigCommand() error {
 			resources, _ := cmd.Flags().GetString("protected-resources")
 			confirm, _ := cmd.Flags().GetString("confirm-mode")
 			cfg := config.InitFromFlags(contexts, resources, confirm)
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			path, err := config.Path()
@@ -600,7 +730,7 @@ func runConfigCommand() error {
 			if !cfg.SetConfirmMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.ConfirmModeSimple, config.ConfirmModeTypeName, config.ConfirmModeAgentRelay)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Confirm mode set: " + cfg.ConfirmMode)
@@ -624,7 +754,7 @@ func runConfigCommand() error {
 			if !cfg.SetAuditMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.AuditModeAll, config.AuditModeGated, config.AuditModeOff)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Audit mode set: " + cfg.AuditMode)
@@ -648,7 +778,7 @@ func runConfigCommand() error {
 			if !cfg.SetContextMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.ContextModeConfirm, config.ContextModeBlock)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Context mode set: " + cfg.ContextMode)
@@ -672,10 +802,295 @@ func runConfigCommand() error {
 			if !cfg.SetNamespaceMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.NamespaceModeConfirm, config.NamespaceModeBlock)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Namespace mode set: " + cfg.NamespaceMode)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "blast-radius [off|gate|block]",
+		Short: "Show or set gating of wide-scope / bulk mutations on every context",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
+				return nil
+			}
+			if !cfg.SetBlastRadiusMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.BlastRadiusOff, config.BlastRadiusGate, config.BlastRadiusBlock)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Blast radius set: " + cfg.BlastRadius)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "actor-policy [<actor> <context-mode> [namespace-mode] | remove <actor>]",
+		Short: "Show or set per-actor context/namespace mode overrides",
+		Long: "Per-actor overrides of the global context/namespace mode, so a known\n" +
+			"actor label (KUBECTL_GUARD_ACTOR, matched by glob) can be held to a\n" +
+			"stricter posture than a human. An override can only tighten a mode\n" +
+			"(confirm -> block), never weaken it.\n\n" +
+			"  actor-policy                          list the policies\n" +
+			"  actor-policy <actor> <ctx-mode> [ns]  set/replace a policy\n" +
+			"  actor-policy remove <actor>           delete a policy\n\n" +
+			"Modes are confirm|block. Use \"-\" for a mode to inherit the global one.",
+		Args: cobra.MaximumNArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				printActorPolicies(cfg)
+				return nil
+			}
+			if args[0] == "remove" {
+				if len(args) != 2 {
+					return fmt.Errorf("usage: config actor-policy remove <actor>")
+				}
+				if !cfg.RemoveActorPolicy(args[1]) {
+					return fmt.Errorf("no actor policy for %q", args[1])
+				}
+				if err := saveConfig(cfg); err != nil {
+					return err
+				}
+				ui.PrintSuccess("Removed actor policy: " + args[1])
+				return nil
+			}
+			if len(args) < 2 {
+				return fmt.Errorf("usage: config actor-policy <actor> <context-mode> [namespace-mode] (mode is confirm|block, or - to inherit)")
+			}
+			ctxMode := normalizeInheritMode(args[1])
+			nsMode := ""
+			if len(args) == 3 {
+				nsMode = normalizeInheritMode(args[2])
+			}
+			if !cfg.SetActorPolicy(args[0], ctxMode, nsMode) {
+				return fmt.Errorf("invalid actor policy (actor must be non-empty; modes must be %q, %q, or - to inherit)", config.ContextModeConfirm, config.ContextModeBlock)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess(fmt.Sprintf("Actor policy set: %s (context=%s namespace=%s)", args[0], displayMode(ctxMode), displayMode(nsMode)))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "audit-rotation [<max-size-mb> [max-files]]",
+		Short: "Show or set audit-log size-based rotation",
+		Args:  cobra.MaximumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				if cfg.AuditMaxSizeMB <= 0 {
+					ui.PrintInfo("Audit rotation: off (log grows unbounded)")
+				} else {
+					ui.PrintInfo(fmt.Sprintf("Audit rotation: at %d MB, keeping %d archive(s)", cfg.AuditMaxSizeMB, cfg.AuditMaxFilesOrDefault()))
+				}
+				return nil
+			}
+			size, err := strconv.Atoi(args[0])
+			if err != nil || size < 0 {
+				return fmt.Errorf("max-size-mb must be a non-negative integer (0 disables rotation)")
+			}
+			cfg.AuditMaxSizeMB = size
+			if len(args) == 2 {
+				files, err := strconv.Atoi(args[1])
+				if err != nil || files < 0 {
+					return fmt.Errorf("max-files must be a non-negative integer")
+				}
+				cfg.AuditMaxFiles = files
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			if cfg.AuditMaxSizeMB == 0 {
+				ui.PrintSuccess("Audit rotation disabled")
+			} else {
+				ui.PrintSuccess(fmt.Sprintf("Audit rotation set: %d MB, %d archive(s)", cfg.AuditMaxSizeMB, cfg.AuditMaxFilesOrDefault()))
+			}
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "audit-webhook [<url>|off]",
+		Short: "Show or set a webhook that receives each audit entry as JSON",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				if cfg.AuditWebhookURL == "" {
+					ui.PrintInfo("Audit webhook: (none)")
+				} else {
+					ui.PrintInfo("Audit webhook: " + cfg.AuditWebhookURL)
+				}
+				return nil
+			}
+			if args[0] == "off" {
+				cfg.AuditWebhookURL = ""
+			} else {
+				if !config.ValidWebhookURL(args[0]) {
+					return fmt.Errorf("%q is not a valid http(s) URL", args[0])
+				}
+				cfg.AuditWebhookURL = args[0]
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			if cfg.AuditWebhookURL == "" {
+				ui.PrintSuccess("Audit webhook cleared")
+			} else {
+				ui.PrintSuccess("Audit webhook set: " + cfg.AuditWebhookURL)
+			}
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "audit-syslog [on|off]",
+		Short: "Show or toggle shipping audit entries to local syslog",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Audit syslog: " + onOff(cfg.AuditSyslog))
+				return nil
+			}
+			switch args[0] {
+			case "on":
+				cfg.AuditSyslog = true
+			case "off":
+				cfg.AuditSyslog = false
+			default:
+				return fmt.Errorf("expected 'on' or 'off'")
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Audit syslog: " + onOff(cfg.AuditSyslog))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "confirm-weakening [on|off]",
+		Short: "Show or toggle requiring confirmation for protection-weakening config changes",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
+				return nil
+			}
+			switch args[0] {
+			case "on":
+				cfg.RequireConfirmWeakening = true
+			case "off":
+				cfg.RequireConfirmWeakening = false
+			default:
+				return fmt.Errorf("expected 'on' or 'off'")
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "unknown-verb [allow|gate|deny]",
+		Short: "Show or set how unrecognized verbs are treated on protected targets",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Unknown verb: " + cfg.UnknownVerbMode())
+				return nil
+			}
+			if !cfg.SetUnknownVerb(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.UnknownVerbAllow, config.UnknownVerbGate, config.UnknownVerbDeny)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Unknown verb policy set: " + cfg.UnknownVerb)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "command-override [safe <verb> | dangerous <verb> | remove <verb>]",
+		Short: "Override the built-in safe/state-altering classification of a verb",
+		Long: "Tailor command classification without forking. `safe` makes a verb\n" +
+			"pass through as read-only; `dangerous` makes it require confirmation on\n" +
+			"protected contexts (e.g. a custom plugin, or `logs` if apps log secrets).\n\n" +
+			"  command-override                    list overrides\n" +
+			"  command-override safe <verb>        classify <verb> as read-only\n" +
+			"  command-override dangerous <verb>   classify <verb> as state-altering\n" +
+			"  command-override remove <verb>      drop any override for <verb>",
+		Args: cobra.MaximumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				printCommandOverrides(cfg)
+				return nil
+			}
+			if len(args) != 2 {
+				return fmt.Errorf("usage: config command-override <safe|dangerous|remove> <verb>")
+			}
+			action, verb := args[0], args[1]
+			switch action {
+			case "safe":
+				if !cfg.SetCommandOverride(verb, config.ClassSafe) {
+					return fmt.Errorf("invalid verb %q", verb)
+				}
+			case "dangerous":
+				if !cfg.SetCommandOverride(verb, config.ClassStateAltering) {
+					return fmt.Errorf("invalid verb %q", verb)
+				}
+			case "remove":
+				if !cfg.RemoveCommandOverride(verb) {
+					return fmt.Errorf("no override for %q", verb)
+				}
+			default:
+				return fmt.Errorf("expected 'safe', 'dangerous', or 'remove', got %q", action)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess(fmt.Sprintf("Command override updated: %s %s", action, strings.ToLower(strings.TrimSpace(verb))))
 			return nil
 		},
 	})
@@ -715,6 +1130,43 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "validate",
+		Short: "Check the config for problems (exit non-zero if any)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			exists, err := config.Exists()
+			if err != nil {
+				return err
+			}
+			if !exists {
+				ui.PrintInfo("No configuration file; nothing to validate.")
+				return nil
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				// An unparseable config file is itself a fatal validation
+				// failure. Print it and exit non-zero directly, so the output is
+				// the single clean line below rather than cobra's usage dump plus
+				// a doubled "Error:" from the top-level handler.
+				ui.PrintWarning("Config is not valid YAML: " + err.Error())
+				os.Exit(1)
+			}
+			cfg.ApplyDefaults()
+			problems := cfg.Validate()
+			if len(problems) == 0 {
+				ui.PrintSuccess("Config is valid.")
+				return nil
+			}
+			ui.PrintWarning(fmt.Sprintf("Config has %d problem(s):", len(problems)))
+			for _, p := range problems {
+				fmt.Fprintln(os.Stderr, "  - "+p)
+			}
+			// Exit non-zero so CI / pre-flight checks fail on a bad config.
+			os.Exit(1)
+			return nil // unreachable
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "path",
 		Short: "Print the config file path",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -740,7 +1192,7 @@ func mutateConfig(fn func(*config.Config) bool, done, noop string) error {
 		return err
 	}
 	if fn(cfg) {
-		if err := config.Save(cfg); err != nil {
+		if err := saveConfig(cfg); err != nil {
 			return err
 		}
 		ui.PrintSuccess(done)
@@ -748,6 +1200,75 @@ func mutateConfig(fn func(*config.Config) bool, done, noop string) error {
 		ui.PrintInfo(noop)
 	}
 	return nil
+}
+
+// saveConfig persists a change made by a `config` subcommand. It defends the
+// guard's own config: every change is AUDITED (outcome config-change), and a
+// change that WEAKENS protection is gated behind an interactive confirmation when
+// require_confirm_weakening is set. The audit is written BEFORE the change takes
+// effect, using the OLD config's audit policy — so even `audit-mode off` is
+// recorded — and the weakening gate reads the OLD require_confirm_weakening, so
+// turning that flag off is itself gated.
+func saveConfig(newCfg *config.Config) error {
+	old := currentOnDiskConfig()
+	weakening := config.WeakensProtection(old, newCfg)
+	cmdStr := configCommandString()
+
+	if len(weakening) > 0 && old.RequireConfirmWeakening {
+		ui.PrintWarning("This config change weakens kubectl-guard's protection:")
+		for _, item := range weakening {
+			fmt.Fprintln(os.Stderr, "  - "+item)
+		}
+		if ui.Confirm("Apply this protection-weakening change?", 0) != ui.ConfirmApproved {
+			_ = guard.AppendAudit(old, guard.AuditEntry{
+				Command: cmdStr,
+				Outcome: guard.OutcomeConfigChange,
+				Reason:  "weakening declined: " + strings.Join(weakening, "; "),
+			})
+			return fmt.Errorf("aborted: protection-weakening change not confirmed (re-run and confirm, or set require_confirm_weakening: false first)")
+		}
+	}
+
+	reason := "config change"
+	if len(weakening) > 0 {
+		reason = "weakened protection: " + strings.Join(weakening, "; ")
+	}
+	_ = guard.AppendAudit(old, guard.AuditEntry{
+		Command: cmdStr,
+		Outcome: guard.OutcomeConfigChange,
+		Reason:  reason,
+	})
+
+	return config.Save(newCfg)
+}
+
+// currentOnDiskConfig loads the config currently on disk (defaults applied) as
+// the "before" state for weakening detection and auditing, or an empty
+// default config when none exists yet.
+func currentOnDiskConfig() *config.Config {
+	exists, err := config.Exists()
+	if err == nil && exists {
+		if c, err := config.Load(); err == nil {
+			c.ApplyDefaults()
+			return c
+		}
+	}
+	c := &config.Config{}
+	c.ApplyDefaults()
+	return c
+}
+
+// configCommandString renders the invoked `config` subcommand for the audit
+// record (e.g. "config remove-resource secret"), recorded verbatim. Config args
+// are policy values, not kubectl credential flags; the one exception is a webhook
+// URL that embeds a token in its query string, which is stored as-is in the
+// 0600-mode local audit log (json.Marshal escapes control characters, so a
+// crafted arg cannot forge a log line).
+func configCommandString() string {
+	if len(os.Args) > 1 {
+		return strings.Join(os.Args[1:], " ")
+	}
+	return "config"
 }
 
 func printConfig() error {
@@ -793,11 +1314,126 @@ func printConfig() error {
 	}
 
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
+	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
+	ui.PrintInfo("Unknown verb: " + cfg.UnknownVerbMode())
+	ui.PrintInfo("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
+
+	printActorPolicies(cfg)
+	printCommandOverrides(cfg)
 
 	auditPath, _ := config.AuditPath(cfg)
 	ui.PrintInfo("Audit log: " + auditPath)
+	if cfg.AuditMaxSizeMB > 0 {
+		ui.PrintInfo(fmt.Sprintf("Audit rotation: %d MB, %d archive(s)", cfg.AuditMaxSizeMB, cfg.AuditMaxFilesOrDefault()))
+	}
+	if cfg.AuditWebhookURL != "" {
+		ui.PrintInfo("Audit webhook: " + cfg.AuditWebhookURL)
+	}
+	if cfg.AuditSyslog {
+		ui.PrintInfo("Audit syslog: on")
+	}
 
 	return nil
+}
+
+// maxPreviewLines caps how many affected-object names the preview prints, so a
+// selector matching thousands of objects does not flood the terminal before the
+// prompt. Beyond the cap it prints a "… and N more" summary.
+const maxPreviewLines = 20
+
+// printAffectedPreview runs the read-only `kubectl get … -o name` preview and
+// prints the affected objects to stderr before the confirmation prompt. It is
+// best-effort: any failure warns and returns so the prompt still shows.
+func printAffectedPreview(previewArgs []string) {
+	out, err := guard.RunKubectl(previewArgs...)
+	if err != nil {
+		// exit 1 from `get` is "not found" — a valid, informative result (the
+		// selector/name matches nothing), not a preview failure.
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			fmt.Fprintln(os.Stderr, "--- preview: affected resources ---")
+			fmt.Fprintln(os.Stderr, "(no matching objects found)")
+			fmt.Fprintln(os.Stderr, "--- end preview ---")
+			return
+		}
+		ui.PrintWarning("Could not preview affected resources; prompting anyway.")
+		return
+	}
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		lines = nil
+	}
+	fmt.Fprintln(os.Stderr, "--- preview: affected resources ---")
+	if len(lines) == 0 {
+		fmt.Fprintln(os.Stderr, "(no matching objects found)")
+	} else {
+		shown := lines
+		if len(shown) > maxPreviewLines {
+			shown = shown[:maxPreviewLines]
+		}
+		for _, l := range shown {
+			fmt.Fprintln(os.Stderr, "  "+l)
+		}
+		if len(lines) > maxPreviewLines {
+			fmt.Fprintf(os.Stderr, "  … and %d more (%d total)\n", len(lines)-maxPreviewLines, len(lines))
+		} else {
+			fmt.Fprintf(os.Stderr, "  (%d total)\n", len(lines))
+		}
+	}
+	fmt.Fprintln(os.Stderr, "--- end preview ---")
+}
+
+// onOff renders a boolean toggle as "on"/"off" for config output.
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+// normalizeInheritMode maps the CLI "-" sentinel (and empty) to "", meaning
+// "inherit the global mode", and passes any other value through for validation.
+func normalizeInheritMode(m string) string {
+	if m == "-" {
+		return ""
+	}
+	return m
+}
+
+// displayMode renders an actor-policy mode for output: "" (inherit) shows as
+// "(inherit)".
+func displayMode(m string) string {
+	if m == "" {
+		return "(inherit)"
+	}
+	return m
+}
+
+// printCommandOverrides lists the configured command classification overrides.
+func printCommandOverrides(cfg *config.Config) {
+	ui.PrintInfo("Command overrides:")
+	o := cfg.CommandOverrides
+	if len(o.Safe) == 0 && len(o.StateAltering) == 0 && len(o.UnsafeSafe) == 0 {
+		fmt.Println("  (none)")
+		return
+	}
+	for _, v := range o.Safe {
+		fmt.Printf("  - %s: safe (read-only)\n", v)
+	}
+	for _, v := range append(append([]string{}, o.StateAltering...), o.UnsafeSafe...) {
+		fmt.Printf("  - %s: state-altering (gated)\n", v)
+	}
+}
+
+// printActorPolicies lists the configured per-actor mode overrides.
+func printActorPolicies(cfg *config.Config) {
+	ui.PrintInfo("Actor policies:")
+	if cfg == nil || len(cfg.ActorPolicies) == 0 {
+		fmt.Println("  (none)")
+		return
+	}
+	for _, ap := range cfg.ActorPolicies {
+		fmt.Printf("  - %s: context=%s namespace=%s\n", ap.Actor, displayMode(ap.ContextMode), displayMode(ap.NamespaceMode))
+	}
 }
 
 func loadOrCreateConfig() (*config.Config, error) {
@@ -824,6 +1460,9 @@ func printHelp() {
 Usage:
   kubectl-guard [kubectl args...]     Run kubectl with protection
   kubectl-guard config <subcommand>   Manage configuration
+  kubectl-guard explain [--json] -- <kubectl args...>
+                                      Preflight: would this be gated, and why?
+                                      (runs the decision without kubectl/prompt/audit)
   kubectl-guard doctor                Check PATH-shadowing interception
   kubectl-guard --version             Print version (or -V)
   kubectl-guard --help                Print this help
@@ -834,7 +1473,11 @@ Protection model:
   - Protected NAMESPACES: state-altering commands are gated when the target
     namespace (--namespace/-n, the context's namespace, or "default", and any
     namespace under --all-namespaces/-A) matches (or blocked in
-    namespace_mode: block).
+    namespace_mode: block). A command whose TARGET OBJECT is a protected
+    namespace is also gated, on any context and with no -n
+    ("delete namespace kube-system", "delete ns/prod-app"); a namespace command
+    naming no names ("delete ns --all", "delete ns -l x=y") is gated whenever
+    any namespace is protected, since its targets cannot be known in advance.
   - Protected RESOURCES: any command touching the resource is blocked
     everywhere (reads included), e.g. block all secret access.
   - Dry-run (--dry-run=client|server) skips the prompt; real-mutation forms
@@ -871,8 +1514,32 @@ Config subcommands:
                              Show or set how protected contexts are enforced
   namespace-mode [confirm|block]
                              Show or set how protected namespaces are enforced
+  blast-radius [off|gate|block]
+                             Gate wide-scope / bulk mutations (delete --all,
+                             apply --prune, a selector or --all-namespaces on a
+                             destructive verb, a force delete) on every context
+  actor-policy [<actor> <ctx-mode> [ns-mode] | remove <actor>]
+                             Per-actor context/namespace mode overrides (an
+                             agent label can be held to block where a human
+                             confirms); an override can only tighten, never weaken
   audit-mode [all|gated|off] Show or set what the audit log records
+  audit-rotation [<mb> [n]]  Rotate the audit log at <mb> megabytes, keeping n
+                             archives (0 mb disables; default n is 5)
+  audit-webhook [<url>|off]  POST each audit entry as JSON to a webhook
+  audit-syslog [on|off]      Also write each audit entry to local syslog
+  command-override [safe <verb> | dangerous <verb> | remove <verb>]
+                             Override the built-in safe/state-altering
+                             classification of a verb (e.g. a plugin, or treat
+                             logs as requiring confirmation)
+  unknown-verb [allow|gate|deny]
+                             How to treat a verb the guard cannot classify on a
+                             protected target: allow (default), gate (confirm),
+                             or deny (refuse). Unprotected targets always pass
+  confirm-weakening [on|off] Require confirmation for a config change that weakens
+                             protection (every config change is audited regardless)
   audit                      Show the audit log path and recent entries
+  validate                   Check the config for problems (exit non-zero if any;
+                             an invalid config also fails closed at runtime)
   path                       Print the config file path
 
 Examples:

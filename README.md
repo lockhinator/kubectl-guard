@@ -22,6 +22,20 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
 
 ## What's New
 
+### v0.6.0 — Access-aware policy, self-defense & agent preflight
+
+- **Sensitive-access gating** — `sensitive_access: gate|block` gates the verbs that *read/reach* into a workload — `exec`, `cp`, `attach`, `debug`, `port-forward`, `proxy` — on **every** context, not just protected ones, because their risk is what they can reach (a Secret via `exec … cat` or a `debug` ephemeral container, a node root shell via `debug node/…`, a tunnel to a workload), independent of where they run. Verb set configurable via `sensitive_verbs`.
+- **Blast-radius gating** — `blast_radius: gate|block` gates **wide-scope / bulk mutations** on every context, because a command's danger is also about *how much* it destroys: a destructive verb with `--all` / a label-or-field selector / `--all-namespaces`, a force delete (`--force` / `--grace-period=0`), and `apply --prune`. The message names *why*; a genuine `--dry-run` is not gated.
+- **Actor-aware policy** — `actor_policies` overrides `context_mode`/`namespace_mode` per actor (glob-matched on `KUBECTL_GUARD_ACTOR`), so a known agent label can be held to **block** where a human **confirms**. An override can only *tighten*, never weaken (a self-asserted actor cannot relax protection below the global floor).
+- **Unknown-verb strict mode** — `unknown_verb: gate|deny` closes the "unknown ⇒ allowed" bypass: a verb the guard can't classify (a plugin, a future verb) is gated or refused on a **protected** target. It keys off the *leading* verb, so a plugin can't launder its args (`my-plugin get pods`) into "known-safe".
+- **Configurable command classification** — `command_overrides` (`safe` / `state_altering` / `unsafe_safe`) tailors the built-in verb classification without forking — mark a custom verb dangerous, or promote `logs` to gated. Orthogonal policies (resource/blast/sensitive) still apply to a `safe`-downgraded verb.
+- **Preview affected resources** — `preview_before_confirm` lists *which* objects a gated `delete`/`scale`/… would affect (a read-only `kubectl get <target/selector> -o name`) before the prompt — a `delete pod -l app=x` might match one pod or fifty. Diffable applies still use `kubectl diff`.
+- **In-cluster policy** — `in_cluster: namespace|deny|allow` defines behavior when there is no named context (inside a pod / CI with an in-cluster kubeconfig). In-cluster detection requires a readable serviceaccount namespace file, so setting `KUBERNETES_SERVICE_HOST` alone cannot relax the guard.
+- **Config self-defense** — every `config` change is now **audited** (written before it takes effect, so even `audit-mode off` is recorded), and `require_confirm_weakening` **gates** changes that weaken protection (removing a protected target, downgrading a mode, disabling a guard, reducing audit coverage) while additive changes stay frictionless. The guard can no longer be silently neutralized.
+- **Audit rotation & shipping** — size-based rotation (`audit_max_size_mb`/`audit_max_files`, concurrency-safe) plus shipping sinks: `audit_webhook_url` (POST each redacted entry as JSON, bounded, refuses redirects) and `audit_syslog`.
+- **`explain` preflight** — `kubectl-guard explain [--json] -- <args>` answers "would this be gated, and why?" by running the real decision **without** executing kubectl, prompting, or auditing — the preflight for the agent approval flow. `--json`'s `reason` carries a machine-readable matched-rule token.
+- **CRD short-name discovery, streaming manifests, config validation, glob matching, confirm timeout, namespace-by-name gating** — protecting a CRD by kind also blocks its discovered short name; large `-f` manifests are streamed instead of read into memory; an invalid config fails **closed** (and `config validate` lists the problems); context/namespace patterns use real glob matching; the confirmation prompt has a fail-safe timeout; and `delete namespace <name>` is gated by the target namespace even with no `-n`.
+
 ### v0.5.0 — Bypass closure & agent-relay
 
 - **Gated access vectors** — `port-forward` and `proxy` are now gated like `exec`/`attach`/`cp`. They mutate nothing, but they open a live channel into the cluster with your credentials (a tunnel to a prod database; the whole API server bound locally), so they require confirmation on protected contexts/namespaces (or are blocked in block mode).
@@ -142,8 +156,17 @@ Select contexts to protect (space to toggle, enter to confirm):
   [x] prod-cluster
   [x] prod-us-east-1
 
+[/] filter  [space] toggle  [a] toggle visible  [n] none  [enter] confirm  [q] quit
+
 ✓ Saved to ~/.kubectl-guard.yaml
 ```
+
+Contexts whose name contains `prod` are **pre-selected** so the common case
+needs no hunting. For a large kubeconfig, the list is **scrollable** (it renders
+a window sized to your terminal and follows the cursor) and **filterable**: press
+`/`, type a substring to narrow the list (with a live match count), `enter` to
+apply or `esc` to clear. `[a]` toggles only the currently-visible (filtered)
+contexts; selections persist across filtering.
 
 ##### Headless / non-interactive setup (CI, agents, no TTY)
 
@@ -374,6 +397,27 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
   `--all-namespaces`/`-A` is gated whenever any namespace is protected.
   Composes with context protection: a command is gated if *either* the context
   or the namespace is protected.
+
+  Protecting a namespace also guards **the namespace object itself**. A command
+  whose target *is* a protected namespace is gated even on an unprotected
+  context and with no `-n` flag, because otherwise the target namespace would
+  resolve to `default` and the most destructive command of all would sail
+  through:
+
+  ```bash
+  kubectl delete namespace kube-system   # gated
+  kubectl delete ns/prod-app             # gated (type/name form)
+  kubectl edit namespace kube-system     # gated
+  kubectl delete ns,pod kube-system      # gated (comma type list)
+  ```
+
+  Because kubectl's own usage is `delete TYPE (NAME | -l label | --all)`, a
+  namespace command that supplies **no names** cannot be checked against the
+  protected patterns. `kubectl delete namespace --all` and
+  `kubectl delete ns -l env=prod` are therefore gated whenever *any* namespace
+  is protected — the guard cannot prove a protected namespace is not among the
+  targets. Reads (`kubectl get namespace kube-system`) are unaffected; use
+  `protected_resources` to block reads.
 - **Block mode** — set `context_mode: block` and/or `namespace_mode: block` to
   hard-refuse state-altering commands with **no confirmation option** (for CI
   service accounts or a strict "agents must never touch prod" policy). Block
@@ -481,10 +525,12 @@ diff_before_confirm: true # optional: show `kubectl diff` before the confirm pro
 
 Fields:
 - **`protected_contexts`** — glob patterns of contexts that gate
-  state-altering commands (require confirmation)
+  state-altering commands (require confirmation). See
+  [Glob pattern semantics](#glob-pattern-semantics).
 - **`protected_namespaces`** — glob patterns of namespaces that gate
   state-altering commands (resolved from `--namespace`/`-n`, the context's
-  baked-in namespace, or `default`)
+  baked-in namespace, or `default`). Same glob semantics as
+  `protected_contexts`.
 - **`protected_resources`** — resources blocked everywhere, reads included
 - **`context_mode`** — `confirm` (default, prompts) or `block` (hard-refuse)
 - **`namespace_mode`** — `confirm` (default) or `block`, for protected namespaces
@@ -495,13 +541,163 @@ Fields:
 - **`audit_mode`** — `all` (default, logs every command including allowed
   passthrough), `gated` (only interventions: blocked/confirmed/aborted/denied),
   or `off` (logs nothing)
+- **`require_confirm_weakening`** — when true, a `config` change that **weakens**
+  protection (removing a protected context/resource/namespace, downgrading a mode,
+  disabling `block_impersonation`/`audit_syslog`, un-gating a verb, removing an
+  audit webhook, …) requires interactive confirmation; **additive** changes stay
+  frictionless. The gate reads the *current* value of this flag, so turning it off
+  is itself gated. Off by default. **Every** `config` change is audited regardless
+  (see below). Toggle with `kubectl-guard config confirm-weakening on`. The guard
+  now defends its own config: an agent with shell access can no longer silently
+  neutralize protection.
+
+  Every `config` mutation writes an audit entry (`outcome: config-change`) naming
+  the change — and for a weakening change, exactly what it weakened — written
+  **before** the change takes effect using the prior audit policy, so even
+  `audit-mode off` is recorded.
 - **`audit_log`** — optional override for the audit log path
+- **`audit_max_size_mb`** — enable size-based rotation of the audit log: when the
+  file would exceed this many megabytes it is rotated to `<log>.1` (older archives
+  shift to `.2`, `.3`, …). `0` (default) disables rotation. Set with
+  `kubectl-guard config audit-rotation <mb> [max-files]`
+- **`audit_max_files`** — how many rotated archives to keep (`<log>.1 … .N`); the
+  oldest is dropped on each rotation. Default `5` when rotation is on. Rotation is
+  concurrency-safe (serialized by a dedicated `<log>.lock`, so a rename never
+  races a concurrent append)
+- **`audit_webhook_url`** — POST each audited entry as a JSON body to this
+  `http(s)` URL (a SIEM, Slack, etc.). Synchronous and best-effort with a short
+  timeout, so a slow/dead webhook adds at most that delay and never fails the
+  command; local file logging still happens. Set with
+  `kubectl-guard config audit-webhook <url|off>`
+- **`audit_syslog`** — also write each audited entry to the local syslog
+  (`LOG_USER`/`LOG_INFO`, tag `kubectl-guard`). Set with
+  `kubectl-guard config audit-syslog on`. Shipping sinks respect `audit_mode`: a
+  filtered-out entry is neither logged nor shipped
 - **`actor`** — optional static default for the audit `actor` field (overridden
   by `KUBECTL_GUARD_ACTOR` when set); useful for a shared CI host
 - **`diff_before_confirm`** — when true, run `kubectl diff` (server-side) and
   show the result on stderr before the confirmation prompt for diffable commands
   (`apply`/`create`/`replace -f`). Off by default (adds latency and needs
   server-side dry-run RBAC; a failed diff warns and prompts anyway)
+- **`preview_before_confirm`** — when true, preview **what a gated command will
+  affect** before prompting: `kubectl diff` for diffable applies (as above), and
+  a read-only `kubectl get <same target/selector> -o name` for non-diffable
+  destructive commands (`delete`/`scale`/`label`/`annotate`/`patch`/`taint`/
+  `cordon`/`uncordon`/`drain`/`autoscale`). This answers "*which* objects?" at the
+  prompt — `kubectl delete pod -l app=x` might match one pod or fifty. Output goes
+  to stderr, capped at the first 20 objects plus a total count. Best-effort: a
+  failed preview warns and prompts anyway. Off by default (adds a read round-trip
+  per gated command)
+- **`confirm_timeout_seconds`** — how long the confirmation prompt waits for an
+  answer. `0` (default) waits forever. When positive, an unanswered prompt
+  **aborts** (fail-safe: an unanswered "are you sure?" resolves to *no*) with the
+  needs-confirmation exit code, audited as `aborted` with reason `timeout`. Only
+  the interactive prompt is affected; `--json`, `--yes`, and no-TTY paths already
+  resolve without blocking. Capped at one year (`31536000`); use `0` for a
+  deliberate wait-forever
+- **`sensitive_access`** — `off` (default), `gate`, or `block`. Gates the
+  **sensitive-access verbs** — `exec`, `cp`, `attach`, `debug`, `port-forward`,
+  `proxy` — on **every** context, not just protected ones, because their risk is
+  about what they can *read/reach* (a secret in a pod via `exec … cat` or a
+  `debug` ephemeral container, a file via `cp`, a root shell on a node via
+  `debug node/…`, a tunnel to a workload), independent of where they run. `gate`
+  requires confirmation, `block` refuses. It applies even in `--dry-run` mode (a
+  dry-run still reads/reaches). Read verbs (`get`/`describe`/`logs`) are
+  unaffected. Composes most-restrictive with context/namespace protection. Off by
+  default (unchanged behavior: these verbs gate only on protected targets)
+- **`sensitive_verbs`** — override the verb set `sensitive_access` applies to
+  (default `exec, cp, attach, debug, port-forward, proxy`). You can add a verb you
+  consider sensitive (e.g. `logs`, if apps log secrets) — it is then gated even
+  though it is otherwise read-only
+- **`blast_radius`** — `off` (default), `gate`, or `block`. Gates **wide-scope /
+  bulk mutations** on **every** context, because a command's danger is also about
+  *how much* it destroys, not only *where* it runs — these are exactly the
+  mistakes an agent makes on a "dev" cluster. Triggers: a destructive verb with
+  `--all`, a label/field selector (`-l`/`--selector`/`--field-selector`), or
+  `--all-namespaces`; a **force delete** (`--force` or `--grace-period=0`); and
+  `apply --prune` (deletes anything not in the manifest). `gate` requires
+  confirmation, `block` refuses; the message names *why* (e.g. "`--all` targets
+  every object of the type in the namespace"). A genuine `--dry-run` is **not**
+  gated (it changes nothing, whatever its scope). Composes most-restrictive with
+  context/namespace protection. Set it with
+  `kubectl-guard config blast-radius gate`
+- **`command_overrides`** — tailor the built-in safe/state-altering verb
+  classification without forking. `state_altering` marks a custom/plugin verb as
+  requiring confirmation on protected contexts; `unsafe_safe` promotes a
+  default-safe verb (e.g. `logs`, if apps log secrets) to gated; `safe`
+  downgrades a verb to read-only pass-through for the **context/namespace** gates
+  (a deliberate, documented loosening — the guard trusts your list). A `safe`
+  override does **not** disable the orthogonal policies: `protected_resources`,
+  `blast_radius`, and `sensitive_access` still apply (e.g. `delete` marked safe is
+  still blocked by a protected `secret`, and a wide `delete --all` is still gated
+  by `blast_radius`). Matching is case-insensitive; a verb
+  listed as both safe and state-altering resolves **most-restrictive** (gated).
+  Overrides are verb-level (they do not distinguish subcommands). Manage with
+  `kubectl-guard config command-override <safe|dangerous|remove> <verb>`:
+
+  ```yaml
+  command_overrides:
+    state_altering: [my-dangerous-plugin]
+    unsafe_safe:    [logs]   # treat logs as requiring confirmation
+    safe:           [my-read-only-plugin]
+  ```
+
+  (Unknown verbs the guard has never heard of still pass through unless you list
+  them — or use `unknown_verb` below to gate them wholesale.)
+- **`unknown_verb`** — strict-mode policy for a verb the guard cannot classify as
+  safe or state-altering (a kubectl plugin, a future/renamed verb, or a gap in
+  the built-in lists) on a **protected** context/namespace: `allow` (default,
+  unchanged — `unknown ⇒ allowed`), `gate` (require confirmation, or block under
+  a block-mode context/namespace), or `deny` (refuse, fail-closed). For a security
+  tool, "unknown ⇒ allowed" is the wrong default on a protected target — the guard
+  cannot prove the command is safe. **Only** affects protected targets: unknown
+  verbs on unprotected contexts always pass, so plugins keep working elsewhere. A
+  verb you classify with `command_overrides` is no longer "unknown". Set with
+  `kubectl-guard config unknown-verb gate`
+- **`actor_policies`** — per-actor overrides of `context_mode` / `namespace_mode`,
+  so a known agent label can be held to a stricter posture than a human. The
+  actor is resolved exactly as for auditing (`KUBECTL_GUARD_ACTOR` → the `actor`
+  config → OS user) and matched by **glob**; a matching policy's mode replaces the
+  global mode for that actor. An override can only make a mode **stricter**
+  (`confirm` → `block`), never weaker — `KUBECTL_GUARD_ACTOR` is self-asserted, so
+  a self-named actor must not be able to relax protection below the global
+  posture. An unset or unmatched actor uses the global modes unchanged. This is
+  **policy-shaping, not authentication**: an actor can lie about who it is, so it
+  is for making the *default* posture stricter for honest agent frameworks, not a
+  security boundary. Manage with `kubectl-guard config actor-policy claude-code
+  block` (or `… <actor> <ctx-mode> [ns-mode]`, `… remove <actor>`):
+
+  ```yaml
+  actor_policies:
+    - actor: "claude-code"   # exact or glob
+      context_mode: block    # agents never mutate protected contexts
+      namespace_mode: block
+    - actor: "ci-*"
+      context_mode: confirm
+  ```
+- **`in_cluster`** — policy for running with **no named context** (inside a pod
+  on the serviceaccount config, or CI with an in-cluster kubeconfig), when
+  protected contexts are configured. `namespace` (default) gates by the resolved
+  **serviceaccount namespace** instead of the context name, so namespace
+  protection still works — a state-altering command in a protected namespace is
+  gated, one in an unprotected namespace passes. `deny` fails closed (refuses
+  every command; the pre-v0.6.0 behavior). `allow` passes through. Out-of-cluster
+  behavior is unchanged: an unresolvable context still fails closed. In-cluster
+  detection requires **both** `KUBERNETES_SERVICE_HOST` and a readable
+  serviceaccount namespace file (a projected-SA file an out-of-cluster caller
+  cannot fabricate), so setting the env var alone cannot relax the guard. Under
+  `namespace` mode, context-name protection is **not** evaluated in-cluster
+  (there is no context name), so a config that protects *only* contexts gives no
+  in-cluster protection — pair it with `protected_namespaces`, or use
+  `in_cluster: deny`
+- **`discover_short_names`** — `true` (default) or `false`. When enabled, the
+  guard discovers **CRD short names** by querying `kubectl api-resources` (cached
+  ~10 min per cluster), so protecting a CRD by its kind also blocks its short
+  name — e.g. with `secretstore` protected, `kubectl get ss` is blocked, not just
+  `kubectl get secretstore`. Discovery is best-effort and **additive**: it can
+  only ever add short names, never weaken protection, and if `api-resources` fails
+  (offline, RBAC) the built-in short names still work. Set to `false` for
+  air-gapped or latency-sensitive use
 
 Manage via CLI:
 
@@ -520,9 +716,117 @@ kubectl-guard config context-mode block      # Hard-block state changes on prote
 kubectl-guard config namespace-mode block    # Hard-block state changes on protected namespaces
 kubectl-guard config audit-mode all          # Log every command (default)
 kubectl-guard config audit                # Show audit log path + recent entries
+kubectl-guard config validate             # Check the config for problems (exit non-zero if any)
 kubectl-guard config setup                # Re-run setup wizard
 kubectl-guard config init                 # Write config non-interactively (headless)
 kubectl-guard config path                 # Print config file path
+```
+
+### Config validation
+
+Garbage values used to be silently ignored. A typo like `context_mode: blck` is
+not `block`, so the guard would fall back to `confirm` — you think you configured
+a hard block, but a `--yes` sails through. For a security tool that is exactly the
+wrong default, so kubectl-guard now **validates the config and fails closed** on an
+invalid value:
+
+```bash
+$ kubectl-guard config validate
+⚠️  Config has 2 problem(s):
+  - context_mode: "blck" is not valid (want "confirm" or "block")
+  - protected_contexts: pattern "prod-[" has an unterminated '[' character class
+# exit code 1
+```
+
+An invalid config makes the guard **refuse every command** (fail closed) until it
+is fixed — it never runs with protection weaker than you configured. The
+config-mutation subcommands (`config context-mode block`, …) still work while the
+config is invalid, so you can correct it. `config validate` is also handy as a
+CI/pre-flight check: it exits non-zero if there is any problem, zero if clean.
+
+Validation checks the mode fields (`confirm_mode`, `audit_mode`, `context_mode`,
+`namespace_mode`) against their allowed values, that glob patterns are well-formed
+(a `prod-[` with no closing `]` is almost certainly a mistake — the matcher would
+treat it as the literal string `prod-[` and protect nothing you intended), and
+that protected-resource entries are non-empty. Unknown fields are ignored
+(forward-compatible with configs written by a newer version).
+
+### Glob pattern semantics
+
+`protected_contexts` and `protected_namespaces` are matched with the **same**
+glob matcher, so a pattern means exactly one thing wherever you write it.
+Context and namespace names are *names*, not filesystem paths, so the matcher
+uses shell-like semantics rather than path semantics:
+
+| Syntax | Matches |
+|--------|---------|
+| `*` | any sequence of characters, **including `/` and `:`** (and the empty string) |
+| `?` | exactly one character (one UTF-8 rune, not one byte) |
+| `[abc]` | one character from the set |
+| `[a-z]` | one character from the range |
+| `[^abc]` | one character **not** in the set |
+| `\*`, `\?`, `\[`, `\\` | the literal character, escaped |
+
+Everything else matches itself. Behavior is **identical on Linux, macOS, and
+Windows** — `/` and `\` carry no special path meaning.
+
+Note that only `^` negates a character class. Unlike most shells, `[!abc]` is
+**not** a negation here — `!` is an ordinary member of the set. This matches the
+behavior of the matcher used in earlier releases, so upgrading can never turn a
+protected context into an unprotected one.
+
+```yaml
+protected_contexts:
+  - 'prod-*'                          # prod-us-east-1, prod-us/east/1
+  - '*prod*'                          # team-a/prod/cluster, myprodcluster
+  - 'arn:aws:eks:*:*:cluster/prod-*'  # EKS ARNs
+  - 'gke_*_prod-*'                    # GKE context names
+```
+
+Because `*` spans `/`, a path-shaped context name (`team-a/prod`) is matched by
+`*prod*` the way you would expect from a shell. Note the literal parts of a
+pattern still have to match literally: `prod-*` matches `prod-us/east/1` but not
+`prod/us/east/1`, because `prod-` is not a prefix of `prod/`.
+
+> Earlier releases used Go's `path/filepath.Match`, where `*` and `?` refuse to
+> cross `/`, escaping is disabled on Windows, and a malformed pattern such as
+> `prod-[` returns an error that the guard swallowed — silently protecting
+> **nothing**. Upgrading is safe: for any context or namespace name, a pattern
+> that was protected before is still protected. The new matcher only ever widens
+> what a pattern matches. (The sole exception is a name containing a multi-byte
+> UTF-8 character matched by a wildcard, where `filepath.Match` matched the
+> character's interior bytes; Kubernetes context and namespace names are ASCII,
+> so no real configuration is affected.)
+
+### Preflight — `explain`
+
+Ask the guard **"would this command be gated, and why?"** without running it:
+
+```bash
+$ kubectl-guard explain -- delete pod nginx --context prod-cluster
+decision:  needs-confirmation
+reason:    protected context "prod-cluster"
+verb:      delete (state-altering)
+context:   prod-cluster
+namespace: default
+```
+
+`explain` runs the guard's real decision logic (the same `Check` used at runtime)
+**without** executing kubectl, prompting, or writing an audit entry — a pure
+policy query. It reports the decision (`allow` / `needs-confirmation` / `blocked`
+/ `denied`), the **matched rule** (protected context/namespace/resource, block
+mode, sensitive-access, blast-radius, unknown-verb, `--server` deny, dry-run skip,
+allow), the resolved verb and its classification, context, and namespace.
+
+`--json` emits the same `JSONResult` shape as the runtime `--json` mode, so an
+agent parses one schema everywhere; its `reason` field carries the machine-readable
+matched **rule** (`protected-context`, `blast-radius`, `unknown-verb`, …) an agent
+can branch on. This is the **preflight** for the agent approval flow: an agent can
+check in advance whether a command would gate and route it through human approval,
+instead of discovering it at execution time.
+
+```bash
+kubectl-guard explain --json -- delete pods --all      # agent preflight
 ```
 
 ### Diagnostics
@@ -680,6 +984,17 @@ knowing:
   bypass attempts.
 - **`-k` kustomize** directories are conservatively blocked when resource
   protection is active, but their contents are not deeply parsed.
+- **No output redaction — the guard blocks commands, it does not filter their
+  output.** Once a command is allowed, kubectl's output flows straight to your
+  terminal: the guard hands off with `exec` and never sees it. So a secret
+  value that reaches you *through* a permitted command — an env var in
+  `get pod -o yaml`, a token an app wrote to `logs` — is not redacted. Protect
+  the resource (`config add-resource secret`) and gate the access vectors
+  (`exec`, `cp`, `port-forward`) instead; those are decisions the guard can make
+  from the command line, with certainty, before anything runs. This is a
+  deliberate design decision — see
+  [docs/redaction-decision.md](docs/redaction-decision.md) for the full
+  rationale and the cost analysis behind it.
 
 ## Reliability
 

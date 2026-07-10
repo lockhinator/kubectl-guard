@@ -59,6 +59,22 @@ func (c *Config) Validate() []string {
 		}
 	}
 
+	if c.ConfirmTimeoutSeconds < 0 {
+		problems = append(problems, fmt.Sprintf(
+			"confirm_timeout_seconds: %d is negative (use 0 to wait forever, or a positive number of seconds)",
+			c.ConfirmTimeoutSeconds))
+	} else if c.ConfirmTimeoutSeconds > MaxConfirmTimeoutSeconds {
+		// A finite timeout above the ceiling is rejected rather than silently
+		// accepted, because `time.Duration(n) * time.Second` overflows int64
+		// nanoseconds around n=9.2e9 and wraps NEGATIVE — which readLine treats as
+		// "wait forever", silently defeating the fail-safe the value was meant to
+		// provide. The ceiling is far below the overflow point and far above any
+		// real prompt timeout; use 0 to wait forever deliberately.
+		problems = append(problems, fmt.Sprintf(
+			"confirm_timeout_seconds: %d is too large (max %d; use 0 to wait forever)",
+			c.ConfirmTimeoutSeconds, MaxConfirmTimeoutSeconds))
+	}
+
 	return problems
 }
 

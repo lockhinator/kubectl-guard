@@ -121,12 +121,13 @@ func RunSetup(contextNames []string) bool {
 		return false
 	}
 
-	// Build multi-select items
+	// Build multi-select items, pre-selecting production-looking contexts so the
+	// common case (protect prod) needs no hunting through a long list.
 	items := make([]ui.MultiSelectItem, len(contextNames))
 	for i, name := range contextNames {
 		items[i] = ui.MultiSelectItem{
 			Name:     name,
-			Selected: false,
+			Selected: ui.IsProductionContext(name),
 		}
 	}
 

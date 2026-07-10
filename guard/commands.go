@@ -59,6 +59,9 @@ var stateAlteringCommands = map[string]bool{
 	"attach":       true,
 	"port-forward": true,
 	"proxy":        true,
+	// certificate approve/deny issues or refuses a client certificate — a
+	// credential-issuance and privilege-escalation primitive, not a read.
+	"certificate": true,
 }
 
 // noDryRunCommands are gated verbs that kubectl gives no --dry-run flag.
@@ -72,6 +75,7 @@ var stateAlteringCommands = map[string]bool{
 var noDryRunCommands = map[string]bool{
 	"exec": true, "cp": true, "attach": true, "debug": true,
 	"port-forward": true, "proxy": true, "edit": true, "config": true,
+	"certificate": true,
 }
 
 // noDryRunSubcommands is noDryRunCommands at subcommand granularity, for verbs

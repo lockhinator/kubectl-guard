@@ -119,6 +119,8 @@ func TestSupportsDryRun(t *testing.T) {
 		{"proxy", []string{"proxy"}, false},
 		{"edit", []string{"edit", "deployment", "nginx"}, false},
 		{"config use-context", []string{"config", "use-context", "prod"}, false},
+		{"certificate approve", []string{"certificate", "approve", "my-csr"}, false},
+		{"certificate deny", []string{"certificate", "deny", "my-csr"}, false},
 		{"rollout restart", []string{"rollout", "restart", "deployment/nginx"}, false},
 		{"rollout pause", []string{"rollout", "pause", "deployment/nginx"}, false},
 		{"rollout resume", []string{"rollout", "resume", "deployment/nginx"}, false},
@@ -271,5 +273,41 @@ func TestApplyDryRunStillSkipsGating(t *testing.T) {
 	res, _, _, _ := checkWith([]string{"apply", "--dry-run=client", "-f", "deploy.yaml"}, staticContext("prod-cluster"))
 	if res != Allow {
 		t.Errorf("result = %v, want Allow (a real dry-run still skips gating)", res)
+	}
+}
+
+// TestCertificateApproveGatedOnProtectedContext locks down the hole where
+// `certificate approve` (credential issuance) bypassed even a configured guard,
+// because it was classified as a read.
+func TestCertificateApproveGatedOnProtectedContext(t *testing.T) {
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	defer cleanup()
+	res, _, _, _ := checkWith([]string{"certificate", "approve", "my-csr"}, staticContext("prod-cluster"))
+	if res != RequireConfirmation {
+		t.Errorf("result = %v, want RequireConfirmation", res)
+	}
+}
+
+// TestCertificateDryRunCannotSkipGating: `certificate approve` has no --dry-run
+// flag, so a --dry-run token must not buy the ungated pass a real dry-run would.
+func TestCertificateDryRunCannotSkipGating(t *testing.T) {
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	defer cleanup()
+	res, _, _, _ := checkWith([]string{"certificate", "approve", "--dry-run=client", "my-csr"}, staticContext("prod-cluster"))
+	if res != RequireConfirmation {
+		t.Errorf("result = %v, want RequireConfirmation (dry-run must not skip gating)", res)
+	}
+}
+
+// TestCertificateBlockedInBlockMode: block mode hard-refuses it.
+func TestCertificateBlockedInBlockMode(t *testing.T) {
+	cleanup := withTempHome(t, &config.Config{
+		ProtectedContexts: []string{"prod-*"},
+		ContextMode:       config.ContextModeBlock,
+	})
+	defer cleanup()
+	res, _, _, _ := checkWith([]string{"certificate", "deny", "my-csr"}, staticContext("prod-cluster"))
+	if res != Blocked {
+		t.Errorf("result = %v, want Blocked", res)
 	}
 }

@@ -123,14 +123,15 @@ func (c *Config) ShouldAudit(outcome string) bool {
 	}
 }
 
-// SetAuditMode sets the audit mode if the value is valid.
+// SetAuditMode sets the audit mode if the value is valid. The valid-value check
+// is validAuditMode (config/validate.go), the single source of truth shared with
+// Config.Validate, so the setter and the validator can never disagree.
 func (c *Config) SetAuditMode(mode string) bool {
-	switch mode {
-	case AuditModeAll, AuditModeGated, AuditModeOff:
-		c.AuditMode = mode
-		return true
+	if !validAuditMode(mode) {
+		return false
 	}
-	return false
+	c.AuditMode = mode
+	return true
 }
 
 // Path returns the full path to the config file.
@@ -304,22 +305,20 @@ func (c *Config) RemoveNamespace(namespace string) bool {
 
 // SetContextMode sets the context protection mode if valid.
 func (c *Config) SetContextMode(mode string) bool {
-	switch mode {
-	case ContextModeConfirm, ContextModeBlock:
-		c.ContextMode = mode
-		return true
+	if !validContextMode(mode) {
+		return false
 	}
-	return false
+	c.ContextMode = mode
+	return true
 }
 
 // SetNamespaceMode sets the namespace protection mode if valid.
 func (c *Config) SetNamespaceMode(mode string) bool {
-	switch mode {
-	case NamespaceModeConfirm, NamespaceModeBlock:
-		c.NamespaceMode = mode
-		return true
+	if !validNamespaceMode(mode) {
+		return false
 	}
-	return false
+	c.NamespaceMode = mode
+	return true
 }
 
 // resourceShortNames maps kubectl built-in short names to their canonical
@@ -403,10 +402,9 @@ func (c *Config) RemoveResource(name string) bool {
 
 // SetConfirmMode sets the confirmation mode if the value is valid.
 func (c *Config) SetConfirmMode(mode string) bool {
-	switch mode {
-	case ConfirmModeSimple, ConfirmModeTypeName, ConfirmModeAgentRelay:
-		c.ConfirmMode = mode
-		return true
+	if !validConfirmMode(mode) {
+		return false
 	}
-	return false
+	c.ConfirmMode = mode
+	return true
 }

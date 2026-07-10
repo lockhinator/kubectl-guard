@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -118,6 +119,17 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 		return Deny, "", nil, fmt.Errorf("cannot load config: %w", err)
 	}
 	cfg.ApplyDefaults()
+
+	// A config with an invalid known-field value silently downgrades protection:
+	// e.g. context_mode: "blck" is not "block", so the runtime falls back to
+	// confirm (bypassable with --yes) while the user believes they set block. For
+	// a security tool that is the wrong default, so an invalid config fails
+	// CLOSED: refuse every command until it is fixed, rather than run with
+	// protection weaker than configured. `kubectl-guard config validate` lists the
+	// problems, and the config-mutation subcommands still work so it can be fixed.
+	if problems := cfg.Validate(); len(problems) > 0 {
+		return Deny, "", cfg, fmt.Errorf("config is invalid: %s (run 'kubectl-guard config validate')", strings.Join(problems, "; "))
+	}
 
 	// Best-effort context for messaging; failures are handled below.
 	ctx, ctxErr := resolveContextWith(args, current)

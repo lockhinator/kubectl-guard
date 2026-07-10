@@ -38,6 +38,7 @@ var guardConfigSubcommands = map[string]bool{
 	"audit-mode":       true,
 	"audit":            true,
 	"path":             true,
+	"validate":         true,
 }
 
 func main() {
@@ -728,6 +729,43 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "validate",
+		Short: "Check the config for problems (exit non-zero if any)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			exists, err := config.Exists()
+			if err != nil {
+				return err
+			}
+			if !exists {
+				ui.PrintInfo("No configuration file; nothing to validate.")
+				return nil
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				// An unparseable config file is itself a fatal validation
+				// failure. Print it and exit non-zero directly, so the output is
+				// the single clean line below rather than cobra's usage dump plus
+				// a doubled "Error:" from the top-level handler.
+				ui.PrintWarning("Config is not valid YAML: " + err.Error())
+				os.Exit(1)
+			}
+			cfg.ApplyDefaults()
+			problems := cfg.Validate()
+			if len(problems) == 0 {
+				ui.PrintSuccess("Config is valid.")
+				return nil
+			}
+			ui.PrintWarning(fmt.Sprintf("Config has %d problem(s):", len(problems)))
+			for _, p := range problems {
+				fmt.Fprintln(os.Stderr, "  - "+p)
+			}
+			// Exit non-zero so CI / pre-flight checks fail on a bad config.
+			os.Exit(1)
+			return nil // unreachable
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "path",
 		Short: "Print the config file path",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -890,6 +928,8 @@ Config subcommands:
                              Show or set how protected namespaces are enforced
   audit-mode [all|gated|off] Show or set what the audit log records
   audit                      Show the audit log path and recent entries
+  validate                   Check the config for problems (exit non-zero if any;
+                             an invalid config also fails closed at runtime)
   path                       Print the config file path
 
 Examples:

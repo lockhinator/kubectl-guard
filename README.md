@@ -784,6 +784,37 @@ pattern still have to match literally: `prod-*` matches `prod-us/east/1` but not
 > character's interior bytes; Kubernetes context and namespace names are ASCII,
 > so no real configuration is affected.)
 
+### Preflight — `explain`
+
+Ask the guard **"would this command be gated, and why?"** without running it:
+
+```bash
+$ kubectl-guard explain -- delete pod nginx --context prod-cluster
+decision:  needs-confirmation
+reason:    protected context "prod-cluster"
+verb:      delete (state-altering)
+context:   prod-cluster
+namespace: default
+```
+
+`explain` runs the guard's real decision logic (the same `Check` used at runtime)
+**without** executing kubectl, prompting, or writing an audit entry — a pure
+policy query. It reports the decision (`allow` / `needs-confirmation` / `blocked`
+/ `denied`), the **matched rule** (protected context/namespace/resource, block
+mode, sensitive-access, blast-radius, unknown-verb, `--server` deny, dry-run skip,
+allow), the resolved verb and its classification, context, and namespace.
+
+`--json` emits the same `JSONResult` shape as the runtime `--json` mode, so an
+agent parses one schema everywhere; its `reason` field carries the machine-readable
+matched **rule** (`protected-context`, `blast-radius`, `unknown-verb`, …) an agent
+can branch on. This is the **preflight** for the agent approval flow: an agent can
+check in advance whether a command would gate and route it through human approval,
+instead of discovering it at execution time.
+
+```bash
+kubectl-guard explain --json -- delete pods --all      # agent preflight
+```
+
 ### Diagnostics
 
 ```bash

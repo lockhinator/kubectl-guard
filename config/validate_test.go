@@ -36,6 +36,15 @@ func TestValidate(t *testing.T) {
 		{"empty resource entry", Config{ProtectedResources: []string{"secret", ""}}, "protected_resources"},
 		{"whitespace resource entry", Config{ProtectedResources: []string{"   "}}, "protected_resources"},
 
+		{"negative confirm timeout", Config{ConfirmTimeoutSeconds: -1}, "confirm_timeout_seconds"},
+		{"zero confirm timeout is valid", Config{ConfirmTimeoutSeconds: 0}, ""},
+		{"positive confirm timeout is valid", Config{ConfirmTimeoutSeconds: 60}, ""},
+		{"max confirm timeout is valid", Config{ConfirmTimeoutSeconds: MaxConfirmTimeoutSeconds}, ""},
+		{"over-max confirm timeout rejected", Config{ConfirmTimeoutSeconds: MaxConfirmTimeoutSeconds + 1}, "too large"},
+		// The value that overflows time.Duration to a negative (silent
+		// wait-forever) must be rejected, not silently accepted.
+		{"overflow confirm timeout rejected", Config{ConfirmTimeoutSeconds: 9223372037}, "too large"},
+
 		{"valid globs with classes and escapes", Config{
 			ProtectedContexts: []string{"prod-[abc]", "prod-[!x]", "prod-[a-z]", `lit\[eral`, "*prod*"},
 		}, ""},

@@ -525,6 +525,13 @@ Fields:
   show the result on stderr before the confirmation prompt for diffable commands
   (`apply`/`create`/`replace -f`). Off by default (adds latency and needs
   server-side dry-run RBAC; a failed diff warns and prompts anyway)
+- **`confirm_timeout_seconds`** — how long the confirmation prompt waits for an
+  answer. `0` (default) waits forever. When positive, an unanswered prompt
+  **aborts** (fail-safe: an unanswered "are you sure?" resolves to *no*) with the
+  needs-confirmation exit code, audited as `aborted` with reason `timeout`. Only
+  the interactive prompt is affected; `--json`, `--yes`, and no-TTY paths already
+  resolve without blocking. Capped at one year (`31536000`); use `0` for a
+  deliberate wait-forever
 
 Manage via CLI:
 

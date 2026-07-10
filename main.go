@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/lockhinator/kubectl-guard/config"
 	"github.com/lockhinator/kubectl-guard/guard"
@@ -481,21 +482,33 @@ func runGuard(args []string) error {
 			}
 		}
 
-		confirmed := false
-		if cfg != nil && cfg.ConfirmMode == config.ConfirmModeTypeName {
-			confirmed = ui.ConfirmWithName(message, target)
-		} else {
-			confirmed = ui.Confirm(message)
+		var timeout time.Duration
+		if cfg != nil && cfg.ConfirmTimeoutSeconds > 0 {
+			timeout = time.Duration(cfg.ConfirmTimeoutSeconds) * time.Second
 		}
 
-		if confirmed {
+		var outcome ui.ConfirmOutcome
+		if cfg != nil && cfg.ConfirmMode == config.ConfirmModeTypeName {
+			outcome = ui.ConfirmWithName(message, target, timeout)
+		} else {
+			outcome = ui.Confirm(message, timeout)
+		}
+
+		switch outcome {
+		case ui.ConfirmApproved:
 			audit(guard.OutcomeConfirmed, "")
 			return guard.ExecKubectl(forwarded)
+		case ui.ConfirmTimedOut:
+			// Fail-safe: an unanswered prompt is a decline, recorded distinctly so
+			// the audit trail shows the command was abandoned, not refused.
+			audit(guard.OutcomeAborted, "timeout")
+			fmt.Fprintln(os.Stderr, "Timed out — aborted (not confirmed).")
+			os.Exit(guard.ExitNeedsConfirm)
+		default: // ui.ConfirmDeclined
+			audit(guard.OutcomeAborted, "")
+			fmt.Fprintln(os.Stderr, "Aborted.")
+			os.Exit(guard.ExitNeedsConfirm)
 		}
-
-		audit(guard.OutcomeAborted, "")
-		fmt.Fprintln(os.Stderr, "Aborted.")
-		os.Exit(guard.ExitNeedsConfirm)
 
 	case guard.Allow:
 		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so

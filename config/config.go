@@ -41,6 +41,13 @@ const (
 	auditFileName  = ".kubectl-guard-audit.log"
 )
 
+// MaxConfirmTimeoutSeconds caps confirm_timeout_seconds. It is one year — far
+// above any real confirmation-prompt timeout and far below the ~9.2e9 point
+// where time.Duration(n)*time.Second overflows int64 nanoseconds and wraps
+// negative (which would silently mean "wait forever"). A deliberate wait-forever
+// is spelled 0.
+const MaxConfirmTimeoutSeconds = 365 * 24 * 60 * 60
+
 // Config represents the kubectl-guard configuration.
 type Config struct {
 	// ProtectedContexts are context name patterns (glob) that require
@@ -91,6 +98,14 @@ type Config struct {
 	// the result on stderr before the confirmation prompt for diffable commands.
 	// Off by default (diff adds latency and needs server-side dry-run RBAC).
 	DiffBeforeConfirm bool `yaml:"diff_before_confirm,omitempty"`
+
+	// ConfirmTimeoutSeconds bounds how long the confirmation prompt waits for an
+	// answer. 0 (default) waits forever, preserving the previous behavior. When
+	// positive, an unanswered prompt aborts (fail-safe: an unanswered "are you
+	// sure?" resolves to no) with the needs-confirmation exit code, audited as
+	// aborted/timeout. Only affects the interactive prompt; --json/--yes/no-TTY
+	// paths already resolve without blocking.
+	ConfirmTimeoutSeconds int `yaml:"confirm_timeout_seconds,omitempty"`
 }
 
 // ApplyDefaults fills in zero-value fields with sensible defaults.

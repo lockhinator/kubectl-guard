@@ -22,6 +22,15 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
 
 ## What's New
 
+### v0.5.0 — Bypass closure & agent-relay
+
+- **Gated access vectors** — `port-forward` and `proxy` are now gated like `exec`/`attach`/`cp`. They mutate nothing, but they open a live channel into the cluster with your credentials (a tunnel to a prod database; the whole API server bound locally), so they require confirmation on protected contexts/namespaces (or are blocked in block mode).
+- **Verb-shift bypass closed** — a kubectl global flag taking a space-separated value (`kubectl -v 3 delete …`, `--request-timeout 30 …`) used to push the real verb out of position, so it ran **ungated**. The guard now consumes those flags' values (its table mirrors kubectl's persistent value-taking flags) and falls back to the first recognized verb, so every gated verb gates regardless of leading global flags.
+- **`--raw` gating** — `kubectl get --raw /api/v1/namespaces/default/secrets/db-creds` read secrets straight past resource protection. `--raw` is now blocked whenever any resource protection is configured (the guard cannot map a literal API path to a resource type); untouched when none is, so `--raw /healthz` still works. `create`/`replace`/`delete --raw` are covered too.
+- **Audit-log secret redaction** — the guard no longer writes secret values into its own audit log, `--json` output, or prompts. Credential flags, `key=value` flags (`--from-literal`/`--env`/…), JSON blobs (`--patch`/`--overrides`), `set env` positionals, and `config set` credential properties are redacted to `***` on every surface, while kubectl still receives the real command.
+- **Secure-default headless bootstrap** — an unconfigured headless first run no longer silently writes an empty (unprotected) config and proceeds. `KUBECTL_GUARD_BOOTSTRAP` selects the posture; the default `deny` refuses state-altering commands and writes nothing, `empty` is the opt-in for intentionally-unprotected CI.
+- **Agent-relay approval flow** — `confirm_mode: agent-relay` (or `KUBECTL_GUARD_AGENT_RELAY=1`) emits a structured `needs-confirmation` object on stderr and exits `4` instead of prompting stdin, so an agent framework can relay the request to its human and re-run with `--yes` once approved. Hard blocks stay hard blocks.
+
 ### v0.4.0 — Security completeness
 
 - **Targeting & identity flags** — `--server` (which points at a different cluster the guard can't verify) is now **denied** when context protection is configured. `--as`/`--as-group`/`--as-uid` impersonation and `--token` are **recorded in the audit log**, and optionally **blocked** on protected contexts via `block_impersonation`.

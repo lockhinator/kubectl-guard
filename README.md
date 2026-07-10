@@ -615,7 +615,17 @@ Fields:
   ```
 
   (Unknown verbs the guard has never heard of still pass through unless you list
-  them — see the strict-mode option to gate unknown verbs instead.)
+  them — or use `unknown_verb` below to gate them wholesale.)
+- **`unknown_verb`** — strict-mode policy for a verb the guard cannot classify as
+  safe or state-altering (a kubectl plugin, a future/renamed verb, or a gap in
+  the built-in lists) on a **protected** context/namespace: `allow` (default,
+  unchanged — `unknown ⇒ allowed`), `gate` (require confirmation, or block under
+  a block-mode context/namespace), or `deny` (refuse, fail-closed). For a security
+  tool, "unknown ⇒ allowed" is the wrong default on a protected target — the guard
+  cannot prove the command is safe. **Only** affects protected targets: unknown
+  verbs on unprotected contexts always pass, so plugins keep working elsewhere. A
+  verb you classify with `command_overrides` is no longer "unknown". Set with
+  `kubectl-guard config unknown-verb gate`
 - **`actor_policies`** — per-actor overrides of `context_mode` / `namespace_mode`,
   so a known agent label can be held to a stricter posture than a human. The
   actor is resolved exactly as for auditing (`KUBECTL_GUARD_ACTOR` → the `actor`

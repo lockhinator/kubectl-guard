@@ -277,18 +277,37 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// safe) would slip past a blast-radius BLOCK — inconsistent with the sensitive
 	// case and with "block is un-bypassable". (When no override is in play,
 	// blastActive already implies stateAltering, so this is a no-op.)
+	// Unknown-verb strict policy (#72): a verb the guard cannot classify as safe
+	// or state-altering (a plugin, a future kubectl verb, or a gap in the lists) is
+	// normally allowed — "unknown ⇒ allowed". On a PROTECTED target that is the
+	// wrong default: the guard cannot prove the command is safe, so unknown_verb:
+	// gate/deny makes it fail toward gating. unknownStrict makes such a verb skip
+	// the read-only early return so its target's protection is evaluated; on an
+	// unprotected target it still falls through to Allow below.
+	unknownStrict := cfg.UnknownVerbMode() != config.UnknownVerbAllow && IsUnknownCommand(cfg, args)
+
 	stateAltering := IsStateAlteringWith(cfg, args)
-	if !stateAltering && !sensitiveActive && !blastActive {
+	if !stateAltering && !sensitiveActive && !blastActive && !unknownStrict {
 		return Allow, ctx, cfg, nil
 	}
 
 	// The target namespace comes from --namespace/-n, then the namespace baked
 	// into the resolved context, then kubectl's "default". --all-namespaces/-A
 	// spans every namespace, so it is gated when any namespace is protected
-	// (like "get all" spans resources). Only meaningful for state-altering verbs.
+	// (like "get all" spans resources). Evaluated for state-altering verbs, and
+	// for an unknown verb under a strict policy (so its namespace is checked too).
 	namespaceProtected := false
-	if stateAltering {
+	if stateAltering || unknownStrict {
 		namespaceProtected = namespaceTargetProtected(cfg, p, ctx, inClusterNamespace, nsFor)
+	}
+
+	// An unknown verb is only gated/denied when the target is actually protected;
+	// on an unprotected target it passes (plugins keep working elsewhere).
+	unknownProtected := unknownStrict && (contextProtected || namespaceProtected)
+	if unknownProtected && cfg.UnknownVerbMode() == config.UnknownVerbDeny {
+		return Deny, ctx, cfg, fmt.Errorf(
+			"unrecognized verb %q on a protected target and unknown_verb=deny; refusing (classify it with `config command-override`, or set unknown_verb: gate)",
+			LeadingVerb(args))
 	}
 
 	if contextProtected || namespaceProtected || sensitiveActive || blastActive {

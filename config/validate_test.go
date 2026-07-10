@@ -39,6 +39,8 @@ func TestValidate(t *testing.T) {
 		{"valid audit rotation", Config{AuditMaxSizeMB: 100, AuditMaxFiles: 5}, ""},
 		{"empty command override entry", Config{CommandOverrides: CommandOverrides{StateAltering: []string{"x", " "}}}, "command_overrides"},
 		{"valid command overrides", Config{CommandOverrides: CommandOverrides{Safe: []string{"my-read"}, StateAltering: []string{"my-plugin"}}}, ""},
+		{"invalid unknown_verb", Config{UnknownVerb: "maybe"}, "unknown_verb"},
+		{"valid unknown_verb deny", Config{UnknownVerb: UnknownVerbDeny}, ""},
 		{"empty actor policy actor", Config{ActorPolicies: []ActorPolicy{{Actor: ""}}}, "actor_policies"},
 		{"invalid actor policy mode", Config{ActorPolicies: []ActorPolicy{{Actor: "x", ContextMode: "blck"}}}, "context_mode"},
 		{"valid actor policy", Config{ActorPolicies: []ActorPolicy{{Actor: "ci-*", ContextMode: ContextModeBlock}}}, ""},

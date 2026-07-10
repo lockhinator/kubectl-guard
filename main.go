@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"strconv"
@@ -211,7 +213,23 @@ func runBypass(args []string) error {
 			_ = guard.AppendAudit(cfg, e)
 		}
 	}
-	return guard.ExecKubectl(args)
+	return execKubectl(args)
+}
+
+// execKubectl hands off to the real kubectl and only returns if the process
+// replacement never happened. The one failure worth translating is "kubectl is
+// not on PATH": ExecKubectl surfaces a raw Go lookup error (exec.ErrNotFound
+// from RealKubectlPath, or ENOENT if the binary vanished between resolution and
+// syscall.Exec), which is opaque noise for a tool whose whole job is wrapping
+// kubectl. Turn it into an actionable message and exit non-zero; any other exec
+// error propagates unchanged to the top-level handler.
+func execKubectl(args []string) error {
+	err := guard.ExecKubectl(args)
+	if err != nil && (errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist)) {
+		ui.PrintWarning("kubectl not found on PATH. Install kubectl (https://kubernetes.io/docs/tasks/tools/) or fix your PATH.")
+		os.Exit(1)
+	}
+	return err
 }
 
 // boolEnv reports whether the env var is set to a truthy value (1, t, true,
@@ -377,7 +395,7 @@ func runGuard(args []string) error {
 				os.Exit(guard.ExitDenied)
 			}
 			ui.PrintWarning("No guard configuration found; this read-only command runs unprotected. Run 'kubectl-guard config init' to configure.")
-			return guard.ExecKubectl(forwarded)
+			return execKubectl(forwarded)
 		}
 		if noPrompt {
 			// bootstrapMode == prompt: an explicit opt-in to the wizard. Say so,
@@ -483,7 +501,7 @@ func runGuard(args []string) error {
 				ui.PrintWarning("Auto-confirming gated command (--yes / KUBECTL_GUARD_CONFIRM=yes); logged as auto-confirmed.")
 			}
 			audit(guard.OutcomeAutoConfirmed, "yes-flag")
-			return guard.ExecKubectl(forwarded)
+			return execKubectl(forwarded)
 		}
 
 		cmdDesc := guard.GetCommandDescription(redacted)
@@ -597,7 +615,7 @@ func runGuard(args []string) error {
 		switch outcome {
 		case ui.ConfirmApproved:
 			audit(guard.OutcomeConfirmed, "")
-			return guard.ExecKubectl(forwarded)
+			return execKubectl(forwarded)
 		case ui.ConfirmTimedOut:
 			// Fail-safe: an unanswered prompt is a decline, recorded distinctly so
 			// the audit trail shows the command was abandoned, not refused.
@@ -618,7 +636,7 @@ func runGuard(args []string) error {
 			outcome = guard.OutcomeDryRun
 		}
 		audit(outcome, "")
-		return guard.ExecKubectl(forwarded)
+		return execKubectl(forwarded)
 	}
 
 	return nil

@@ -161,6 +161,16 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 
 	p := ParseArgs(args)
 
+	// Sensitive-access policy: the sensitive verbs (exec/cp/attach/… or the
+	// configured sensitive_verbs) reach into a workload with the caller's
+	// credentials, so their risk is about what they can read/reach, not WHERE
+	// they run or whether they mutate state. Computed up front because it must
+	// override BOTH the dry-run skip below (a dry-run still reads/reaches — e.g.
+	// `create secret --dry-run=client -o yaml` echoes the secret) and the
+	// read-only early return further down.
+	sensitiveActive := cfg.SensitiveAccessMode() != config.SensitiveAccessOff &&
+		cfg.IsSensitiveVerb(commandVerb(args))
+
 	// --server points at an arbitrary API server the guard cannot map to a
 	// context name. When context protection is configured, fail closed rather
 	// than allow a command against an unverified (possibly production) cluster.
@@ -184,8 +194,10 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	//
 	// Verbs with no --dry-run flag (exec, port-forward, proxy, ...) are excluded:
 	// they cannot be dry-run, so a --dry-run token on such a command must never
-	// buy an ungated pass.
-	if IsStateAltering(args) && p.IsDryRun() && SupportsDryRun(args) {
+	// buy an ungated pass. A sensitive-access verb is also excluded: dry-run is
+	// about the state-mutation axis, but sensitive-access is about reading/
+	// reaching, which a dry-run does not prevent.
+	if IsStateAltering(args) && p.IsDryRun() && SupportsDryRun(args) && !sensitiveActive {
 		return Allow, ctx, cfg, nil
 	}
 
@@ -211,7 +223,15 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 		case config.InClusterDeny:
 			return Deny, "", cfg, fmt.Errorf("running in-cluster with no named context and in_cluster=deny; refusing (set in_cluster: namespace to gate by the serviceaccount namespace instead)")
 		case config.InClusterAllow:
-			return Allow, "", cfg, nil
+			// in_cluster: allow passes the (unevaluable) context protection
+			// through, but sensitive-access is orthogonal — it gates on what the
+			// verb can read/reach, not on the context — so a sensitive verb must
+			// still be gated even in-cluster. Fall through to the unified gate
+			// below (contextProtected stays false); only a non-sensitive command
+			// gets the blanket allow here.
+			if !sensitiveActive {
+				return Allow, "", cfg, nil
+			}
 		default: // InClusterNamespace: context protection cannot be evaluated
 			// in-cluster, so gate by the serviceaccount namespace instead of the
 			// unresolvable context. contextProtected stays false.
@@ -237,30 +257,54 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// namespace resolution (which may shell out for the context's baked-in
 	// namespace, per tier 2) is deferred until we know the verb mutates state.
 	// This keeps read-only commands (get/describe/logs/...) from spawning a
-	// kubectl subprocess just because namespace protection is configured.
-	if !IsStateAltering(args) {
+	// kubectl subprocess just because namespace protection is configured. A
+	// non-state-altering command that is NOT sensitive passes through here.
+	stateAltering := IsStateAltering(args)
+	if !stateAltering && !sensitiveActive {
 		return Allow, ctx, cfg, nil
 	}
 
 	// The target namespace comes from --namespace/-n, then the namespace baked
 	// into the resolved context, then kubectl's "default". --all-namespaces/-A
 	// spans every namespace, so it is gated when any namespace is protected
-	// (like "get all" spans resources).
-	namespaceProtected := namespaceTargetProtected(cfg, p, ctx, inClusterNamespace, nsFor)
+	// (like "get all" spans resources). Only meaningful for state-altering verbs.
+	namespaceProtected := false
+	if stateAltering {
+		namespaceProtected = namespaceTargetProtected(cfg, p, ctx, inClusterNamespace, nsFor)
+	}
 
-	if contextProtected || namespaceProtected {
-		// Block mode: hard-refuse state-altering commands with no prompt. If
-		// either the matching context or namespace is in block mode, block wins
-		// (most restrictive). --yes cannot bypass this: it only auto-confirms
-		// RequireConfirmation, and Blocked is a separate result.
+	if contextProtected || namespaceProtected || sensitiveActive {
+		// Block mode: hard-refuse with no prompt. If ANY matching signal is in
+		// block mode, block wins (most restrictive). --yes cannot bypass this: it
+		// only auto-confirms RequireConfirmation, and Blocked is a separate result.
 		if (contextProtected && cfg.ContextMode == config.ContextModeBlock) ||
-			(namespaceProtected && cfg.NamespaceMode == config.NamespaceModeBlock) {
+			(namespaceProtected && cfg.NamespaceMode == config.NamespaceModeBlock) ||
+			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) {
 			return Blocked, ctx, cfg, nil
 		}
 		return RequireConfirmation, ctx, cfg, nil
 	}
 
 	return Allow, ctx, cfg, nil
+}
+
+// commandVerb returns the lower-cased kubectl verb the guard resolves for args,
+// or "" when none is found. It is a thin wrapper over ExtractCommand for callers
+// that only need the verb.
+func commandVerb(args []string) string {
+	cmd, _ := ExtractCommand(args)
+	return cmd
+}
+
+// IsSensitiveAccess reports whether the sensitive-access policy applies to args
+// under cfg (the policy is enabled and the verb is in the sensitive set). Used by
+// user-facing messages so a sensitive-access gate is named as such rather than as
+// a protected context.
+func IsSensitiveAccess(cfg *config.Config, args []string) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.SensitiveAccessMode() != config.SensitiveAccessOff && cfg.IsSensitiveVerb(commandVerb(args))
 }
 
 // namespaceTargetProtected reports whether the command targets a protected

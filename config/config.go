@@ -36,6 +36,17 @@ const (
 	AuditModeOff   = "off"   // log nothing
 )
 
+// Sensitive-access policies gate interactive / data-movement verbs (exec, cp,
+// attach, debug, port-forward, proxy) on EVERY context — not just protected ones
+// — because their risk is about what they can read/reach (secrets in a pod, a
+// root shell on a node via `debug`, a tunnel to a workload), independent of where
+// they run.
+const (
+	SensitiveAccessOff   = "off"   // default: these verbs gate only on protected targets
+	SensitiveAccessGate  = "gate"  // require confirmation on any context
+	SensitiveAccessBlock = "block" // refuse on any context
+)
+
 // In-cluster policies decide what happens when the guard runs with no named
 // context (inside a pod on the serviceaccount config, or CI with an in-cluster
 // kubeconfig) and protected contexts are configured. Without a context name the
@@ -53,8 +64,10 @@ const (
 	// context gating — a full passthrough. (Applying namespace protection here
 	// would be identical to InClusterNamespace, since context protection is
 	// unevaluable in-cluster either way, which is why "allow" is distinct.)
-	// Resource protection still applies (it is global and evaluated earlier). A
-	// deliberately-permissive opt-in.
+	// Resource protection still applies (it is global and evaluated earlier), and
+	// so does sensitive-access gating: sensitive verbs are gated on EVERY context,
+	// which "allow" does not override. A deliberately-permissive opt-in for the
+	// context/namespace axis only.
 	InClusterAllow = "allow"
 )
 
@@ -129,6 +142,14 @@ type Config struct {
 	// paths already resolve without blocking.
 	ConfirmTimeoutSeconds int `yaml:"confirm_timeout_seconds,omitempty"`
 
+	// SensitiveAccess gates the sensitive-access verbs on EVERY context:
+	// "off" (default), "gate" (confirm), or "block" (refuse). See SensitiveVerbs.
+	SensitiveAccess string `yaml:"sensitive_access,omitempty"`
+
+	// SensitiveVerbs overrides which verbs the sensitive-access policy applies to.
+	// Empty uses the defaults: exec, cp, attach, debug, port-forward, proxy.
+	SensitiveVerbs []string `yaml:"sensitive_verbs,omitempty"`
+
 	// InCluster is the policy for running with no named context (in a pod, or CI
 	// with an in-cluster kubeconfig): "namespace" (default) gates by the resolved
 	// serviceaccount namespace, "deny" fails closed, "allow" passes through. Empty
@@ -148,6 +169,46 @@ type Config struct {
 	// api-resources cache before matching and is NOT serialized. nil means "not
 	// discovered / built-ins only".
 	discovered map[string]string `yaml:"-"`
+}
+
+// defaultSensitiveVerbs are the verbs the sensitive-access policy applies to
+// when SensitiveVerbs is not overridden: interactive / data-movement / reach
+// verbs that read into or open a channel to a workload with the caller's
+// credentials. debug is included because `debug node/...` gives a root shell on
+// the node and `debug` ephemeral containers can read a running pod's secrets and
+// serviceaccount token — the same exfiltration path as exec. proxy exposes the
+// whole API server locally, like port-forward tunnels to one workload.
+var defaultSensitiveVerbs = []string{"exec", "cp", "attach", "debug", "port-forward", "proxy"}
+
+// SensitiveAccessMode returns the sensitive-access policy, defaulting to off.
+// An invalid value is caught by Validate (fail-closed), so off is only reached
+// for the genuine default.
+func (c *Config) SensitiveAccessMode() string {
+	switch c.SensitiveAccess {
+	case SensitiveAccessGate, SensitiveAccessBlock:
+		return c.SensitiveAccess
+	default:
+		return SensitiveAccessOff
+	}
+}
+
+// IsSensitiveVerb reports whether verb is in the sensitive-access verb set — the
+// configured override, or the defaults. Comparison is case-insensitive and
+// trims whitespace on the configured entries, so a quoted YAML value like
+// `- " exec "` still matches (it would otherwise pass validation but silently
+// never match — a fail-open on the user's intent).
+func (c *Config) IsSensitiveVerb(verb string) bool {
+	verbs := c.SensitiveVerbs
+	if len(verbs) == 0 {
+		verbs = defaultSensitiveVerbs
+	}
+	verb = strings.TrimSpace(verb)
+	for _, v := range verbs {
+		if strings.EqualFold(strings.TrimSpace(v), verb) {
+			return true
+		}
+	}
+	return false
 }
 
 // InClusterMode returns the configured in-cluster policy, defaulting to

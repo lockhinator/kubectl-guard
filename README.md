@@ -541,6 +541,14 @@ Fields:
   the interactive prompt is affected; `--json`, `--yes`, and no-TTY paths already
   resolve without blocking. Capped at one year (`31536000`); use `0` for a
   deliberate wait-forever
+- **`discover_short_names`** — `true` (default) or `false`. When enabled, the
+  guard discovers **CRD short names** by querying `kubectl api-resources` (cached
+  ~10 min per cluster), so protecting a CRD by its kind also blocks its short
+  name — e.g. with `secretstore` protected, `kubectl get ss` is blocked, not just
+  `kubectl get secretstore`. Discovery is best-effort and **additive**: it can
+  only ever add short names, never weaken protection, and if `api-resources` fails
+  (offline, RBAC) the built-in short names still work. Set to `false` for
+  air-gapped or latency-sensitive use
 
 Manage via CLI:
 

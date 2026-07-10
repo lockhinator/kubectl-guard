@@ -135,6 +135,16 @@ type Config struct {
 	// unset. Empty falls back to the OS username.
 	Actor string `yaml:"actor,omitempty"`
 
+	// ActorPolicies are per-actor overrides of the global context_mode /
+	// namespace_mode, so a known agent label can be held to a stricter posture
+	// than a human ("agents never mutate prod, humans may confirm"). The actor is
+	// resolved exactly as for auditing (KUBECTL_GUARD_ACTOR → actor → OS user) and
+	// matched by glob. An override can only make a mode STRICTER (confirm → block),
+	// never weaker — KUBECTL_GUARD_ACTOR is self-asserted, so a self-named actor
+	// must not be able to relax protection below the global posture. See
+	// EffectiveModesForActor.
+	ActorPolicies []ActorPolicy `yaml:"actor_policies,omitempty"`
+
 	// BlockImpersonation, when true, denies any command carrying --as / --as-group
 	// / --as-uid on a protected context. Impersonation is a common
 	// privilege-escalation and audit-evasion vector. Off by default.
@@ -504,6 +514,100 @@ func (c *Config) SetBlastRadiusMode(mode string) bool {
 	}
 	c.BlastRadius = mode
 	return true
+}
+
+// ActorPolicy overrides the global context_mode / namespace_mode for a specific
+// actor (matched by glob). An empty mode field means "inherit the global mode".
+type ActorPolicy struct {
+	// Actor is the actor name or glob pattern this policy applies to (e.g.
+	// "claude-code", "ci-*").
+	Actor string `yaml:"actor"`
+	// ContextMode overrides context_mode for matching actors ("confirm"|"block"),
+	// or "" to inherit the global context_mode.
+	ContextMode string `yaml:"context_mode,omitempty"`
+	// NamespaceMode overrides namespace_mode for matching actors, or "" to inherit.
+	NamespaceMode string `yaml:"namespace_mode,omitempty"`
+}
+
+// effectiveContextMode / effectiveNamespaceMode return the configured global mode
+// with the safe default filled in. Validate rejects an invalid value and
+// ApplyDefaults fills the common case, but a config that skipped ApplyDefaults
+// (or set only one field) must still resolve to a valid mode here.
+func (c *Config) effectiveContextMode() string {
+	if c.ContextMode == ContextModeBlock {
+		return ContextModeBlock
+	}
+	return ContextModeConfirm
+}
+
+func (c *Config) effectiveNamespaceMode() string {
+	if c.NamespaceMode == NamespaceModeBlock {
+		return NamespaceModeBlock
+	}
+	return NamespaceModeConfirm
+}
+
+// EffectiveModesForActor returns the context_mode and namespace_mode that apply
+// to the given actor: the global modes, made STRICTER by any matching actor
+// policy. Because block is the most restrictive mode and a policy can only
+// upgrade confirm → block (never downgrade), a matching actor policy can tighten
+// protection for a known agent label but never weaken it below the global
+// posture — the correct stance for a self-asserted identity. An unset or
+// unmatched actor yields exactly the global modes (unchanged behavior).
+func (c *Config) EffectiveModesForActor(actor string) (contextMode, namespaceMode string) {
+	contextMode = c.effectiveContextMode()
+	namespaceMode = c.effectiveNamespaceMode()
+	for _, ap := range c.ActorPolicies {
+		if !matchGlob(ap.Actor, actor) {
+			continue
+		}
+		if ap.ContextMode == ContextModeBlock {
+			contextMode = ContextModeBlock
+		}
+		if ap.NamespaceMode == NamespaceModeBlock {
+			namespaceMode = NamespaceModeBlock
+		}
+	}
+	return contextMode, namespaceMode
+}
+
+// SetActorPolicy adds or replaces the policy for an exact actor pattern, setting
+// its context and namespace modes. An empty mode string means "inherit the
+// global mode". It returns false if the actor is empty or a supplied mode is
+// invalid (the valid-value checks are shared with Validate).
+func (c *Config) SetActorPolicy(actor, contextMode, namespaceMode string) bool {
+	if strings.TrimSpace(actor) == "" {
+		return false
+	}
+	if contextMode != "" && !validContextMode(contextMode) {
+		return false
+	}
+	if namespaceMode != "" && !validNamespaceMode(namespaceMode) {
+		return false
+	}
+	for i := range c.ActorPolicies {
+		if c.ActorPolicies[i].Actor == actor {
+			c.ActorPolicies[i].ContextMode = contextMode
+			c.ActorPolicies[i].NamespaceMode = namespaceMode
+			return true
+		}
+	}
+	c.ActorPolicies = append(c.ActorPolicies, ActorPolicy{
+		Actor: actor, ContextMode: contextMode, NamespaceMode: namespaceMode,
+	})
+	return true
+}
+
+// RemoveActorPolicy deletes the policy for an exact actor pattern, reporting
+// whether one was present.
+func (c *Config) RemoveActorPolicy(actor string) bool {
+	for i := range c.ActorPolicies {
+		if c.ActorPolicies[i].Actor == actor {
+			c.ActorPolicies = append(c.ActorPolicies[:i], c.ActorPolicies[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // resourceShortNames maps kubectl built-in short names to their canonical

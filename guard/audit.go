@@ -101,6 +101,14 @@ func currentUser() string {
 	return ""
 }
 
+// CurrentActor resolves the actor that drives the current command (the same
+// resolution used for auditing: KUBECTL_GUARD_ACTOR → config actor → OS user).
+// It is exported so the CLI can derive the actor-effective modes for its
+// human-facing messages, matching the decision the guard already made.
+func CurrentActor(cfg *config.Config) string {
+	return resolveActor(cfg, currentUser())
+}
+
 // resolveActor determines who drove the command, in priority order:
 //  1. KUBECTL_GUARD_ACTOR env var (explicit opt-in, e.g. "claude-code")
 //  2. config.Actor static default

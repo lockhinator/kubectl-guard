@@ -567,6 +567,27 @@ Fields:
   gated (it changes nothing, whatever its scope). Composes most-restrictive with
   context/namespace protection. Set it with
   `kubectl-guard config blast-radius gate`
+- **`actor_policies`** — per-actor overrides of `context_mode` / `namespace_mode`,
+  so a known agent label can be held to a stricter posture than a human. The
+  actor is resolved exactly as for auditing (`KUBECTL_GUARD_ACTOR` → the `actor`
+  config → OS user) and matched by **glob**; a matching policy's mode replaces the
+  global mode for that actor. An override can only make a mode **stricter**
+  (`confirm` → `block`), never weaker — `KUBECTL_GUARD_ACTOR` is self-asserted, so
+  a self-named actor must not be able to relax protection below the global
+  posture. An unset or unmatched actor uses the global modes unchanged. This is
+  **policy-shaping, not authentication**: an actor can lie about who it is, so it
+  is for making the *default* posture stricter for honest agent frameworks, not a
+  security boundary. Manage with `kubectl-guard config actor-policy claude-code
+  block` (or `… <actor> <ctx-mode> [ns-mode]`, `… remove <actor>`):
+
+  ```yaml
+  actor_policies:
+    - actor: "claude-code"   # exact or glob
+      context_mode: block    # agents never mutate protected contexts
+      namespace_mode: block
+    - actor: "ci-*"
+      context_mode: confirm
+  ```
 - **`in_cluster`** — policy for running with **no named context** (inside a pod
   on the serviceaccount config, or CI with an in-cluster kubeconfig), when
   protected contexts are configured. `namespace` (default) gates by the resolved

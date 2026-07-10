@@ -61,6 +61,23 @@ func (c *Config) Validate() []string {
 			"blast_radius: %q is not valid (want %q, %q, or %q)",
 			c.BlastRadius, BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock))
 	}
+	for i, ap := range c.ActorPolicies {
+		if strings.TrimSpace(ap.Actor) == "" {
+			problems = append(problems, fmt.Sprintf("actor_policies: entry %d has an empty actor", i))
+		} else if err := validateGlobPattern(ap.Actor); err != nil {
+			problems = append(problems, fmt.Sprintf("actor_policies: actor %q %v", ap.Actor, err))
+		}
+		if ap.ContextMode != "" && !validContextMode(ap.ContextMode) {
+			problems = append(problems, fmt.Sprintf(
+				"actor_policies[%d].context_mode: %q is not valid (want %q or %q)",
+				i, ap.ContextMode, ContextModeConfirm, ContextModeBlock))
+		}
+		if ap.NamespaceMode != "" && !validNamespaceMode(ap.NamespaceMode) {
+			problems = append(problems, fmt.Sprintf(
+				"actor_policies[%d].namespace_mode: %q is not valid (want %q or %q)",
+				i, ap.NamespaceMode, NamespaceModeConfirm, NamespaceModeBlock))
+		}
+	}
 
 	for _, p := range c.ProtectedContexts {
 		if err := validateGlobPattern(p); err != nil {

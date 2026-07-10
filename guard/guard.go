@@ -284,11 +284,16 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	}
 
 	if contextProtected || namespaceProtected || sensitiveActive || blastActive {
+		// Per-actor policy: a matching actor policy can make context/namespace
+		// protection STRICTER for a known actor (e.g. an agent label gets block
+		// where a human gets confirm). It never weakens the global posture.
+		ctxMode, nsMode := cfg.EffectiveModesForActor(resolveActor(cfg, currentUser()))
+
 		// Block mode: hard-refuse with no prompt. If ANY matching signal is in
 		// block mode, block wins (most restrictive). --yes cannot bypass this: it
 		// only auto-confirms RequireConfirmation, and Blocked is a separate result.
-		if (contextProtected && cfg.ContextMode == config.ContextModeBlock) ||
-			(namespaceProtected && cfg.NamespaceMode == config.NamespaceModeBlock) ||
+		if (contextProtected && ctxMode == config.ContextModeBlock) ||
+			(namespaceProtected && nsMode == config.NamespaceModeBlock) ||
 			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) ||
 			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) {
 			return Blocked, ctx, cfg, nil

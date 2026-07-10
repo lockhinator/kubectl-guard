@@ -37,6 +37,7 @@ var guardConfigSubcommands = map[string]bool{
 	"context-mode":     true,
 	"namespace-mode":   true,
 	"blast-radius":     true,
+	"actor-policy":     true,
 	"audit-mode":       true,
 	"audit":            true,
 	"path":             true,
@@ -344,8 +345,15 @@ func runGuard(args []string) error {
 		// message and audit reason are accurate.
 		blockReason := "protected-resource"
 		if !guard.MatchesProtectedResource(cfg, forwarded) {
+			// Use the actor-effective modes, so an actor-policy upgrade (confirm →
+			// block for a known agent) is labeled as a context/namespace block, the
+			// same decision the guard made.
+			ctxMode := config.ContextModeConfirm
+			if cfg != nil {
+				ctxMode, _ = cfg.EffectiveModesForActor(guard.CurrentActor(cfg))
+			}
 			switch {
-			case cfg != nil && cfg.IsContextProtected(ctx) && cfg.ContextMode == config.ContextModeBlock:
+			case cfg != nil && cfg.IsContextProtected(ctx) && ctxMode == config.ContextModeBlock:
 				blockReason = "protected-context-block-mode"
 			case guard.IsSensitiveAccess(cfg, forwarded) && cfg != nil && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock:
 				blockReason = "sensitive-access-block"
@@ -755,6 +763,59 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "actor-policy [<actor> <context-mode> [namespace-mode] | remove <actor>]",
+		Short: "Show or set per-actor context/namespace mode overrides",
+		Long: "Per-actor overrides of the global context/namespace mode, so a known\n" +
+			"actor label (KUBECTL_GUARD_ACTOR, matched by glob) can be held to a\n" +
+			"stricter posture than a human. An override can only tighten a mode\n" +
+			"(confirm -> block), never weaken it.\n\n" +
+			"  actor-policy                          list the policies\n" +
+			"  actor-policy <actor> <ctx-mode> [ns]  set/replace a policy\n" +
+			"  actor-policy remove <actor>           delete a policy\n\n" +
+			"Modes are confirm|block. Use \"-\" for a mode to inherit the global one.",
+		Args: cobra.MaximumNArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				printActorPolicies(cfg)
+				return nil
+			}
+			if args[0] == "remove" {
+				if len(args) != 2 {
+					return fmt.Errorf("usage: config actor-policy remove <actor>")
+				}
+				if !cfg.RemoveActorPolicy(args[1]) {
+					return fmt.Errorf("no actor policy for %q", args[1])
+				}
+				if err := config.Save(cfg); err != nil {
+					return err
+				}
+				ui.PrintSuccess("Removed actor policy: " + args[1])
+				return nil
+			}
+			if len(args) < 2 {
+				return fmt.Errorf("usage: config actor-policy <actor> <context-mode> [namespace-mode] (mode is confirm|block, or - to inherit)")
+			}
+			ctxMode := normalizeInheritMode(args[1])
+			nsMode := ""
+			if len(args) == 3 {
+				nsMode = normalizeInheritMode(args[2])
+			}
+			if !cfg.SetActorPolicy(args[0], ctxMode, nsMode) {
+				return fmt.Errorf("invalid actor policy (actor must be non-empty; modes must be %q, %q, or - to inherit)", config.ContextModeConfirm, config.ContextModeBlock)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess(fmt.Sprintf("Actor policy set: %s (context=%s namespace=%s)", args[0], displayMode(ctxMode), displayMode(nsMode)))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "audit",
 		Short: "Show the audit log path and recent entries",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -906,10 +967,42 @@ func printConfig() error {
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
 
+	printActorPolicies(cfg)
+
 	auditPath, _ := config.AuditPath(cfg)
 	ui.PrintInfo("Audit log: " + auditPath)
 
 	return nil
+}
+
+// normalizeInheritMode maps the CLI "-" sentinel (and empty) to "", meaning
+// "inherit the global mode", and passes any other value through for validation.
+func normalizeInheritMode(m string) string {
+	if m == "-" {
+		return ""
+	}
+	return m
+}
+
+// displayMode renders an actor-policy mode for output: "" (inherit) shows as
+// "(inherit)".
+func displayMode(m string) string {
+	if m == "" {
+		return "(inherit)"
+	}
+	return m
+}
+
+// printActorPolicies lists the configured per-actor mode overrides.
+func printActorPolicies(cfg *config.Config) {
+	ui.PrintInfo("Actor policies:")
+	if cfg == nil || len(cfg.ActorPolicies) == 0 {
+		fmt.Println("  (none)")
+		return
+	}
+	for _, ap := range cfg.ActorPolicies {
+		fmt.Printf("  - %s: context=%s namespace=%s\n", ap.Actor, displayMode(ap.ContextMode), displayMode(ap.NamespaceMode))
+	}
 }
 
 func loadOrCreateConfig() (*config.Config, error) {
@@ -991,6 +1084,10 @@ Config subcommands:
                              Gate wide-scope / bulk mutations (delete --all,
                              apply --prune, a selector or --all-namespaces on a
                              destructive verb, a force delete) on every context
+  actor-policy [<actor> <ctx-mode> [ns-mode] | remove <actor>]
+                             Per-actor context/namespace mode overrides (an
+                             agent label can be held to block where a human
+                             confirms); an override can only tighten, never weaken
   audit-mode [all|gated|off] Show or set what the audit log records
   audit                      Show the audit log path and recent entries
   validate                   Check the config for problems (exit non-zero if any;

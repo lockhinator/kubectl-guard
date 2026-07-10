@@ -23,6 +23,7 @@ const (
 	EnvStrict             = "KUBECTL_GUARD_STRICT"      // fail closed on a group/world-writable config
 	EnvConfig             = "KUBECTL_GUARD_CONFIG"      // override the config file location
 	EnvAuditLog           = "KUBECTL_GUARD_AUDIT_LOG"   // override the audit log location
+	EnvReadOnly           = "KUBECTL_GUARD_READONLY"    // global freeze: block all state-altering commands
 )
 
 // boolEnv reports whether an env var is set to a truthy value (1, t, true, yes,

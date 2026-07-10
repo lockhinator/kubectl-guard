@@ -87,6 +87,10 @@ func run() error {
 			return runGuard(os.Args[1:])
 		case "doctor":
 			return runDoctor()
+		case "freeze":
+			return runFreeze(true)
+		case "unfreeze":
+			return runFreeze(false)
 		case "explain":
 			return runExplain(os.Args[2:])
 		case "completion", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
@@ -202,6 +206,27 @@ func orUnknown(s string) string {
 		return "(unknown)"
 	}
 	return s
+}
+
+// runFreeze toggles global read-only / freeze mode (the incident panic button).
+// Enabling it strengthens protection; disabling it (unfreeze) weakens protection,
+// so the change routes through saveConfig — audited, and gated by
+// require_confirm_weakening on unfreeze.
+func runFreeze(on bool) error {
+	cfg, err := loadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	cfg.ReadOnly = on
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
+	if on {
+		ui.PrintSuccess("Read-only mode ENABLED (freeze): everything except known-safe reads is now blocked, everywhere (including unclassified plugin verbs). Reads still pass. Run 'kubectl-guard unfreeze' to lift.")
+	} else {
+		ui.PrintSuccess("Read-only mode DISABLED (unfreeze): state-altering commands are gated normally again.")
+	}
+	return nil
 }
 
 // runBypass executes the command against the real kubectl with the guard fully
@@ -501,6 +526,12 @@ func runGuard(args []string) error {
 				ctxMode, _ = cfg.EffectiveModesForActor(guard.CurrentActor(cfg))
 			}
 			switch {
+			case cfg != nil && cfg.ReadOnlyActive() && !guard.IsSafeCommandWith(cfg, forwarded):
+				// Global read-only/freeze is checked before context gating in the
+				// core and blocks anything that is not a known-safe read, so a
+				// non-safe block under read-only is that, not a context/namespace
+				// block. (A genuine dry-run would not reach Blocked.)
+				blockReason = "read-only-mode"
 			case cfg != nil && cfg.IsContextProtected(ctx) && ctxMode == config.ContextModeBlock:
 				blockReason = "protected-context-block-mode"
 			case guard.IsSensitiveAccess(cfg, forwarded) && cfg != nil && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock:
@@ -532,6 +563,8 @@ func runGuard(args []string) error {
 				}
 			case "protected-context-block-mode":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
+			case "read-only-mode":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s — global read-only mode is active (freeze); everything except known-safe reads is refused, everywhere. Reads still pass. Run 'kubectl-guard unfreeze' or clear KUBECTL_GUARD_READONLY to lift.", cmdDesc))
 			case "sensitive-access-block":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s is a sensitive-access verb (sensitive_access: block; refused on every context)", cmdDesc))
 			case "blast-radius-block":
@@ -1726,6 +1759,9 @@ Usage:
                                       Preflight: would this be gated, and why?
                                       (runs the decision without kubectl/prompt/audit)
   kubectl-guard doctor                Check PATH-shadowing interception
+  kubectl-guard freeze                Global read-only mode: block ALL
+                                      state-altering commands (incident switch)
+  kubectl-guard unfreeze              Lift read-only mode
   kubectl-guard --version             Print version (or -V)
   kubectl-guard --help                Print this help
 

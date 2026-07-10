@@ -20,6 +20,7 @@ var safeCommands = map[string]bool{
 	"get":           true,
 	"describe":      true,
 	"logs":          true,
+	"events":        true, // native read since k8s 1.23 (like `get events`)
 	"top":           true,
 	"explain":       true,
 	"api-resources": true,

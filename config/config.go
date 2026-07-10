@@ -247,6 +247,13 @@ type Config struct {
 	// KUBECTL_GUARD_STRICT env var. See InsecureConfigPerms / StrictPerms.
 	StrictConfigPerms bool `yaml:"strict_config_perms,omitempty"`
 
+	// ReadOnly is the global freeze / incident panic button. When true, EVERY
+	// state-altering command is Blocked regardless of context/namespace/actor;
+	// reads pass, a genuine --dry-run passes, and --yes does NOT override (it is
+	// absolute, not a confirm). Toggled by `freeze`/`unfreeze`, or per-invocation
+	// via the KUBECTL_GUARD_READONLY env var. See ReadOnlyActive.
+	ReadOnly bool `yaml:"read_only,omitempty"`
+
 	// InCluster is the policy for running with no named context (in a pod, or CI
 	// with an in-cluster kubeconfig): "namespace" (default) gates by the resolved
 	// serviceaccount namespace, "deny" fails closed, "allow" passes through. Empty
@@ -655,6 +662,16 @@ func (c *Config) StrictPerms() bool {
 		return true
 	}
 	return boolEnv(EnvStrict)
+}
+
+// ReadOnlyActive reports whether global read-only / freeze mode is on, from
+// either the config field or the KUBECTL_GUARD_READONLY env var (a per-invocation
+// override, e.g. `KUBECTL_GUARD_READONLY=1 kubectl ...` during an incident).
+func (c *Config) ReadOnlyActive() bool {
+	if c != nil && c.ReadOnly {
+		return true
+	}
+	return boolEnv(EnvReadOnly)
 }
 
 // Save writes the config to disk atomically.

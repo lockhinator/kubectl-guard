@@ -54,6 +54,9 @@ func WeakensProtection(old, new *Config) []string {
 	}
 
 	// Disabled guards / reduced audit coverage.
+	if old.ReadOnly && !new.ReadOnly {
+		w = append(w, "disabled read_only (unfreeze)")
+	}
 	if old.BlockImpersonation && !new.BlockImpersonation {
 		w = append(w, "disabled block_impersonation")
 	}

@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/lockhinator/kubectl-guard/config"
 )
 
 // safeCommands are read-only top-level commands that don't modify cluster
@@ -250,6 +252,19 @@ type ParsedArgs struct {
 	HasNamespace  bool
 	AllNamespaces bool
 
+	// All is kubectl's --all flag: "select ALL resources of the given type in
+	// the namespace". It is distinct from --all-namespaces/-A. On `delete TYPE`
+	// it replaces the NAME argument, so the guard cannot enumerate what the
+	// command targets. Verified against `kubectl delete --help` (v1.33): --all is
+	// boolean and has no single-letter shorthand.
+	All bool
+
+	// HasSelector reports whether a selector flag was given that stands in for an
+	// explicit NAME: -l/--selector (label) OR --field-selector. On
+	// `delete TYPE -l label` / `delete TYPE --field-selector metadata.name=x` the
+	// affected objects are chosen server-side, so they are not knowable from argv.
+	HasSelector bool
+
 	// Raw is the value of --raw: a literal API-server path, e.g.
 	// "/api/v1/namespaces/default/secrets/db-creds". kubectl requests it
 	// verbatim, so no resource token ever appears in the command and resource
@@ -428,6 +443,15 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 				return true
 			}
 			return false
+		case c == 'l':
+			// -l / --selector stands in for a NAME argument; record that the
+			// command's targets cannot be enumerated from argv. It consumes the
+			// rest of the token, or the next argument.
+			p.HasSelector = true
+			if len(shorthands) > 1 {
+				return false
+			}
+			return len(rest) > 0
 		case shortTakesValue[c]:
 			// consumes the rest of the token, or the next argument.
 			if len(shorthands) > 1 {
@@ -565,6 +589,34 @@ func ParseArgs(args []string) ParsedArgs {
 					}
 				} else {
 					p.AllNamespaces = true
+				}
+			case "--all":
+				// Boolean, like --all-namespaces: it must NOT consume the next
+				// argument, or a following verb would be swallowed. --all=false
+				// selects nothing extra and must not be treated as wide-scope.
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.All = b
+					} else {
+						p.All = true
+					}
+				} else {
+					p.All = true
+				}
+			case "--selector", "--field-selector":
+				// Both take a value and both stand in for the NAME argument:
+				// `delete ns -l env=prod` and `delete ns --field-selector
+				// metadata.name=kube-system` name no object positionally, so the
+				// affected namespaces are chosen server-side and cannot be read off
+				// argv. --field-selector must be consumed here too, or its value
+				// lands in the positional stream (a verb-shift / mis-parse) AND the
+				// namespace-name gate is bypassed (`delete namespace
+				// --field-selector metadata.name=kube-system` targets kube-system
+				// but names it nowhere the guard can check). Verified accepted on
+				// `kubectl delete` (v1.33).
+				p.HasSelector = true
+				if !hasInline && i+1 < len(args) {
+					skipNext = true
 				}
 			case "--raw":
 				p.HasRaw = true
@@ -1157,6 +1209,154 @@ func RedactArgs(args []string) []string {
 		}
 	}
 	return out
+}
+
+// namespaceKind is the canonical form config.NormalizeResource produces for
+// "namespace", "namespaces", "ns", and "ns.v1".
+const namespaceKind = "namespace"
+
+// dashDashPayloadVerbs are the verbs for which a "--" separator introduces a
+// FOREIGN command, not more kubectl arguments. `kubectl exec pod -- kubectl
+// delete ns/x` runs kubectl inside the pod; the tokens after "--" are that
+// container command's argv and must never be read as kubectl targets.
+//
+// Every OTHER verb — delete, edit, patch, label, ... — uses "--" only to end
+// flag parsing, so `kubectl delete -- namespace kube-system` still deletes the
+// namespace. Treating "--" as a payload boundary for those verbs let a protected
+// namespace be deleted ungated (a real bypass). Verified against kubectl v1.33:
+// exec/run/debug document `-- COMMAND`; delete/edit pass post-"--" tokens to the
+// resource builder as TYPE/NAME.
+var dashDashPayloadVerbs = map[string]bool{
+	"exec": true, "run": true, "debug": true,
+	"attach": true, "cp": true, "port-forward": true, "proxy": true,
+}
+
+// NamespaceTargets describes how a command addresses the `namespace` KIND, as
+// opposed to the namespace a command runs *in* (which comes from --namespace/-n
+// or the context). `kubectl delete namespace kube-system` carries no -n flag, so
+// namespace protection would otherwise resolve the target namespace to "default"
+// and never notice that the object being destroyed IS a protected namespace.
+type NamespaceTargets struct {
+	// Kind is true when the command's resource type is namespace/ns, in any of
+	// the forms kubectl accepts.
+	Kind bool
+	// Names are the namespace names addressed positionally, from either
+	// `namespace NAME...` or `ns/NAME` type/name tokens.
+	Names []string
+	// Wide is true when the command targets the namespace kind with --all or a
+	// label selector instead of names. kubectl's own usage is
+	// `delete TYPE [(NAME | -l label | --all)]`, so in that case the affected
+	// namespaces are NOT knowable from argv and the guard must fail closed.
+	Wide bool
+}
+
+// namespaceTargetsFrom extracts the namespace-kind targets from an already
+// parsed command.
+//
+// kubectl accepts several shapes, all of which must be recognized or the gate is
+// trivially bypassed. Verified against `kubectl delete --help` (v1.33), whose
+// usage line is `kubectl delete TYPE [(NAME | -l label | --all)]` and whose own
+// example is `kubectl delete pod,service baz foo`:
+//
+//	delete namespace kube-system        bare kind, one name
+//	delete ns kube-system               short name
+//	delete namespaces a b c             plural kind, several names
+//	delete ns/kube-system               type/name token
+//	delete pod/x ns/kube-system         type/name mixed with other kinds
+//	delete ns,pod foo                   COMMA TYPE LIST: names apply to every type
+//	delete namespace --all              wide: names unknowable
+//	delete ns -l env=prod               wide: names unknowable
+//
+// Only tokens before the "--" separator are resource tokens; an "ns/x" inside an
+// exec payload is a foreign command's argument, not a kubectl target.
+func namespaceTargetsFrom(p ParsedArgs) NamespaceTargets {
+	var out NamespaceTargets
+
+	v := verbPositionalIndex(p.Positional)
+	if v < 0 {
+		return out
+	}
+	// For a resource verb, tokens after "--" are still TYPE/NAME arguments, so
+	// scan through the end of the positional list. Only for the exec-family verbs
+	// is "--" a foreign-command boundary; there, clip at the separator so an
+	// `exec pod -- kubectl delete ns/x` payload is not read as a target.
+	end := len(p.Positional)
+	if dashDashPayloadVerbs[strings.ToLower(p.Positional[v])] {
+		end = p.PositionalsBeforeSep
+	}
+	if v+1 >= end {
+		return out
+	}
+	toks := p.Positional[v+1 : end]
+
+	// The first positional after the verb is the TYPE (or a comma-separated TYPE
+	// list). A bare namespace kind there means every later positional is a NAME
+	// of a namespace.
+	bareKindIsNamespace := false
+	for _, part := range strings.Split(toks[0], ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.Contains(part, "/") {
+			continue
+		}
+		if config.NormalizeResource(part) == namespaceKind {
+			bareKindIsNamespace = true
+		}
+	}
+
+	// Every token is comma-split. kubectl only comma-splits the TYPE argument, not
+	// a NAME, so this over-splits a name like "foo,kube-system" into two names.
+	// That is deliberately kept: it only ever adds candidate names (fail-CLOSED,
+	// it can gate more but never less), and a real namespace name cannot contain a
+	// comma anyway (RFC 1123 label). Splitting names also catches a comma list of
+	// type/name tokens (`ns/a,ns/b`) without needing to know kubectl's exact rule.
+	for i, tok := range toks {
+		for _, part := range strings.Split(tok, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// A "type/name" token names its own kind, wherever it appears — so
+			// `delete pod/x ns/kube-system` is caught even though the leading
+			// TYPE is not a namespace.
+			if slash := strings.IndexByte(part, '/'); slash >= 0 {
+				if config.NormalizeResource(part[:slash]) == namespaceKind && slash+1 < len(part) {
+					out.Kind = true
+					out.Names = append(out.Names, part[slash+1:])
+				}
+				continue
+			}
+			if i == 0 {
+				continue // the TYPE token itself, not a name
+			}
+			if bareKindIsNamespace {
+				out.Names = append(out.Names, part)
+			}
+		}
+	}
+
+	if bareKindIsNamespace {
+		out.Kind = true
+	}
+	if out.Kind && len(out.Names) == 0 && (p.All || p.HasSelector) {
+		// `delete namespace --all` / `delete ns -l env=prod`: the command targets
+		// namespaces but names none. We cannot prove a protected namespace is not
+		// among them.
+		out.Wide = true
+	}
+	return out
+}
+
+// NamespaceNameTargets returns the namespace names a command addresses by name,
+// or nil when it does not target the namespace kind.
+func NamespaceNameTargets(args []string) []string {
+	return namespaceTargetsFrom(ParseArgs(args)).Names
+}
+
+// NamespaceKindIsWide reports whether the command targets the namespace kind
+// with --all or a label selector, so the affected namespaces cannot be read off
+// the command line.
+func NamespaceKindIsWide(args []string) bool {
+	return namespaceTargetsFrom(ParseArgs(args)).Wide
 }
 
 // MatchesProtectedResource reports whether args target a protected resource,

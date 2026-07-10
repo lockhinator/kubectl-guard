@@ -197,14 +197,63 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 }
 
 // namespaceTargetProtected reports whether the command targets a protected
-// namespace. --all-namespaces/-A spans every namespace, so it is treated as
-// protected whenever any namespace pattern is configured; otherwise the
-// resolved namespace is matched against the configured patterns.
+// namespace, by any of three routes (any match gates):
+//
+//  1. --all-namespaces/-A spans every namespace, so it is treated as protected
+//     whenever any namespace pattern is configured;
+//  2. the command's resource kind is `namespace` and one of the namespace NAMES
+//     it addresses is protected — `kubectl delete namespace kube-system` carries
+//     no -n flag, so route 3 would resolve "default" and miss it entirely;
+//  3. the namespace the command runs IN (from -n, the context, or "default")
+//     matches a protected pattern.
+//
+// This function is only reached for state-altering verbs: checkWith returns
+// Allow for reads before calling it, so `kubectl get namespace kube-system` is
+// never gated.
 func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs, ctx string, nsFor NamespaceForContextFunc) bool {
 	if p.AllNamespaces && cfg.HasProtectedNamespaces() {
 		return true
 	}
+	if _, ok := protectedNamespaceNameTarget(cfg, p); ok {
+		return true
+	}
 	return cfg.IsNamespaceProtected(resolveTargetNamespace(cfg, p, ctx, nsFor))
+}
+
+// protectedNamespaceNameTarget reports whether a state-altering command targets
+// a protected namespace as its OBJECT (rather than as the namespace it runs in),
+// returning the matched target for messaging.
+//
+// A wide-scope namespace command (`delete namespace --all`, `delete ns -l x=y`)
+// names nothing the guard can check, so with any namespace protection configured
+// it fails closed: the guard cannot prove a protected namespace is not among the
+// targets.
+func protectedNamespaceNameTarget(cfg namespaceChecker, p ParsedArgs) (string, bool) {
+	t := namespaceTargetsFrom(p)
+	if !t.Kind || !cfg.HasProtectedNamespaces() {
+		return "", false
+	}
+	if t.Wide {
+		return "all namespaces", true
+	}
+	for _, name := range t.Names {
+		if cfg.IsNamespaceProtected(name) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// ProtectedNamespaceNameTarget is the exported form of
+// protectedNamespaceNameTarget, used by user-facing messages so they name the
+// namespace OBJECT that triggered gating (e.g. "kube-system" for
+// `delete namespace kube-system`) rather than the namespace the command would
+// otherwise be considered to run in (e.g. "default").
+func ProtectedNamespaceNameTarget(cfg *config.Config, args []string) (string, bool) {
+	if cfg == nil {
+		return "", false
+	}
+	return protectedNamespaceNameTarget(cfg, ParseArgs(args))
 }
 
 // resolveTargetNamespace determines the namespace a command targets for

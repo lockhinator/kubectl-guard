@@ -142,8 +142,17 @@ Select contexts to protect (space to toggle, enter to confirm):
   [x] prod-cluster
   [x] prod-us-east-1
 
+[/] filter  [space] toggle  [a] toggle visible  [n] none  [enter] confirm  [q] quit
+
 ✓ Saved to ~/.kubectl-guard.yaml
 ```
+
+Contexts whose name contains `prod` are **pre-selected** so the common case
+needs no hunting. For a large kubeconfig, the list is **scrollable** (it renders
+a window sized to your terminal and follows the cursor) and **filterable**: press
+`/`, type a substring to narrow the list (with a live match count), `enter` to
+apply or `esc` to clear. `[a]` toggles only the currently-visible (filtered)
+contexts; selections persist across filtering.
 
 ##### Headless / non-interactive setup (CI, agents, no TTY)
 

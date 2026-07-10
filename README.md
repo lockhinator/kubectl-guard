@@ -481,10 +481,12 @@ diff_before_confirm: true # optional: show `kubectl diff` before the confirm pro
 
 Fields:
 - **`protected_contexts`** — glob patterns of contexts that gate
-  state-altering commands (require confirmation)
+  state-altering commands (require confirmation). See
+  [Glob pattern semantics](#glob-pattern-semantics).
 - **`protected_namespaces`** — glob patterns of namespaces that gate
   state-altering commands (resolved from `--namespace`/`-n`, the context's
-  baked-in namespace, or `default`)
+  baked-in namespace, or `default`). Same glob semantics as
+  `protected_contexts`.
 - **`protected_resources`** — resources blocked everywhere, reads included
 - **`context_mode`** — `confirm` (default, prompts) or `block` (hard-refuse)
 - **`namespace_mode`** — `confirm` (default) or `block`, for protected namespaces
@@ -524,6 +526,53 @@ kubectl-guard config setup                # Re-run setup wizard
 kubectl-guard config init                 # Write config non-interactively (headless)
 kubectl-guard config path                 # Print config file path
 ```
+
+### Glob pattern semantics
+
+`protected_contexts` and `protected_namespaces` are matched with the **same**
+glob matcher, so a pattern means exactly one thing wherever you write it.
+Context and namespace names are *names*, not filesystem paths, so the matcher
+uses shell-like semantics rather than path semantics:
+
+| Syntax | Matches |
+|--------|---------|
+| `*` | any sequence of characters, **including `/` and `:`** (and the empty string) |
+| `?` | exactly one character (one UTF-8 rune, not one byte) |
+| `[abc]` | one character from the set |
+| `[a-z]` | one character from the range |
+| `[^abc]` | one character **not** in the set |
+| `\*`, `\?`, `\[`, `\\` | the literal character, escaped |
+
+Everything else matches itself. Behavior is **identical on Linux, macOS, and
+Windows** — `/` and `\` carry no special path meaning.
+
+Note that only `^` negates a character class. Unlike most shells, `[!abc]` is
+**not** a negation here — `!` is an ordinary member of the set. This matches the
+behavior of the matcher used in earlier releases, so upgrading can never turn a
+protected context into an unprotected one.
+
+```yaml
+protected_contexts:
+  - 'prod-*'                          # prod-us-east-1, prod-us/east/1
+  - '*prod*'                          # team-a/prod/cluster, myprodcluster
+  - 'arn:aws:eks:*:*:cluster/prod-*'  # EKS ARNs
+  - 'gke_*_prod-*'                    # GKE context names
+```
+
+Because `*` spans `/`, a path-shaped context name (`team-a/prod`) is matched by
+`*prod*` the way you would expect from a shell. Note the literal parts of a
+pattern still have to match literally: `prod-*` matches `prod-us/east/1` but not
+`prod/us/east/1`, because `prod-` is not a prefix of `prod/`.
+
+> Earlier releases used Go's `path/filepath.Match`, where `*` and `?` refuse to
+> cross `/`, escaping is disabled on Windows, and a malformed pattern such as
+> `prod-[` returns an error that the guard swallowed — silently protecting
+> **nothing**. Upgrading is safe: for any context or namespace name, a pattern
+> that was protected before is still protected. The new matcher only ever widens
+> what a pattern matches. (The sole exception is a name containing a multi-byte
+> UTF-8 character matched by a wildcard, where `filepath.Match` matched the
+> character's interior bytes; Kubernetes context and namespace names are ASCII,
+> so no real configuration is affected.)
 
 ### Diagnostics
 

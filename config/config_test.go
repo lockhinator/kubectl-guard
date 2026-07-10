@@ -68,6 +68,54 @@ func TestIsContextProtected(t *testing.T) {
 			context:   "arn:aws:eks:us-east-1:123456789:cluster/prod-main",
 			protected: true,
 		},
+		// #30: '*' spans '/', so a path-shaped context name is matched. Under
+		// the previous filepath.Match implementation these were NOT protected.
+		{
+			name:      "wildcard crosses slash",
+			patterns:  []string{"prod-*"},
+			context:   "prod-us/east/1",
+			protected: true,
+		},
+		{
+			name:      "wildcard spans whole path-shaped name",
+			patterns:  []string{"prod*"},
+			context:   "prod/us/east/1",
+			protected: true,
+		},
+		{
+			name:      "contains-anywhere crosses slash",
+			patterns:  []string{"*prod*"},
+			context:   "team-a/prod/cluster",
+			protected: true,
+		},
+		{
+			name:      "single star protects every context",
+			patterns:  []string{"*"},
+			context:   "any/thing:at-all",
+			protected: true,
+		},
+		// The literal part of a pattern is still required to match literally.
+		{
+			name:      "literal prefix still enforced",
+			patterns:  []string{"prod-*"},
+			context:   "prod/us/east/1",
+			protected: false,
+		},
+		// A malformed pattern degrades to a literal instead of silently
+		// protecting nothing (see TestMatchGlobDoesNotFailOpen). Reporting the
+		// typo to the user is config validation's job (#26).
+		{
+			name:      "malformed pattern does not match as a class",
+			patterns:  []string{"prod-[abc"},
+			context:   "prod-a",
+			protected: false,
+		},
+		{
+			name:      "malformed pattern matches itself literally",
+			patterns:  []string{"prod-["},
+			context:   "prod-[",
+			protected: true,
+		},
 	}
 
 	for _, tt := range tests {

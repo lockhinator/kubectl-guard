@@ -229,9 +229,12 @@ func Save(cfg *Config) error {
 }
 
 // IsContextProtected checks if a context matches any protected pattern.
+// Patterns use the glob semantics documented in glob.go: '*' matches any run of
+// characters (including '/' and ':', so it spans EKS ARNs and path-shaped
+// context names), '?' matches one character, and '[...]' matches a class.
 func (c *Config) IsContextProtected(context string) bool {
 	for _, pattern := range c.ProtectedContexts {
-		if matched, _ := filepath.Match(pattern, context); matched {
+		if matchGlob(pattern, context) {
 			return true
 		}
 	}
@@ -266,9 +269,11 @@ func (c *Config) HasProtectedNamespaces() bool {
 }
 
 // IsNamespaceProtected checks if a namespace matches any protected pattern.
+// It uses the same matcher as IsContextProtected, so context and namespace
+// patterns can never disagree about what a glob means.
 func (c *Config) IsNamespaceProtected(namespace string) bool {
 	for _, pattern := range c.ProtectedNamespaces {
-		if matched, _ := filepath.Match(pattern, namespace); matched {
+		if matchGlob(pattern, namespace) {
 			return true
 		}
 	}

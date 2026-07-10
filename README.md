@@ -543,10 +543,40 @@ kubectl-guard config context-mode block      # Hard-block state changes on prote
 kubectl-guard config namespace-mode block    # Hard-block state changes on protected namespaces
 kubectl-guard config audit-mode all          # Log every command (default)
 kubectl-guard config audit                # Show audit log path + recent entries
+kubectl-guard config validate             # Check the config for problems (exit non-zero if any)
 kubectl-guard config setup                # Re-run setup wizard
 kubectl-guard config init                 # Write config non-interactively (headless)
 kubectl-guard config path                 # Print config file path
 ```
+
+### Config validation
+
+Garbage values used to be silently ignored. A typo like `context_mode: blck` is
+not `block`, so the guard would fall back to `confirm` — you think you configured
+a hard block, but a `--yes` sails through. For a security tool that is exactly the
+wrong default, so kubectl-guard now **validates the config and fails closed** on an
+invalid value:
+
+```bash
+$ kubectl-guard config validate
+⚠️  Config has 2 problem(s):
+  - context_mode: "blck" is not valid (want "confirm" or "block")
+  - protected_contexts: pattern "prod-[" has an unterminated '[' character class
+# exit code 1
+```
+
+An invalid config makes the guard **refuse every command** (fail closed) until it
+is fixed — it never runs with protection weaker than you configured. The
+config-mutation subcommands (`config context-mode block`, …) still work while the
+config is invalid, so you can correct it. `config validate` is also handy as a
+CI/pre-flight check: it exits non-zero if there is any problem, zero if clean.
+
+Validation checks the mode fields (`confirm_mode`, `audit_mode`, `context_mode`,
+`namespace_mode`) against their allowed values, that glob patterns are well-formed
+(a `prod-[` with no closing `]` is almost certainly a mistake — the matcher would
+treat it as the literal string `prod-[` and protect nothing you intended), and
+that protected-resource entries are non-empty. Unknown fields are ignored
+(forward-compatible with configs written by a newer version).
 
 ### Glob pattern semantics
 

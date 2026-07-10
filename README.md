@@ -541,6 +541,21 @@ Fields:
   the interactive prompt is affected; `--json`, `--yes`, and no-TTY paths already
   resolve without blocking. Capped at one year (`31536000`); use `0` for a
   deliberate wait-forever
+- **`in_cluster`** — policy for running with **no named context** (inside a pod
+  on the serviceaccount config, or CI with an in-cluster kubeconfig), when
+  protected contexts are configured. `namespace` (default) gates by the resolved
+  **serviceaccount namespace** instead of the context name, so namespace
+  protection still works — a state-altering command in a protected namespace is
+  gated, one in an unprotected namespace passes. `deny` fails closed (refuses
+  every command; the pre-v0.6.0 behavior). `allow` passes through. Out-of-cluster
+  behavior is unchanged: an unresolvable context still fails closed. In-cluster
+  detection requires **both** `KUBERNETES_SERVICE_HOST` and a readable
+  serviceaccount namespace file (a projected-SA file an out-of-cluster caller
+  cannot fabricate), so setting the env var alone cannot relax the guard. Under
+  `namespace` mode, context-name protection is **not** evaluated in-cluster
+  (there is no context name), so a config that protects *only* contexts gives no
+  in-cluster protection — pair it with `protected_namespaces`, or use
+  `in_cluster: deny`
 - **`discover_short_names`** — `true` (default) or `false`. When enabled, the
   guard discovers **CRD short names** by querying `kubectl api-resources` (cached
   ~10 min per cluster), so protecting a CRD by its kind also blocks its short

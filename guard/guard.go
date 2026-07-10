@@ -91,7 +91,7 @@ const (
 // loaded config (non-nil for Allow/Blocked/RequireConfirmation) so callers do
 // not need to re-read the file.
 func Check(args []string) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace, DiscoverShortNames)
+	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace, DiscoverShortNames, defaultInCluster)
 }
 
 // ShortNameDiscoverer returns discovered CRD short names for the command's
@@ -108,13 +108,14 @@ func noShortNames(*config.Config, []string) map[string]string { return nil }
 // tests never spawn a kubectl subprocess; tier-2 namespace resolution and CRD
 // short-name discovery are exercised via checkWithResolvers with injected fakes.
 func checkWith(args []string, current CurrentContextFunc) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, current, noContextNamespace, noShortNames)
+	return checkWithResolvers(args, current, noContextNamespace, noShortNames, notInCluster)
 }
 
 // checkWithResolvers is the testable core of Check: the current-context lookup,
-// the context-namespace lookup, and the CRD short-name discovery are all injected
-// so the protection decision can be exercised without kubectl.
-func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer) (Result, string, *config.Config, error) {
+// the context-namespace lookup, the CRD short-name discovery, and the in-cluster
+// detection are all injected so the protection decision can be exercised without
+// kubectl or a real pod.
+func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer, inCluster InClusterFunc) (Result, string, *config.Config, error) {
 	// Config must be readable; if we cannot tell what is protected we refuse.
 	exists, err := config.Exists()
 	if err != nil {
@@ -168,6 +169,14 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts are configured (use --context instead)")
 	}
 
+	// --cluster retargets the API server via a named kubeconfig cluster, decoupled
+	// from the context NAME the guard gates on: `--context=dev --cluster=prod`
+	// gates on "dev" while the command hits prod. Refuse it under protected
+	// contexts, like --server.
+	if p.HasClusterOverride && len(cfg.ProtectedContexts) > 0 {
+		return Deny, ctx, cfg, fmt.Errorf("--cluster overrides the cluster target independently of the context name; refusing because protected contexts are configured (use --context instead)")
+	}
+
 	// A state-altering command in dry-run mode (--dry-run=client|server, not
 	// none) changes no cluster state, so skip context/namespace gating. This
 	// reduces cry-wolf prompts on safe operations. Protected-resource blocks
@@ -181,15 +190,42 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	}
 
 	// Context protection. If we cannot resolve the context while protected
-	// contexts are configured, fail closed (we can't confirm it's unprotected).
+	// contexts are configured, we normally fail closed. But in-cluster (running
+	// in a pod on the serviceaccount config, or CI with an in-cluster kubeconfig)
+	// there is no context NAME to evaluate, so a blanket deny makes the guard
+	// unusable there. The in_cluster policy decides what to do instead.
 	contextProtected := false
+	inClusterNamespace := "" // SA namespace to use as the namespace fallback (in-cluster namespace mode)
 	if ctx != "" && cfg.IsContextProtected(ctx) {
 		contextProtected = true
 	} else if (ctxErr != nil || ctx == "") && len(cfg.ProtectedContexts) > 0 {
-		if ctxErr != nil {
-			return Deny, "", cfg, fmt.Errorf("cannot resolve current context: %w", ctxErr)
+		saNS, isInCluster := inCluster()
+		if !isInCluster {
+			// Out-of-cluster: fail closed, unchanged.
+			if ctxErr != nil {
+				return Deny, "", cfg, fmt.Errorf("cannot resolve current context: %w", ctxErr)
+			}
+			return Deny, "", cfg, fmt.Errorf("cannot resolve current context")
 		}
-		return Deny, "", cfg, fmt.Errorf("cannot resolve current context")
+		switch cfg.InClusterMode() {
+		case config.InClusterDeny:
+			return Deny, "", cfg, fmt.Errorf("running in-cluster with no named context and in_cluster=deny; refusing (set in_cluster: namespace to gate by the serviceaccount namespace instead)")
+		case config.InClusterAllow:
+			return Allow, "", cfg, nil
+		default: // InClusterNamespace: context protection cannot be evaluated
+			// in-cluster, so gate by the serviceaccount namespace instead of the
+			// unresolvable context. contextProtected stays false.
+			if saNS == "" {
+				// We are in-cluster but cannot determine the serviceaccount
+				// namespace, so we cannot evaluate namespace protection either.
+				// Fail closed rather than pass through: an unknowable identity must
+				// not silently disable protection. (defaultInCluster already refuses
+				// to report in-cluster without a readable SA namespace, so this is a
+				// belt-and-suspenders guard against any other InClusterFunc.)
+				return Deny, "", cfg, fmt.Errorf("running in-cluster but the serviceaccount namespace is unreadable; refusing (set in_cluster: allow to override, or use -n to name the namespace)")
+			}
+			inClusterNamespace = saNS
+		}
 	}
 
 	// Optional policy: deny any impersonation (--as*) on a protected context.
@@ -210,7 +246,7 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// into the resolved context, then kubectl's "default". --all-namespaces/-A
 	// spans every namespace, so it is gated when any namespace is protected
 	// (like "get all" spans resources).
-	namespaceProtected := namespaceTargetProtected(cfg, p, ctx, nsFor)
+	namespaceProtected := namespaceTargetProtected(cfg, p, ctx, inClusterNamespace, nsFor)
 
 	if contextProtected || namespaceProtected {
 		// Block mode: hard-refuse state-altering commands with no prompt. If
@@ -241,14 +277,14 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 // This function is only reached for state-altering verbs: checkWith returns
 // Allow for reads before calling it, so `kubectl get namespace kube-system` is
 // never gated.
-func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs, ctx string, nsFor NamespaceForContextFunc) bool {
+func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs, ctx, fallbackNS string, nsFor NamespaceForContextFunc) bool {
 	if p.AllNamespaces && cfg.HasProtectedNamespaces() {
 		return true
 	}
 	if _, ok := protectedNamespaceNameTarget(cfg, p); ok {
 		return true
 	}
-	return cfg.IsNamespaceProtected(resolveTargetNamespace(cfg, p, ctx, nsFor))
+	return cfg.IsNamespaceProtected(resolveTargetNamespace(cfg, p, ctx, fallbackNS, nsFor))
 }
 
 // protectedNamespaceNameTarget reports whether a state-altering command targets
@@ -297,7 +333,12 @@ func ProtectedNamespaceNameTarget(cfg *config.Config, args []string) (string, bo
 // configured, because it shells out; a lookup error falls back to "default"
 // rather than failing closed, so a transient kubeconfig read cannot block every
 // namespace-gated command. Explicit -n and -A protection are unaffected.
-func resolveTargetNamespace(cfg namespaceChecker, p ParsedArgs, ctx string, nsFor NamespaceForContextFunc) string {
+//
+// fallbackNS is the namespace used when neither an explicit -n nor the context's
+// baked-in namespace resolves: "default" out-of-cluster, or the serviceaccount
+// namespace in-cluster (namespace mode), where a command with no -n runs in the
+// pod's namespace rather than "default".
+func resolveTargetNamespace(cfg namespaceChecker, p ParsedArgs, ctx, fallbackNS string, nsFor NamespaceForContextFunc) string {
 	if p.HasNamespace && p.Namespace != "" {
 		return p.Namespace
 	}
@@ -306,17 +347,25 @@ func resolveTargetNamespace(cfg namespaceChecker, p ParsedArgs, ctx string, nsFo
 			return ns
 		}
 	}
+	if fallbackNS != "" {
+		return fallbackNS
+	}
 	return "default"
 }
 
 // ResolvedTargetNamespace returns the namespace a command targets, applying the
 // same resolution the guard decision used (--namespace/-n, then the context's
-// baked-in namespace, then "default"). It is used for user-facing messages so
-// they name the namespace that actually triggered gating, including one derived
-// from the context. It may shell out for the context lookup, so callers should
-// use it only on the (interactive) gated path, not the hot read path.
+// baked-in namespace, then the serviceaccount namespace in-cluster, then
+// "default"). It is used for user-facing messages so they name the namespace that
+// actually triggered gating. It may shell out for the context lookup and reads
+// the in-cluster signal, so callers should use it only on the (interactive) gated
+// path, not the hot read path.
 func ResolvedTargetNamespace(cfg *config.Config, args []string, ctx string) string {
-	return resolveTargetNamespace(cfg, ParseArgs(args), ctx, defaultContextNamespace)
+	fallbackNS := ""
+	if saNS, inCluster := defaultInCluster(); inCluster {
+		fallbackNS = saNS
+	}
+	return resolveTargetNamespace(cfg, ParseArgs(args), ctx, fallbackNS, defaultContextNamespace)
 }
 
 // namespaceChecker is satisfied by *config.Config; kept as an interface so the

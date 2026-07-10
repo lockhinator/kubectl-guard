@@ -36,6 +36,28 @@ const (
 	AuditModeOff   = "off"   // log nothing
 )
 
+// In-cluster policies decide what happens when the guard runs with no named
+// context (inside a pod on the serviceaccount config, or CI with an in-cluster
+// kubeconfig) and protected contexts are configured. Without a context name the
+// guard cannot evaluate context protection, so historically it failed closed and
+// denied everything, making it unusable in-cluster.
+const (
+	// InClusterNamespace (default) gates by the resolved serviceaccount
+	// namespace instead of the context name, so namespace protection still
+	// applies in-cluster. Commands in an unprotected namespace pass through.
+	InClusterNamespace = "namespace"
+	// InClusterDeny reproduces the previous fail-closed behavior: refuse every
+	// state-altering command in-cluster when protected contexts are configured.
+	InClusterDeny = "deny"
+	// InClusterAllow passes commands through in-cluster with NO namespace or
+	// context gating — a full passthrough. (Applying namespace protection here
+	// would be identical to InClusterNamespace, since context protection is
+	// unevaluable in-cluster either way, which is why "allow" is distinct.)
+	// Resource protection still applies (it is global and evaluated earlier). A
+	// deliberately-permissive opt-in.
+	InClusterAllow = "allow"
+)
+
 const (
 	configFileName = ".kubectl-guard.yaml"
 	auditFileName  = ".kubectl-guard-audit.log"
@@ -107,6 +129,12 @@ type Config struct {
 	// paths already resolve without blocking.
 	ConfirmTimeoutSeconds int `yaml:"confirm_timeout_seconds,omitempty"`
 
+	// InCluster is the policy for running with no named context (in a pod, or CI
+	// with an in-cluster kubeconfig): "namespace" (default) gates by the resolved
+	// serviceaccount namespace, "deny" fails closed, "allow" passes through. Empty
+	// means the default.
+	InCluster string `yaml:"in_cluster,omitempty"`
+
 	// DiscoverShortNames controls whether the guard discovers CRD short names by
 	// querying `kubectl api-resources` (cached), so protecting a CRD by its kind
 	// also blocks its short name (e.g. protecting "secretstore" blocks
@@ -120,6 +148,19 @@ type Config struct {
 	// api-resources cache before matching and is NOT serialized. nil means "not
 	// discovered / built-ins only".
 	discovered map[string]string `yaml:"-"`
+}
+
+// InClusterMode returns the configured in-cluster policy, defaulting to
+// InClusterNamespace when unset. An invalid value is caught by Validate (which
+// fails the config closed), so it is never reached here at runtime; defaulting to
+// the safe "namespace" is the conservative fallback regardless.
+func (c *Config) InClusterMode() string {
+	switch c.InCluster {
+	case InClusterDeny, InClusterAllow:
+		return c.InCluster
+	default:
+		return InClusterNamespace
+	}
 }
 
 // ShouldDiscoverShortNames reports whether CRD short-name discovery is enabled.

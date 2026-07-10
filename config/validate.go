@@ -41,6 +41,11 @@ func (c *Config) Validate() []string {
 			"namespace_mode: %q is not valid (want %q or %q)",
 			c.NamespaceMode, NamespaceModeConfirm, NamespaceModeBlock))
 	}
+	if c.InCluster != "" && !validInClusterMode(c.InCluster) {
+		problems = append(problems, fmt.Sprintf(
+			"in_cluster: %q is not valid (want %q, %q, or %q)",
+			c.InCluster, InClusterNamespace, InClusterDeny, InClusterAllow))
+	}
 
 	for _, p := range c.ProtectedContexts {
 		if err := validateGlobPattern(p); err != nil {
@@ -105,6 +110,14 @@ func validContextMode(m string) bool {
 func validNamespaceMode(m string) bool {
 	switch m {
 	case NamespaceModeConfirm, NamespaceModeBlock:
+		return true
+	}
+	return false
+}
+
+func validInClusterMode(m string) bool {
+	switch m {
+	case InClusterNamespace, InClusterDeny, InClusterAllow:
 		return true
 	}
 	return false

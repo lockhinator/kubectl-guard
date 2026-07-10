@@ -26,6 +26,10 @@ func TestValidate(t *testing.T) {
 		{"invalid audit_mode", Config{AuditMode: "sometimes"}, "audit_mode"},
 		{"invalid context_mode", Config{ContextMode: "blck"}, "context_mode"},
 		{"invalid namespace_mode", Config{NamespaceMode: "hard"}, "namespace_mode"},
+		{"invalid in_cluster", Config{InCluster: "sometimes"}, "in_cluster"},
+		{"valid in_cluster namespace", Config{InCluster: InClusterNamespace}, ""},
+		{"valid in_cluster deny", Config{InCluster: InClusterDeny}, ""},
+		{"valid in_cluster allow", Config{InCluster: InClusterAllow}, ""},
 
 		{"valid agent-relay confirm mode", Config{ConfirmMode: ConfirmModeAgentRelay}, ""},
 

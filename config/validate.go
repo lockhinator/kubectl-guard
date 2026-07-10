@@ -46,6 +46,16 @@ func (c *Config) Validate() []string {
 			"in_cluster: %q is not valid (want %q, %q, or %q)",
 			c.InCluster, InClusterNamespace, InClusterDeny, InClusterAllow))
 	}
+	if c.SensitiveAccess != "" && !validSensitiveAccessMode(c.SensitiveAccess) {
+		problems = append(problems, fmt.Sprintf(
+			"sensitive_access: %q is not valid (want %q, %q, or %q)",
+			c.SensitiveAccess, SensitiveAccessOff, SensitiveAccessGate, SensitiveAccessBlock))
+	}
+	for i, v := range c.SensitiveVerbs {
+		if strings.TrimSpace(v) == "" {
+			problems = append(problems, fmt.Sprintf("sensitive_verbs: entry %d is empty", i))
+		}
+	}
 
 	for _, p := range c.ProtectedContexts {
 		if err := validateGlobPattern(p); err != nil {
@@ -118,6 +128,14 @@ func validNamespaceMode(m string) bool {
 func validInClusterMode(m string) bool {
 	switch m {
 	case InClusterNamespace, InClusterDeny, InClusterAllow:
+		return true
+	}
+	return false
+}
+
+func validSensitiveAccessMode(m string) bool {
+	switch m {
+	case SensitiveAccessOff, SensitiveAccessGate, SensitiveAccessBlock:
 		return true
 	}
 	return false

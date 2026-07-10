@@ -541,6 +541,20 @@ Fields:
   the interactive prompt is affected; `--json`, `--yes`, and no-TTY paths already
   resolve without blocking. Capped at one year (`31536000`); use `0` for a
   deliberate wait-forever
+- **`sensitive_access`** — `off` (default), `gate`, or `block`. Gates the
+  **sensitive-access verbs** — `exec`, `cp`, `attach`, `debug`, `port-forward`,
+  `proxy` — on **every** context, not just protected ones, because their risk is
+  about what they can *read/reach* (a secret in a pod via `exec … cat` or a
+  `debug` ephemeral container, a file via `cp`, a root shell on a node via
+  `debug node/…`, a tunnel to a workload), independent of where they run. `gate`
+  requires confirmation, `block` refuses. It applies even in `--dry-run` mode (a
+  dry-run still reads/reaches). Read verbs (`get`/`describe`/`logs`) are
+  unaffected. Composes most-restrictive with context/namespace protection. Off by
+  default (unchanged behavior: these verbs gate only on protected targets)
+- **`sensitive_verbs`** — override the verb set `sensitive_access` applies to
+  (default `exec, cp, attach, debug, port-forward, proxy`). You can add a verb you
+  consider sensitive (e.g. `logs`, if apps log secrets) — it is then gated even
+  though it is otherwise read-only
 - **`in_cluster`** — policy for running with **no named context** (inside a pod
   on the serviceaccount config, or CI with an in-cluster kubeconfig), when
   protected contexts are configured. `namespace` (default) gates by the resolved

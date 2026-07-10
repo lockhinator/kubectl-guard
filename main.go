@@ -343,9 +343,12 @@ func runGuard(args []string) error {
 		// message and audit reason are accurate.
 		blockReason := "protected-resource"
 		if !guard.MatchesProtectedResource(cfg, forwarded) {
-			if cfg != nil && cfg.IsContextProtected(ctx) && cfg.ContextMode == config.ContextModeBlock {
+			switch {
+			case cfg != nil && cfg.IsContextProtected(ctx) && cfg.ContextMode == config.ContextModeBlock:
 				blockReason = "protected-context-block-mode"
-			} else {
+			case guard.IsSensitiveAccess(cfg, forwarded) && cfg != nil && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock:
+				blockReason = "sensitive-access-block"
+			default:
 				blockReason = "protected-namespace-block-mode"
 			}
 		}
@@ -370,6 +373,8 @@ func runGuard(args []string) error {
 				}
 			case "protected-context-block-mode":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
+			case "sensitive-access-block":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s is a sensitive-access verb (sensitive_access: block; refused on every context)", cmdDesc))
 			default: // protected-namespace-block-mode
 				// Prefer the namespace OBJECT the command targets by name
 				// (`delete namespace kube-system`) over the namespace it would
@@ -411,6 +416,10 @@ func runGuard(args []string) error {
 		reason := "protected context"
 		target := ctx
 		switch nameTarget, byName := guard.ProtectedNamespaceNameTarget(cfg, forwarded); {
+		case guard.IsSensitiveAccess(cfg, forwarded) && !cfg.IsContextProtected(ctx) && !byName:
+			// Gated purely because it is a sensitive-access verb on an otherwise
+			// unprotected target — name that, not a "protected context".
+			reason, target = "sensitive access", "any context"
 		case byName:
 			// The command's OBJECT is a protected namespace (e.g.
 			// `delete namespace kube-system`). Name that, rather than the

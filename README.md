@@ -680,6 +680,17 @@ knowing:
   bypass attempts.
 - **`-k` kustomize** directories are conservatively blocked when resource
   protection is active, but their contents are not deeply parsed.
+- **No output redaction — the guard blocks commands, it does not filter their
+  output.** Once a command is allowed, kubectl's output flows straight to your
+  terminal: the guard hands off with `exec` and never sees it. So a secret
+  value that reaches you *through* a permitted command — an env var in
+  `get pod -o yaml`, a token an app wrote to `logs` — is not redacted. Protect
+  the resource (`config add-resource secret`) and gate the access vectors
+  (`exec`, `cp`, `port-forward`) instead; those are decisions the guard can make
+  from the command line, with certainty, before anything runs. This is a
+  deliberate design decision — see
+  [docs/redaction-decision.md](docs/redaction-decision.md) for the full
+  rationale and the cost analysis behind it.
 
 ## Reliability
 

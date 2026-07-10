@@ -112,9 +112,16 @@ func splitCSV(v string) []string {
 	return out
 }
 
-// RunSetup runs the first-time setup wizard with the given context names.
-// Returns true if setup completed successfully, false if user quit.
-func RunSetup(contextNames []string) bool {
+// RunSetup runs the setup wizard with the given context names, persisting the
+// resulting config via the injected save function. Returns true if setup
+// completed successfully, false if the user quit.
+//
+// save is injected (rather than calling Save directly) so the caller can route
+// the write through the audited, weakening-gated path: the wizard builds a fresh
+// config from the selected contexts, which on an EXISTING install drops every
+// other protection axis — a weakening that must be audited and gated like any
+// other config change, not written silently.
+func RunSetup(contextNames []string, save func(*Config) error) bool {
 	if len(contextNames) == 0 {
 		ui.PrintWarning("No kubectl contexts found.")
 		ui.PrintInfo("Configure kubectl first, then re-run your command.")
@@ -150,8 +157,8 @@ func RunSetup(contextNames []string) bool {
 		}
 	}
 
-	// Save config
-	if err := Save(cfg); err != nil {
+	// Save config via the injected persister (audits + gates weakening).
+	if err := save(cfg); err != nil {
 		ui.PrintWarning("Failed to save config: " + err.Error())
 		return false
 	}

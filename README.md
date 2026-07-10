@@ -527,6 +527,20 @@ Fields:
 - **`audit_mode`** — `all` (default, logs every command including allowed
   passthrough), `gated` (only interventions: blocked/confirmed/aborted/denied),
   or `off` (logs nothing)
+- **`require_confirm_weakening`** — when true, a `config` change that **weakens**
+  protection (removing a protected context/resource/namespace, downgrading a mode,
+  disabling `block_impersonation`/`audit_syslog`, un-gating a verb, removing an
+  audit webhook, …) requires interactive confirmation; **additive** changes stay
+  frictionless. The gate reads the *current* value of this flag, so turning it off
+  is itself gated. Off by default. **Every** `config` change is audited regardless
+  (see below). Toggle with `kubectl-guard config confirm-weakening on`. The guard
+  now defends its own config: an agent with shell access can no longer silently
+  neutralize protection.
+
+  Every `config` mutation writes an audit entry (`outcome: config-change`) naming
+  the change — and for a weakening change, exactly what it weakened — written
+  **before** the change takes effect using the prior audit policy, so even
+  `audit-mode off` is recorded.
 - **`audit_log`** — optional override for the audit log path
 - **`audit_max_size_mb`** — enable size-based rotation of the audit log: when the
   file would exceed this many megabytes it is rotated to `<log>.1` (older archives

@@ -23,31 +23,32 @@ var version = "dev"
 // "config <subcommand>" (e.g. "config use-context", "config view") is a kubectl
 // command and must be forwarded through the guard rather than intercepted.
 var guardConfigSubcommands = map[string]bool{
-	"setup":            true,
-	"init":             true,
-	"list":             true,
-	"add":              true,
-	"remove":           true,
-	"add-context":      true,
-	"remove-context":   true,
-	"add-resource":     true,
-	"remove-resource":  true,
-	"add-namespace":    true,
-	"remove-namespace": true,
-	"confirm-mode":     true,
-	"context-mode":     true,
-	"namespace-mode":   true,
-	"blast-radius":     true,
-	"actor-policy":     true,
-	"audit-mode":       true,
-	"audit-rotation":   true,
-	"audit-webhook":    true,
-	"audit-syslog":     true,
-	"command-override": true,
-	"unknown-verb":     true,
-	"audit":            true,
-	"path":             true,
-	"validate":         true,
+	"setup":             true,
+	"init":              true,
+	"list":              true,
+	"add":               true,
+	"remove":            true,
+	"add-context":       true,
+	"remove-context":    true,
+	"add-resource":      true,
+	"remove-resource":   true,
+	"add-namespace":     true,
+	"remove-namespace":  true,
+	"confirm-mode":      true,
+	"context-mode":      true,
+	"namespace-mode":    true,
+	"blast-radius":      true,
+	"actor-policy":      true,
+	"audit-mode":        true,
+	"audit-rotation":    true,
+	"audit-webhook":     true,
+	"audit-syslog":      true,
+	"command-override":  true,
+	"unknown-verb":      true,
+	"confirm-weakening": true,
+	"audit":             true,
+	"path":              true,
+	"validate":          true,
 }
 
 func main() {
@@ -342,7 +343,9 @@ func runGuard(args []string) error {
 		for i, c := range contexts {
 			contextNames[i] = c.Name
 		}
-		config.RunSetup(contextNames)
+		// First-time setup: no prior config exists (Check returned SetupRequired),
+		// so there is nothing to weaken or audit — save directly.
+		config.RunSetup(contextNames, config.Save)
 		return nil
 
 	case guard.Blocked:
@@ -587,7 +590,10 @@ func runConfigCommand() error {
 			for i, c := range contexts {
 				contextNames[i] = c.Name
 			}
-			config.RunSetup(contextNames)
+			// Route the wizard's write through saveConfig, so re-running setup on an
+			// existing install (which rebuilds a contexts-only config, dropping other
+			// protection) is audited and gated as the weakening it is.
+			config.RunSetup(contextNames, saveConfig)
 			return nil
 		},
 	})
@@ -600,7 +606,7 @@ func runConfigCommand() error {
 			resources, _ := cmd.Flags().GetString("protected-resources")
 			confirm, _ := cmd.Flags().GetString("confirm-mode")
 			cfg := config.InitFromFlags(contexts, resources, confirm)
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			path, err := config.Path()
@@ -672,7 +678,7 @@ func runConfigCommand() error {
 			if !cfg.SetConfirmMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.ConfirmModeSimple, config.ConfirmModeTypeName, config.ConfirmModeAgentRelay)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Confirm mode set: " + cfg.ConfirmMode)
@@ -696,7 +702,7 @@ func runConfigCommand() error {
 			if !cfg.SetAuditMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.AuditModeAll, config.AuditModeGated, config.AuditModeOff)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Audit mode set: " + cfg.AuditMode)
@@ -720,7 +726,7 @@ func runConfigCommand() error {
 			if !cfg.SetContextMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.ContextModeConfirm, config.ContextModeBlock)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Context mode set: " + cfg.ContextMode)
@@ -744,7 +750,7 @@ func runConfigCommand() error {
 			if !cfg.SetNamespaceMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.NamespaceModeConfirm, config.NamespaceModeBlock)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Namespace mode set: " + cfg.NamespaceMode)
@@ -768,7 +774,7 @@ func runConfigCommand() error {
 			if !cfg.SetBlastRadiusMode(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.BlastRadiusOff, config.BlastRadiusGate, config.BlastRadiusBlock)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Blast radius set: " + cfg.BlastRadius)
@@ -804,7 +810,7 @@ func runConfigCommand() error {
 				if !cfg.RemoveActorPolicy(args[1]) {
 					return fmt.Errorf("no actor policy for %q", args[1])
 				}
-				if err := config.Save(cfg); err != nil {
+				if err := saveConfig(cfg); err != nil {
 					return err
 				}
 				ui.PrintSuccess("Removed actor policy: " + args[1])
@@ -821,7 +827,7 @@ func runConfigCommand() error {
 			if !cfg.SetActorPolicy(args[0], ctxMode, nsMode) {
 				return fmt.Errorf("invalid actor policy (actor must be non-empty; modes must be %q, %q, or - to inherit)", config.ContextModeConfirm, config.ContextModeBlock)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess(fmt.Sprintf("Actor policy set: %s (context=%s namespace=%s)", args[0], displayMode(ctxMode), displayMode(nsMode)))
@@ -858,7 +864,7 @@ func runConfigCommand() error {
 				}
 				cfg.AuditMaxFiles = files
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			if cfg.AuditMaxSizeMB == 0 {
@@ -895,7 +901,7 @@ func runConfigCommand() error {
 				}
 				cfg.AuditWebhookURL = args[0]
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			if cfg.AuditWebhookURL == "" {
@@ -928,10 +934,39 @@ func runConfigCommand() error {
 			default:
 				return fmt.Errorf("expected 'on' or 'off'")
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Audit syslog: " + onOff(cfg.AuditSyslog))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "confirm-weakening [on|off]",
+		Short: "Show or toggle requiring confirmation for protection-weakening config changes",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
+				return nil
+			}
+			switch args[0] {
+			case "on":
+				cfg.RequireConfirmWeakening = true
+			case "off":
+				cfg.RequireConfirmWeakening = false
+			default:
+				return fmt.Errorf("expected 'on' or 'off'")
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
 			return nil
 		},
 	})
@@ -952,7 +987,7 @@ func runConfigCommand() error {
 			if !cfg.SetUnknownVerb(args[0]) {
 				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.UnknownVerbAllow, config.UnknownVerbGate, config.UnknownVerbDeny)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess("Unknown verb policy set: " + cfg.UnknownVerb)
@@ -1000,7 +1035,7 @@ func runConfigCommand() error {
 			default:
 				return fmt.Errorf("expected 'safe', 'dangerous', or 'remove', got %q", action)
 			}
-			if err := config.Save(cfg); err != nil {
+			if err := saveConfig(cfg); err != nil {
 				return err
 			}
 			ui.PrintSuccess(fmt.Sprintf("Command override updated: %s %s", action, strings.ToLower(strings.TrimSpace(verb))))
@@ -1105,7 +1140,7 @@ func mutateConfig(fn func(*config.Config) bool, done, noop string) error {
 		return err
 	}
 	if fn(cfg) {
-		if err := config.Save(cfg); err != nil {
+		if err := saveConfig(cfg); err != nil {
 			return err
 		}
 		ui.PrintSuccess(done)
@@ -1113,6 +1148,75 @@ func mutateConfig(fn func(*config.Config) bool, done, noop string) error {
 		ui.PrintInfo(noop)
 	}
 	return nil
+}
+
+// saveConfig persists a change made by a `config` subcommand. It defends the
+// guard's own config: every change is AUDITED (outcome config-change), and a
+// change that WEAKENS protection is gated behind an interactive confirmation when
+// require_confirm_weakening is set. The audit is written BEFORE the change takes
+// effect, using the OLD config's audit policy — so even `audit-mode off` is
+// recorded — and the weakening gate reads the OLD require_confirm_weakening, so
+// turning that flag off is itself gated.
+func saveConfig(newCfg *config.Config) error {
+	old := currentOnDiskConfig()
+	weakening := config.WeakensProtection(old, newCfg)
+	cmdStr := configCommandString()
+
+	if len(weakening) > 0 && old.RequireConfirmWeakening {
+		ui.PrintWarning("This config change weakens kubectl-guard's protection:")
+		for _, item := range weakening {
+			fmt.Fprintln(os.Stderr, "  - "+item)
+		}
+		if ui.Confirm("Apply this protection-weakening change?", 0) != ui.ConfirmApproved {
+			_ = guard.AppendAudit(old, guard.AuditEntry{
+				Command: cmdStr,
+				Outcome: guard.OutcomeConfigChange,
+				Reason:  "weakening declined: " + strings.Join(weakening, "; "),
+			})
+			return fmt.Errorf("aborted: protection-weakening change not confirmed (re-run and confirm, or set require_confirm_weakening: false first)")
+		}
+	}
+
+	reason := "config change"
+	if len(weakening) > 0 {
+		reason = "weakened protection: " + strings.Join(weakening, "; ")
+	}
+	_ = guard.AppendAudit(old, guard.AuditEntry{
+		Command: cmdStr,
+		Outcome: guard.OutcomeConfigChange,
+		Reason:  reason,
+	})
+
+	return config.Save(newCfg)
+}
+
+// currentOnDiskConfig loads the config currently on disk (defaults applied) as
+// the "before" state for weakening detection and auditing, or an empty
+// default config when none exists yet.
+func currentOnDiskConfig() *config.Config {
+	exists, err := config.Exists()
+	if err == nil && exists {
+		if c, err := config.Load(); err == nil {
+			c.ApplyDefaults()
+			return c
+		}
+	}
+	c := &config.Config{}
+	c.ApplyDefaults()
+	return c
+}
+
+// configCommandString renders the invoked `config` subcommand for the audit
+// record (e.g. "config remove-resource secret"), recorded verbatim. Config args
+// are policy values, not kubectl credential flags; the one exception is a webhook
+// URL that embeds a token in its query string, which is stored as-is in the
+// 0600-mode local audit log (json.Marshal escapes control characters, so a
+// crafted arg cannot forge a log line).
+func configCommandString() string {
+	if len(os.Args) > 1 {
+		return strings.Join(os.Args[1:], " ")
+	}
+	return "config"
 }
 
 func printConfig() error {
@@ -1160,6 +1264,7 @@ func printConfig() error {
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
 	ui.PrintInfo("Unknown verb: " + cfg.UnknownVerbMode())
+	ui.PrintInfo("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
 
 	printActorPolicies(cfg)
 	printCommandOverrides(cfg)
@@ -1375,6 +1480,8 @@ Config subcommands:
                              How to treat a verb the guard cannot classify on a
                              protected target: allow (default), gate (confirm),
                              or deny (refuse). Unprotected targets always pass
+  confirm-weakening [on|off] Require confirmation for a config change that weakens
+                             protection (every config change is audited regardless)
   audit                      Show the audit log path and recent entries
   validate                   Check the config for problems (exit non-zero if any;
                              an invalid config also fails closed at runtime)

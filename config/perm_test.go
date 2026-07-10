@@ -97,6 +97,29 @@ func TestInsecureConfigPermsParentDir(t *testing.T) {
 	}
 }
 
+// TestLoadWrapsInvalidYAML: Load wraps a raw yaml library error with actionable
+// context (the config path + "is not valid YAML") instead of leaking the bare
+// library string. #38.
+func TestLoadWrapsInvalidYAML(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(EnvConfig, "")
+	path := filepath.Join(home, ".kubectl-guard.yaml")
+	if err := os.WriteFile(path, []byte(":::not valid yaml:::["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected an error for invalid YAML")
+	}
+	if !strings.Contains(err.Error(), "is not valid YAML") {
+		t.Errorf("error not wrapped with context: %v", err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("wrapped error missing the config path: %v", err)
+	}
+}
+
 // TestStrictPerms verifies strict enforcement is on from either the config field
 // or KUBECTL_GUARD_STRICT. #34.
 func TestStrictPerms(t *testing.T) {

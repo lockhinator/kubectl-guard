@@ -86,10 +86,14 @@ func TestHeadlessEnvBootstrapWritesConfig(t *testing.T) {
 	}
 }
 
-// TestNoPromptBootstrap asserts that --no-prompt with no config and no env
-// config writes an empty config, warns on stderr, and proceeds (no wizard).
-func TestNoPromptBootstrap(t *testing.T) {
-	stdout, stderr, code := runHeadless(t, nil, "--no-prompt", "get", "pods")
+// TestNoPromptBootstrapEmptyMode asserts that --no-prompt with no config, no env
+// config, and the opt-in KUBECTL_GUARD_BOOTSTRAP=empty writes an empty config,
+// warns on stderr, and proceeds (no wizard). This was the pre-v0.5.0 default;
+// #74 made it opt-in.
+func TestNoPromptBootstrapEmptyMode(t *testing.T) {
+	stdout, stderr, code := runHeadless(t,
+		[]string{"KUBECTL_GUARD_BOOTSTRAP=empty"},
+		"--no-prompt", "get", "pods")
 
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
@@ -97,15 +101,16 @@ func TestNoPromptBootstrap(t *testing.T) {
 	if !strings.Contains(stdout, "get pods") {
 		t.Errorf("expected the command to be forwarded, got stdout=%q", stdout)
 	}
-	if !strings.Contains(stderr, "--no-prompt") {
-		t.Errorf("expected a --no-prompt warning on stderr, got %q", stderr)
+	if !strings.Contains(stderr, "empty config") {
+		t.Errorf("expected an empty-config warning on stderr, got %q", stderr)
 	}
 }
 
-// TestNoPromptEnvBootstrap asserts KUBECTL_GUARD_NO_PROMPT behaves like the flag.
-func TestNoPromptEnvBootstrap(t *testing.T) {
+// TestNoPromptEnvBootstrapEmptyMode asserts KUBECTL_GUARD_NO_PROMPT behaves like
+// the flag, under the opt-in empty bootstrap mode.
+func TestNoPromptEnvBootstrapEmptyMode(t *testing.T) {
 	stdout, stderr, code := runHeadless(t,
-		[]string{"KUBECTL_GUARD_NO_PROMPT=yes"},
+		[]string{"KUBECTL_GUARD_NO_PROMPT=yes", "KUBECTL_GUARD_BOOTSTRAP=empty"},
 		"get", "pods")
 
 	if code != 0 {
@@ -114,8 +119,8 @@ func TestNoPromptEnvBootstrap(t *testing.T) {
 	if !strings.Contains(stdout, "get pods") {
 		t.Errorf("expected the command to be forwarded, got stdout=%q", stdout)
 	}
-	if !strings.Contains(stderr, "--no-prompt") {
-		t.Errorf("expected a --no-prompt warning on stderr, got %q", stderr)
+	if !strings.Contains(stderr, "empty config") {
+		t.Errorf("expected an empty-config warning on stderr, got %q", stderr)
 	}
 }
 

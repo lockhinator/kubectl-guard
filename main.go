@@ -247,8 +247,9 @@ func runGuard(args []string) error {
 		// agents and CI configure the guard without a TTY.
 		if envCfg, ok := config.InitFromEnv(); ok {
 			if err := config.Save(envCfg); err != nil {
-				ui.PrintWarning("Failed to save config from environment: " + err.Error())
-				return nil
+				// The command did not run and no config was written; surface a
+				// non-zero exit rather than a misleading success.
+				return fmt.Errorf("failed to save config from environment: %w", err)
 			}
 			if p, perr := config.Path(); perr == nil {
 				ui.PrintInfo("Wrote initial config from KUBECTL_GUARD_* env vars: " + p)
@@ -256,15 +257,70 @@ func runGuard(args []string) error {
 			// Proceed to run the command against the freshly written config.
 			return runGuard(args)
 		}
-		if noPrompt {
-			empty := &config.Config{}
-			empty.ApplyDefaults()
-			if err := config.Save(empty); err != nil {
-				ui.PrintWarning("Failed to save config: " + err.Error())
-				return nil
+		// Headless first run with nothing to go on. The bootstrap mode decides the
+		// posture; it defaults to "deny" so an unconfigured guard never silently
+		// establishes a no-protection posture and persists it to disk. (Before
+		// v0.5.0 this branch always wrote an empty config, after which every later
+		// invocation found a valid — but unprotected — config and never prompted
+		// again. The guard became a no-op and nobody noticed.)
+		bootstrapMode, validMode := config.BootstrapMode()
+		// Only warn about an unrecognized value on the headless path, where the
+		// bootstrap mode actually governs; interactively it is irrelevant.
+		if !validMode && noPrompt {
+			ui.PrintWarning(fmt.Sprintf("Unrecognized %s=%q; falling back to %q (fail closed).",
+				config.EnvBootstrap, os.Getenv(config.EnvBootstrap), bootstrapMode))
+		}
+		if noPrompt && bootstrapMode != config.BootstrapPrompt {
+			if bootstrapMode == config.BootstrapEmpty {
+				empty := &config.Config{}
+				empty.ApplyDefaults()
+				if err := config.Save(empty); err != nil {
+					// The command did not run and no config was written; surface a
+					// non-zero exit rather than a misleading success.
+					return fmt.Errorf("failed to save config: %w", err)
+				}
+				ui.PrintWarning(fmt.Sprintf("%s=%s: wrote an empty config (no protection) and proceeding.",
+					config.EnvBootstrap, config.BootstrapEmpty))
+				return runGuard(args)
 			}
-			ui.PrintWarning("--no-prompt set with no env config: wrote an empty config (no protection) and proceeding.")
-			return runGuard(args)
+
+			// BootstrapDeny: refuse anything that is not a recognized safe read,
+			// and write nothing. This fails closed on unknown/future verbs too:
+			// the ticket's invariant is "an unconfigured guard must not run
+			// state-altering commands", and IsStateAltering returns false for any
+			// verb outside the classification map — so an unrecognized mutating
+			// verb (e.g. `certificate approve`) would otherwise slip through. Reads
+			// carry no mutation risk, so they pass. (Read-based secret exfiltration
+			// is a separate axis: it requires configuring protected_resources,
+			// which by definition does not exist on an unconfigured first run.)
+			if !guard.IsSafeCommand(forwarded) {
+				if jsonMode {
+					jr := guard.JSONResult{
+						Decision: "denied",
+						Reason:   "no-config-bootstrap-deny",
+						Command:  cmdStr,
+					}
+					if b, mErr := json.Marshal(jr); mErr == nil {
+						fmt.Fprintln(os.Stderr, string(b))
+					}
+				} else {
+					ui.PrintWarning("Refusing to run: the guard has no configuration, so it cannot confirm this command is a safe read on this cluster.")
+					ui.PrintInfo("Configure it, then re-run:")
+					ui.PrintInfo("  kubectl-guard config init --protected-contexts 'prod-*' --protected-resources secret")
+					ui.PrintInfo("  or set KUBECTL_GUARD_PROTECTED_CONTEXTS / KUBECTL_GUARD_PROTECTED_RESOURCES")
+					ui.PrintInfo(fmt.Sprintf("  or set %s=%s to run deliberately unprotected.",
+						config.EnvBootstrap, config.BootstrapEmpty))
+				}
+				os.Exit(guard.ExitDenied)
+			}
+			ui.PrintWarning("No guard configuration found; this read-only command runs unprotected. Run 'kubectl-guard config init' to configure.")
+			return guard.ExecKubectl(forwarded)
+		}
+		if noPrompt {
+			// bootstrapMode == prompt: an explicit opt-in to the wizard. Say so,
+			// because it overrides --no-prompt and needs a TTY to complete.
+			ui.PrintWarning(fmt.Sprintf("%s=%s overrides --no-prompt: launching the interactive setup wizard.",
+				config.EnvBootstrap, config.BootstrapPrompt))
 		}
 		contexts, err := guard.GetAllContexts()
 		if err != nil {
@@ -768,7 +824,10 @@ Protection model:
 Guard-only flags (stripped before forwarding to kubectl):
   --json         Emit a structured decision object on stderr for non-allow
   --yes          Auto-confirm a gated command (audited; block mode not bypassed)
-  --no-prompt    Headless: no interactive setup wizard
+  --no-prompt    Headless: no interactive setup wizard. With no config, the
+                 posture comes from KUBECTL_GUARD_BOOTSTRAP (deny by default:
+                 state-altering commands are refused, reads pass, nothing is
+                 written to disk).
 
 Config subcommands:
   setup                      Run the setup wizard
@@ -813,8 +872,11 @@ Examples:
 Environment:
   Config file: ~/.kubectl-guard.yaml
   Audit log:   ~/.kubectl-guard-audit.log
-  See the README for KUBECTL_GUARD_* variables (actor, headless bootstrap,
-  CONFIRM, BYPASS).
+  KUBECTL_GUARD_BOOTSTRAP=deny|empty|prompt  Headless first-run posture when no
+                 config exists (default deny: refuse state-altering commands,
+                 allow reads, write nothing).
+  See the README for the other KUBECTL_GUARD_* variables (actor, headless
+  bootstrap, CONFIRM, BYPASS).
 `
 	fmt.Print(strings.TrimSpace(help) + "\n")
 }

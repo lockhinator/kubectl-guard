@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -60,5 +61,51 @@ func TestInitFromFlags(t *testing.T) {
 	}
 	if cfg.ConfirmMode != ConfirmModeTypeName {
 		t.Errorf("ConfirmMode = %q, want %q", cfg.ConfirmMode, ConfirmModeTypeName)
+	}
+}
+
+// TestBootstrapMode covers the headless first-run posture. Unset means deny;
+// an unrecognized value ALSO means deny (fail closed) but is reported invalid
+// so the caller can warn — a typo must never silently produce an unprotected
+// guard.
+func TestBootstrapMode(t *testing.T) {
+	tests := []struct {
+		env       string
+		wantMode  string
+		wantValid bool
+	}{
+		{"", BootstrapDeny, true},
+		{"deny", BootstrapDeny, true},
+		{"empty", BootstrapEmpty, true},
+		{"prompt", BootstrapPrompt, true},
+		{"DENY", BootstrapDeny, true},
+		{"Empty", BootstrapEmpty, true},
+		{"  deny  ", BootstrapDeny, true},
+		{"emtpy", BootstrapDeny, false}, // typo
+		{"none", BootstrapDeny, false},  // plausible-but-wrong
+		{"false", BootstrapDeny, false}, // truthy-looking
+		{"0", BootstrapDeny, false},     // truthy-looking
+	}
+	for _, tt := range tests {
+		t.Run(tt.env, func(t *testing.T) {
+			t.Setenv(EnvBootstrap, tt.env)
+			mode, valid := BootstrapMode()
+			if mode != tt.wantMode || valid != tt.wantValid {
+				t.Errorf("BootstrapMode() with %q = (%q, %v), want (%q, %v)",
+					tt.env, mode, valid, tt.wantMode, tt.wantValid)
+			}
+		})
+	}
+}
+
+// TestBootstrapModeNeverSilentlyUnprotected: every input that is not exactly
+// "empty" must resolve to a mode that does not write an unprotected config.
+func TestBootstrapModeNeverSilentlyUnprotected(t *testing.T) {
+	for _, v := range []string{"", "deny", "prompt", "emtpy", "EMTPY", "no", "yes", "1", "empty "} {
+		t.Setenv(EnvBootstrap, v)
+		mode, _ := BootstrapMode()
+		if mode == BootstrapEmpty && strings.TrimSpace(strings.ToLower(v)) != BootstrapEmpty {
+			t.Errorf("BootstrapMode() with %q = empty; only an exact \"empty\" may opt into an unprotected config", v)
+		}
 	}
 }

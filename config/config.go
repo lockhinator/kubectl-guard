@@ -106,6 +106,33 @@ type Config struct {
 	// aborted/timeout. Only affects the interactive prompt; --json/--yes/no-TTY
 	// paths already resolve without blocking.
 	ConfirmTimeoutSeconds int `yaml:"confirm_timeout_seconds,omitempty"`
+
+	// DiscoverShortNames controls whether the guard discovers CRD short names by
+	// querying `kubectl api-resources` (cached), so protecting a CRD by its kind
+	// also blocks its short name (e.g. protecting "secretstore" blocks
+	// `kubectl get ss`). nil/true enables it (the default); set to false to opt
+	// out (air-gapped / latency-sensitive). Discovery is best-effort and only ever
+	// ADDS short names, so it can never weaken protection below the built-ins.
+	DiscoverShortNames *bool `yaml:"discover_short_names,omitempty"`
+
+	// discovered maps a runtime-discovered short name to its canonical resource
+	// form (e.g. "ss" -> "secretstore"). It is populated by the guard from the
+	// api-resources cache before matching and is NOT serialized. nil means "not
+	// discovered / built-ins only".
+	discovered map[string]string `yaml:"-"`
+}
+
+// ShouldDiscoverShortNames reports whether CRD short-name discovery is enabled.
+// It defaults to true; only an explicit `discover_short_names: false` disables it.
+func (c *Config) ShouldDiscoverShortNames() bool {
+	return c.DiscoverShortNames == nil || *c.DiscoverShortNames
+}
+
+// SetDiscoveredShortNames installs the runtime-discovered short-name map used by
+// resource matching. The guard calls it after loading the api-resources cache;
+// a nil or empty map leaves matching on the built-in short names only.
+func (c *Config) SetDiscoveredShortNames(m map[string]string) {
+	c.discovered = m
 }
 
 // ApplyDefaults fills in zero-value fields with sensible defaults.
@@ -349,10 +376,27 @@ var resourceShortNames = map[string]string{
 	"pdb": "poddisruptionbudget", "pc": "priorityclass", "sc": "storageclass",
 }
 
-// NormalizeResource canonicalizes a resource name for matching: lower-cased,
-// stripped of any "/name" or ".group" suffix, singularized, and expanded from
-// short name to canonical form. This makes "secret", "secrets", "Secret", and
-// "cm"/"configmap" compare predictably.
+// resourceCanonicalSet is the set of canonical resource names the built-in short
+// names expand to (the values of resourceShortNames). It lets NormalizeResource
+// recognize a name that is ALREADY canonical — including one that ends in "s"
+// like "ingress"/"storageclass" — and not mangle it by blindly trimming the "s".
+var resourceCanonicalSet = func() map[string]bool {
+	m := make(map[string]bool, len(resourceShortNames))
+	for _, v := range resourceShortNames {
+		m[v] = true
+	}
+	return m
+}()
+
+// NormalizeResource canonicalizes a resource name for matching using the BUILT-IN
+// short names only: lower-cased, stripped of any "/name" or ".group" suffix,
+// expanded from a short name to its canonical form, and singularized. This makes
+// "secret", "secrets", "Secret", and "cm"/"configmap" compare predictably.
+//
+// Runtime-discovered CRD short names are deliberately NOT applied here. They are
+// applied only as an ADDITIVE alternative in IsResourceProtected, so discovery
+// can never change the canonical form of a name and therefore can never remove a
+// match that the built-ins produced (the "discovery only adds" invariant).
 func NormalizeResource(name string) string {
 	if i := strings.IndexAny(name, "/."); i >= 0 {
 		name = name[:i]
@@ -361,24 +405,97 @@ func NormalizeResource(name string) string {
 	if full, ok := resourceShortNames[name]; ok {
 		return full
 	}
-	singular := strings.TrimSuffix(name, "s")
-	if full, ok := resourceShortNames[singular]; ok {
-		return full
+	// A name that is already canonical (including "ingress"/"storageclass",
+	// whose singular legitimately ends in "s") must not be stripped.
+	if resourceCanonicalSet[name] {
+		return name
 	}
-	return singular
+	// Singularize. Kubernetes plurals of the built-in kinds are regular "s"
+	// (pods), "es" after s/x/z/ch (ingresses, storageclasses), or "ies" from a
+	// trailing "y" (networkpolicies -> networkpolicy). Try each candidate and
+	// return the first that lands on a known canonical form or short name, so a
+	// user protecting the kind is matched by every form kubectl accepts.
+	for _, singular := range singularCandidates(name) {
+		if full, ok := resourceShortNames[singular]; ok {
+			return full
+		}
+		if resourceCanonicalSet[singular] {
+			return singular
+		}
+	}
+	return strings.TrimSuffix(name, "s")
+}
+
+// singularCandidates returns the plausible singular forms of name, most-specific
+// plural rule first, so the caller can accept the first that resolves to a known
+// resource. It never mis-singularizes an unknown name because the caller only
+// acts on a candidate that matches a built-in canonical/short form.
+func singularCandidates(name string) []string {
+	var out []string
+	if s := strings.TrimSuffix(name, "ies"); s != name {
+		out = append(out, s+"y") // networkpolicies -> networkpolicy
+	}
+	if s := strings.TrimSuffix(name, "es"); s != name {
+		out = append(out, s) // ingresses -> ingress
+	}
+	if s := strings.TrimSuffix(name, "s"); s != name {
+		out = append(out, s) // pods -> pod
+	}
+	return out
+}
+
+// discoveredExpand returns the canonical resource a discovered CRD short name
+// maps to (e.g. "ss" -> "secretstore"), or "" if name is not a discovered short
+// name. It checks the plain name and its singular form. It is the ONLY place the
+// discovered map is consulted, and it is used purely to ADD matches.
+func discoveredExpand(name string, discovered map[string]string) string {
+	if len(discovered) == 0 {
+		return ""
+	}
+	if i := strings.IndexAny(name, "/."); i >= 0 {
+		name = name[:i]
+	}
+	name = strings.ToLower(name)
+	if v, ok := discovered[name]; ok {
+		return v
+	}
+	if s := strings.TrimSuffix(name, "s"); s != name {
+		if v, ok := discovered[s]; ok {
+			return v
+		}
+	}
+	return ""
 }
 
 // IsResourceProtected reports whether candidate names a protected resource.
 // Matching is case-insensitive and treats singular/plural/short-name forms as
 // equivalent.
+//
+// Discovery is strictly ADDITIVE and cannot weaken protection: the base decision
+// (nc == np) uses only the built-in normalization on BOTH sides, so anything
+// protected without discovery stays protected. A discovered CRD short name only
+// adds new ways to match — the candidate being a short name for the protected
+// kind, the protected entry being a short name for the candidate's kind, or both
+// being short names for the same kind. Because the discovered map never touches
+// the base normalization, even a poisoned cache can only ever over-block.
 func (c *Config) IsResourceProtected(candidate string) bool {
 	if candidate == "" || len(c.ProtectedResources) == 0 {
 		return false
 	}
 	nc := NormalizeResource(candidate)
+	ncd := discoveredExpand(candidate, c.discovered)
 	for _, p := range c.ProtectedResources {
-		if nc == NormalizeResource(p) {
+		np := NormalizeResource(p)
+		switch {
+		case nc == np:
 			return true
+		case ncd != "" && ncd == np:
+			return true
+		}
+		if npd := discoveredExpand(p, c.discovered); npd != "" {
+			if npd == nc || (ncd != "" && npd == ncd) {
+				return true
+			}
 		}
 	}
 	return false

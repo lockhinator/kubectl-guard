@@ -179,6 +179,7 @@ func TestNamespaceFromContextGated(t *testing.T) {
 		[]string{"delete", "pod", "nginx"},
 		staticContext("dev"),
 		fakeContextNamespace("kube-system"),
+		noShortNames,
 	)
 	if res != RequireConfirmation {
 		t.Errorf("result = %v, want RequireConfirmation (context namespace protected)", res)
@@ -194,6 +195,7 @@ func TestNamespaceFromContextUnprotected(t *testing.T) {
 		[]string{"delete", "pod", "nginx"},
 		staticContext("dev"),
 		fakeContextNamespace("team-a"),
+		noShortNames,
 	)
 	if res != Allow {
 		t.Errorf("result = %v, want Allow (context namespace unprotected)", res)
@@ -210,6 +212,7 @@ func TestNamespaceFlagOverridesContextNamespace(t *testing.T) {
 		[]string{"delete", "pod", "nginx", "-n", "default"},
 		staticContext("dev"),
 		fakeContextNamespace("kube-system"),
+		noShortNames,
 	)
 	if res != Allow {
 		t.Errorf("result = %v, want Allow (-n default overrides context namespace)", res)
@@ -219,6 +222,7 @@ func TestNamespaceFlagOverridesContextNamespace(t *testing.T) {
 		[]string{"delete", "pod", "nginx", "-n", "kube-system"},
 		staticContext("dev"),
 		fakeContextNamespace("default"),
+		noShortNames,
 	)
 	if res2 != RequireConfirmation {
 		t.Errorf("result = %v, want RequireConfirmation (-n kube-system)", res2)
@@ -237,6 +241,7 @@ func TestNamespaceFromContextBlockMode(t *testing.T) {
 		[]string{"delete", "pod", "nginx"},
 		staticContext("dev"),
 		fakeContextNamespace("kube-system"),
+		noShortNames,
 	)
 	if res != Blocked {
 		t.Errorf("result = %v, want Blocked (context namespace, block mode)", res)
@@ -253,6 +258,7 @@ func TestNamespaceFromContextLookupErrorFallsBack(t *testing.T) {
 		[]string{"delete", "pod", "nginx"},
 		staticContext("dev"),
 		errResolver,
+		noShortNames,
 	)
 	if res != Allow {
 		t.Errorf("result = %v, want Allow (lookup error falls back to default, which is unprotected)", res)
@@ -270,6 +276,7 @@ func TestNamespaceFromContextNotConsultedWithoutProtection(t *testing.T) {
 		[]string{"delete", "pod", "nginx"},
 		staticContext("dev"),
 		spy,
+		noShortNames,
 	)
 	if called {
 		t.Error("context-namespace resolver was called with no namespace protection configured")
@@ -286,7 +293,7 @@ func TestReadOnlyDoesNotResolveContextNamespace(t *testing.T) {
 	defer cleanup()
 	called := false
 	spy := func(_, _ string) (string, error) { called = true; return "kube-system", nil }
-	res, _, _, _ := checkWithResolvers([]string{"get", "pods"}, staticContext("dev"), spy)
+	res, _, _, _ := checkWithResolvers([]string{"get", "pods"}, staticContext("dev"), spy, noShortNames)
 	if called {
 		t.Error("read-only 'get pods' invoked the context-namespace resolver")
 	}

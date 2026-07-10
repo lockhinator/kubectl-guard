@@ -2,6 +2,7 @@
 package guard
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -90,21 +91,30 @@ const (
 // loaded config (non-nil for Allow/Blocked/RequireConfirmation) so callers do
 // not need to re-read the file.
 func Check(args []string) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace)
+	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace, DiscoverShortNames)
 }
+
+// ShortNameDiscoverer returns discovered CRD short names for the command's
+// target cluster (or nil to fall back to built-ins). Injected so the decision
+// core can be tested without shelling out to `kubectl api-resources`.
+type ShortNameDiscoverer func(cfg *config.Config, args []string) map[string]string
+
+// noShortNames is the discoverer used by checkWith: it discovers nothing, so
+// existing tests never spawn a kubectl api-resources subprocess.
+func noShortNames(*config.Config, []string) map[string]string { return nil }
 
 // checkWith is the test seam for the current-context lookup. It uses the no-op
-// context-namespace resolver so existing tests never spawn a kubectl
-// subprocess; tier-2 namespace resolution (from a context's baked-in namespace)
-// is exercised via checkWithResolvers with an injected fake.
+// context-namespace resolver AND the no-op short-name discoverer so existing
+// tests never spawn a kubectl subprocess; tier-2 namespace resolution and CRD
+// short-name discovery are exercised via checkWithResolvers with injected fakes.
 func checkWith(args []string, current CurrentContextFunc) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, current, noContextNamespace)
+	return checkWithResolvers(args, current, noContextNamespace, noShortNames)
 }
 
-// checkWithResolvers is the testable core of Check: both the current-context
-// lookup and the context-namespace lookup are injected so the protection
-// decision can be exercised without kubectl.
-func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc) (Result, string, *config.Config, error) {
+// checkWithResolvers is the testable core of Check: the current-context lookup,
+// the context-namespace lookup, and the CRD short-name discovery are all injected
+// so the protection decision can be exercised without kubectl.
+func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer) (Result, string, *config.Config, error) {
 	// Config must be readable; if we cannot tell what is protected we refuse.
 	exists, err := config.Exists()
 	if err != nil {
@@ -133,6 +143,15 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 
 	// Best-effort context for messaging; failures are handled below.
 	ctx, ctxErr := resolveContextWith(args, current)
+
+	// Enrich resource matching with discovered CRD short names (cached), so that
+	// protecting a CRD by kind also blocks its short name (e.g. "secretstore"
+	// blocks `get ss`). Best-effort and additive: on any failure it is a no-op and
+	// matching stays on the built-in short names. Only worth doing when resource
+	// protection is configured.
+	if cfg.HasProtectedResources() {
+		cfg.SetDiscoveredShortNames(discover(cfg, args))
+	}
 
 	// Protected resources are blocked globally, regardless of context or verb.
 	if MatchesProtectedResource(cfg, args) {
@@ -343,6 +362,17 @@ func kubectlCommand(args ...string) (*exec.Cmd, error) {
 		return nil, err
 	}
 	return exec.Command(path, args...), nil
+}
+
+// kubectlCommandContext is kubectlCommand with a context, so a slow or hung
+// kubectl invocation (a stalled apiserver call, a hanging exec-credential auth
+// plugin) can be bounded by a deadline instead of blocking the guard forever.
+func kubectlCommandContext(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	path, err := RealKubectlPath()
+	if err != nil {
+		return nil, err
+	}
+	return exec.CommandContext(ctx, path, args...), nil
 }
 
 // RealKubectlPath resolves the path to the real kubectl binary by walking PATH

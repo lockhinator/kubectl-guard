@@ -7,8 +7,11 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -581,6 +584,39 @@ func runGuard(args []string) error {
 			os.Exit(guard.ExitNeedsConfirm)
 		}
 
+		// Install a signal handler for the duration of the preview + interactive
+		// prompt — the one place the guard blocks (on a slow diff/get, or on stdin).
+		// A Ctrl-C / SIGTERM here otherwise hits Go's default handler and kills the
+		// process with no audit entry, so a gated command the operator abandoned
+		// leaves no record. Record it as aborted ("interrupted") and exit non-zero.
+		// Best-effort: AppendAudit is flock-serialized and fast, so it will not hang
+		// shutdown. Torn down once we have an answer, so a signal arriving after
+		// approval cannot spuriously abort an already-confirmed command.
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sigDone := make(chan struct{})
+		// decided makes the abort-vs-answer outcome mutually exclusive: whichever
+		// of {a signal, the operator's answer} claims it FIRST acts, and the other
+		// becomes a no-op. Without this, a signal that races the answer (arriving
+		// after the prompt returns but before teardown) would still fire and write a
+		// contradictory "interrupted" audit entry for a command that actually ran —
+		// signal.Stop does not drain an already-buffered signal, and a bare select
+		// gives the done channel no priority.
+		var decided int32
+		go func() {
+			select {
+			case <-sigCh:
+				if atomic.CompareAndSwapInt32(&decided, 0, 1) {
+					audit(guard.OutcomeAborted, "interrupted")
+					fmt.Fprintln(os.Stderr, "\nInterrupted.")
+					os.Exit(guard.ExitNeedsConfirm)
+				}
+				// The answer already committed and the command is proceeding; the
+				// interrupt lost the race, so record nothing.
+			case <-sigDone:
+			}
+		}()
+
 		// Optional: preview what the command will affect before prompting.
 		// A diffable apply (apply/create/replace -f) is previewed with
 		// `kubectl diff`; a non-diffable destructive command (delete/scale/... with
@@ -623,6 +659,18 @@ func runGuard(args []string) error {
 		} else {
 			outcome = ui.Confirm(message, timeout)
 		}
+
+		// Claim the decision for the answer. If a signal won the race, the watcher
+		// is committing an abort+exit; block until that os.Exit terminates us, so we
+		// never run a command the operator interrupted. If the answer won, the
+		// watcher's signal case becomes a no-op.
+		if !atomic.CompareAndSwapInt32(&decided, 0, 1) {
+			<-make(chan struct{})
+		}
+		// Stop handling signals and release the watcher goroutine so a late Ctrl-C
+		// cannot abort an already-approved command and the goroutine does not leak.
+		signal.Stop(sigCh)
+		close(sigDone)
 
 		switch outcome {
 		case ui.ConfirmApproved:

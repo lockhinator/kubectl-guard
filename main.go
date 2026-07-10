@@ -81,6 +81,8 @@ func run() error {
 			return runGuard(os.Args[1:])
 		case "doctor":
 			return runDoctor()
+		case "explain":
+			return runExplain(os.Args[2:])
 		case "--version", "-V":
 			fmt.Printf("kubectl-guard %s\n", version)
 			return nil
@@ -125,6 +127,56 @@ func runDoctor() error {
 	}
 
 	return nil
+}
+
+// runExplain answers "would this command be gated, and why?" by running the
+// guard's real decision logic (guard.Check) without exec'ing kubectl, prompting,
+// or auditing — a policy preflight for agents and humans. Output goes to stdout;
+// --json emits the runtime JSONResult shape so agents parse one schema.
+//
+//	kubectl-guard explain [--json] -- <kubectl args...>
+func runExplain(args []string) error {
+	forwarded, jsonMode := guard.StripGuardFlags(args)
+	// Strip a single leading "--" separating explain's flags from the command.
+	if len(forwarded) > 0 && forwarded[0] == "--" {
+		forwarded = forwarded[1:]
+	}
+	if len(forwarded) == 0 {
+		return fmt.Errorf("usage: kubectl-guard explain [--json] -- <kubectl args...>")
+	}
+
+	res := guard.Explain(forwarded)
+	cmdStr := strings.Join(guard.RedactArgs(forwarded), " ")
+
+	if jsonMode {
+		b, err := json.Marshal(res.JSONResult(cmdStr))
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+
+	fmt.Printf("decision:  %s\n", res.Decision)
+	fmt.Printf("reason:    %s\n", res.Reason)
+	fmt.Printf("verb:      %s (%s)\n", nonEmpty(res.Verb, "(none)"), res.Class)
+	if res.Context != "" {
+		fmt.Printf("context:   %s\n", res.Context)
+	}
+	if res.Namespace != "" {
+		fmt.Printf("namespace: %s\n", res.Namespace)
+	}
+	if res.Resource != "" {
+		fmt.Printf("resource:  %s\n", res.Resource)
+	}
+	return nil
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 func orUnknown(s string) string {
@@ -1408,6 +1460,9 @@ func printHelp() {
 Usage:
   kubectl-guard [kubectl args...]     Run kubectl with protection
   kubectl-guard config <subcommand>   Manage configuration
+  kubectl-guard explain [--json] -- <kubectl args...>
+                                      Preflight: would this be gated, and why?
+                                      (runs the decision without kubectl/prompt/audit)
   kubectl-guard doctor                Check PATH-shadowing interception
   kubectl-guard --version             Print version (or -V)
   kubectl-guard --help                Print this help

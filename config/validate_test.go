@@ -29,6 +29,8 @@ func TestValidate(t *testing.T) {
 		{"invalid in_cluster", Config{InCluster: "sometimes"}, "in_cluster"},
 		{"invalid sensitive_access", Config{SensitiveAccess: "maybe"}, "sensitive_access"},
 		{"valid sensitive_access gate", Config{SensitiveAccess: SensitiveAccessGate}, ""},
+		{"invalid blast_radius", Config{BlastRadius: "gato"}, "blast_radius"},
+		{"valid blast_radius block", Config{BlastRadius: BlastRadiusBlock}, ""},
 		{"empty sensitive_verbs entry", Config{SensitiveVerbs: []string{"exec", ""}}, "sensitive_verbs"},
 		{"valid in_cluster namespace", Config{InCluster: InClusterNamespace}, ""},
 		{"valid in_cluster deny", Config{InCluster: InClusterDeny}, ""},

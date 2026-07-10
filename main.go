@@ -36,6 +36,7 @@ var guardConfigSubcommands = map[string]bool{
 	"confirm-mode":     true,
 	"context-mode":     true,
 	"namespace-mode":   true,
+	"blast-radius":     true,
 	"audit-mode":       true,
 	"audit":            true,
 	"path":             true,
@@ -348,6 +349,8 @@ func runGuard(args []string) error {
 				blockReason = "protected-context-block-mode"
 			case guard.IsSensitiveAccess(cfg, forwarded) && cfg != nil && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock:
 				blockReason = "sensitive-access-block"
+			case guard.IsBlastRadiusActive(cfg, forwarded) && cfg != nil && cfg.BlastRadiusMode() == config.BlastRadiusBlock:
+				blockReason = "blast-radius-block"
 			default:
 				blockReason = "protected-namespace-block-mode"
 			}
@@ -375,6 +378,12 @@ func runGuard(args []string) error {
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
 			case "sensitive-access-block":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s is a sensitive-access verb (sensitive_access: block; refused on every context)", cmdDesc))
+			case "blast-radius-block":
+				scope := "a wide-scope mutation"
+				if _, why := guard.BlastRadius(forwarded); why != "" {
+					scope = why
+				}
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s — %s (blast_radius: block; refused on every context)", cmdDesc, scope))
 			default: // protected-namespace-block-mode
 				// Prefer the namespace OBJECT the command targets by name
 				// (`delete namespace kube-system`) over the namespace it would
@@ -415,6 +424,7 @@ func runGuard(args []string) error {
 		// message names whichever actually applies.
 		reason := "protected context"
 		target := ctx
+		wide, blastReason := guard.BlastRadius(forwarded)
 		switch nameTarget, byName := guard.ProtectedNamespaceNameTarget(cfg, forwarded); {
 		case guard.IsSensitiveAccess(cfg, forwarded) && !cfg.IsContextProtected(ctx) && !byName:
 			// Gated purely because it is a sensitive-access verb on an otherwise
@@ -432,6 +442,10 @@ func runGuard(args []string) error {
 			reason, target = "protected namespace", parsed.Namespace
 		case cfg != nil && cfg.IsContextProtected(ctx):
 			reason, target = "protected context", ctx
+		case wide && cfg != nil && cfg.BlastRadiusMode() != config.BlastRadiusOff:
+			// Gated as a wide-scope / bulk mutation with no protected context or
+			// namespace in play — name the scope so the human sees WHY.
+			reason, target = "blast radius", blastReason
 		case cfg != nil && cfg.HasProtectedNamespaces():
 			// Namespace-driven gating from the context's baked-in namespace.
 			reason, target = "protected namespace", guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
@@ -717,6 +731,30 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "blast-radius [off|gate|block]",
+		Short: "Show or set gating of wide-scope / bulk mutations on every context",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
+				return nil
+			}
+			if !cfg.SetBlastRadiusMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.BlastRadiusOff, config.BlastRadiusGate, config.BlastRadiusBlock)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Blast radius set: " + cfg.BlastRadius)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "audit",
 		Short: "Show the audit log path and recent entries",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -866,6 +904,7 @@ func printConfig() error {
 	}
 
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
+	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
 
 	auditPath, _ := config.AuditPath(cfg)
 	ui.PrintInfo("Audit log: " + auditPath)
@@ -948,6 +987,10 @@ Config subcommands:
                              Show or set how protected contexts are enforced
   namespace-mode [confirm|block]
                              Show or set how protected namespaces are enforced
+  blast-radius [off|gate|block]
+                             Gate wide-scope / bulk mutations (delete --all,
+                             apply --prune, a selector or --all-namespaces on a
+                             destructive verb, a force delete) on every context
   audit-mode [all|gated|off] Show or set what the audit log records
   audit                      Show the audit log path and recent entries
   validate                   Check the config for problems (exit non-zero if any;

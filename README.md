@@ -555,6 +555,18 @@ Fields:
   (default `exec, cp, attach, debug, port-forward, proxy`). You can add a verb you
   consider sensitive (e.g. `logs`, if apps log secrets) — it is then gated even
   though it is otherwise read-only
+- **`blast_radius`** — `off` (default), `gate`, or `block`. Gates **wide-scope /
+  bulk mutations** on **every** context, because a command's danger is also about
+  *how much* it destroys, not only *where* it runs — these are exactly the
+  mistakes an agent makes on a "dev" cluster. Triggers: a destructive verb with
+  `--all`, a label/field selector (`-l`/`--selector`/`--field-selector`), or
+  `--all-namespaces`; a **force delete** (`--force` or `--grace-period=0`); and
+  `apply --prune` (deletes anything not in the manifest). `gate` requires
+  confirmation, `block` refuses; the message names *why* (e.g. "`--all` targets
+  every object of the type in the namespace"). A genuine `--dry-run` is **not**
+  gated (it changes nothing, whatever its scope). Composes most-restrictive with
+  context/namespace protection. Set it with
+  `kubectl-guard config blast-radius gate`
 - **`in_cluster`** — policy for running with **no named context** (inside a pod
   on the serviceaccount config, or CI with an in-cluster kubeconfig), when
   protected contexts are configured. `namespace` (default) gates by the resolved

@@ -273,6 +273,25 @@ type ParsedArgs struct {
 	// affected objects are chosen server-side, so they are not knowable from argv.
 	HasSelector bool
 
+	// Prune is kubectl's `apply --prune`: after applying the manifest, DELETE any
+	// live resource (matching the selector/allowlist) that is not present in it.
+	// It is the widest possible delete, so it is a blast-radius signal. Boolean,
+	// like --all; --prune=false does not prune. Verified against
+	// `kubectl apply --help` (v1.33).
+	Prune bool
+
+	// Force is kubectl's `--force`. On delete it means force/immediate deletion
+	// (skip graceful termination); on apply/replace it means delete-and-recreate.
+	// Boolean; --force=false is not a force operation. It is distinct from
+	// --force-conflicts (server-side apply), which splitLong keeps separate.
+	Force bool
+
+	// GracePeriod captures --grace-period's value (a duration in seconds). On
+	// delete, --grace-period=0 is an immediate/force deletion. HasGracePeriod
+	// distinguishes an unset flag from an explicit "0".
+	GracePeriod    string
+	HasGracePeriod bool
+
 	// Raw is the value of --raw: a literal API-server path, e.g.
 	// "/api/v1/namespaces/default/secrets/db-creds". kubectl requests it
 	// verbatim, so no resource token ever appears in the command and resource
@@ -618,6 +637,39 @@ func ParseArgs(args []string) ParsedArgs {
 					}
 				} else {
 					p.All = true
+				}
+			case "--prune":
+				// Boolean, like --all: honor --prune=false, and never consume the
+				// next argument (it would swallow a following token).
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.Prune = b
+					} else {
+						p.Prune = true
+					}
+				} else {
+					p.Prune = true
+				}
+			case "--force":
+				// Boolean. --force=false is not a force operation.
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.Force = b
+					} else {
+						p.Force = true
+					}
+				} else {
+					p.Force = true
+				}
+			case "--grace-period":
+				// Takes a value (seconds). Consume it in the space form so it does
+				// not land in verb/resource position.
+				p.HasGracePeriod = true
+				if hasInline {
+					p.GracePeriod = val
+				} else if i+1 < len(args) {
+					p.GracePeriod = args[i+1]
+					skipNext = true
 				}
 			case "--selector", "--field-selector":
 				// Both take a value and both stand in for the NAME argument:

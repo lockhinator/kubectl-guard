@@ -59,7 +59,7 @@ var guardConfigSubcommands = map[string]bool{
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		reportError(err)
 		os.Exit(1)
 	}
 }
@@ -244,6 +244,47 @@ func execKubectl(args []string) error {
 	if err != nil && (errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist)) {
 		ui.PrintWarning("kubectl not found on PATH. Install kubectl (https://kubernetes.io/docs/tasks/tools/) or fix your PATH.")
 		os.Exit(1)
+	}
+	return err
+}
+
+// reportError is the single sink for errors that reach the top level. It writes
+// to stderr in one consistent shape — "kubectl-guard: error: <msg>" for humans,
+// or a structured {"error": "..."} object when --json was requested — instead of
+// cobra's usage dump, a raw Go error, or the old bare "Error: ..." prefix. It
+// never prints usage; flag-parse errors surface usage via the cobra
+// FlagErrorFunc (guardFlagErrorFunc) before the error reaches here.
+func reportError(err error) {
+	if err == nil {
+		return
+	}
+	msg := strings.TrimSpace(err.Error())
+	if jsonRequested(os.Args[1:]) {
+		if b, mErr := json.Marshal(map[string]string{"error": msg}); mErr == nil {
+			fmt.Fprintln(os.Stderr, string(b))
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, "kubectl-guard: error: "+msg)
+}
+
+// jsonRequested reports whether JSON mode was requested at the top level. It
+// delegates to guard.StripGuardFlags so it honors every accepted form
+// (--json, --json=true, --json=false) and the "--" separator EXACTLY as the
+// decision path does — a hand-rolled scan drifted from it (missed --json=true).
+func jsonRequested(args []string) bool {
+	_, jsonMode := guard.StripGuardFlags(args)
+	return jsonMode
+}
+
+// guardFlagErrorFunc prints usage for a flag-parse error (the one error class
+// where usage is genuinely helpful) and returns the error so reportError still
+// emits the consistent message. RunE errors get no usage dump. In --json mode the
+// human usage text is suppressed so it cannot pollute the structured error line
+// an agent parses from stderr.
+func guardFlagErrorFunc(c *cobra.Command, err error) error {
+	if !jsonRequested(os.Args[1:]) {
+		fmt.Fprintln(os.Stderr, strings.TrimRight(c.UsageString(), "\n"))
 	}
 	return err
 }
@@ -774,7 +815,12 @@ func newConfigCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "config",
 		Short: "Manage kubectl-guard configuration",
+		// Errors and usage are routed through the top-level reportError sink for a
+		// consistent shape; usage is restored only for flag-parse errors.
+		SilenceErrors: true,
+		SilenceUsage:  true,
 	}
+	rootCmd.SetFlagErrorFunc(guardFlagErrorFunc)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "setup",
@@ -1306,10 +1352,11 @@ func newConfigCommand() *cobra.Command {
 			cfg, err := config.Load()
 			if err != nil {
 				// An unparseable config file is itself a fatal validation
-				// failure. Print it and exit non-zero directly, so the output is
-				// the single clean line below rather than cobra's usage dump plus
-				// a doubled "Error:" from the top-level handler.
-				ui.PrintWarning("Config is not valid YAML: " + err.Error())
+				// failure. config.Load already wraps it as "config file <path> is
+				// not valid YAML: ..."; print that verbatim (don't re-prefix, which
+				// doubled the phrase) and exit non-zero directly, so the output is a
+				// single clean line rather than cobra's usage dump.
+				ui.PrintWarning(err.Error())
 				os.Exit(1)
 			}
 			cfg.ApplyDefaults()
@@ -1360,9 +1407,12 @@ func runConfigCommand() error {
 // auto-attaches the `completion` subcommand to a root that has children.
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "kubectl-guard",
-		Short: "Protect production clusters and sensitive resources from accidental kubectl commands",
+		Use:           "kubectl-guard",
+		Short:         "Protect production clusters and sensitive resources from accidental kubectl commands",
+		SilenceErrors: true,
+		SilenceUsage:  true,
 	}
+	root.SetFlagErrorFunc(guardFlagErrorFunc)
 	root.AddCommand(newConfigCommand())
 	root.AddCommand(&cobra.Command{
 		Use:   "doctor",

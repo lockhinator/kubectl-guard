@@ -595,7 +595,10 @@ func Load() (*Config, error) {
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, err
+		// Wrap the raw yaml library error ("yaml: line 1: ...") with context so
+		// callers surface an actionable message ("config file <path> is not valid
+		// YAML: ...") rather than a bare library string.
+		return nil, fmt.Errorf("config file %s is not valid YAML: %w", path, err)
 	}
 
 	cfg.ApplyDefaults()

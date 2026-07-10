@@ -134,7 +134,7 @@ func runBypass(args []string) error {
 	if exists, err := config.Exists(); err == nil && exists {
 		if cfg, err := config.Load(); err == nil {
 			e := guard.AuditEntry{
-				Command: strings.Join(args, " "),
+				Command: guard.RedactCommand(args),
 				Outcome: guard.OutcomeBypassed,
 				Reason:  "KUBECTL_GUARD_BYPASS",
 			}
@@ -174,7 +174,17 @@ func runGuard(args []string) error {
 	forwarded, yesFlag := guard.StripYes(forwarded)
 
 	result, ctx, cfg, err := guard.Check(forwarded)
-	cmdStr := strings.Join(forwarded, " ")
+	// Secret-bearing values (--token, --from-literal=k=v, --patch bodies, key
+	// material, ...) are redacted once, here. Every surface that DISPLAYS the
+	// command — the audit log, --json output, and user-facing messages — derives
+	// from `redacted`; every surface that DECIDES (protection matching, namespace
+	// resolution) keeps using `forwarded`, and kubectl is exec'd with `forwarded`.
+	//
+	// Message and JSON builders take the redacted slice, not just the joined
+	// string: they surface individual tokens (the resource name, the command
+	// description), and a raw token would bypass the redactor entirely.
+	redacted := guard.RedactArgs(forwarded)
+	cmdStr := strings.Join(redacted, " ")
 
 	// Parse once to attribute impersonation (--as) and credential overrides
 	// (--token) in the audit log, so the record shows who a command ran AS,
@@ -207,7 +217,7 @@ func runGuard(args []string) error {
 	// only in --json mode for non-Allow results; for Allow nothing is emitted so
 	// kubectl's stdout stays clean for the agent.
 	emitDecision := func() {
-		jr := guard.JSONForResult(result, ctx, cmdStr, forwarded, err)
+		jr := guard.JSONForResult(result, ctx, cmdStr, redacted, err)
 		b, mErr := json.Marshal(jr)
 		if mErr != nil {
 			return
@@ -282,7 +292,7 @@ func runGuard(args []string) error {
 			}
 		}
 		if jsonMode {
-			jr := guard.JSONForResult(result, ctx, cmdStr, forwarded, err)
+			jr := guard.JSONForResult(result, ctx, cmdStr, redacted, err)
 			jr.Reason = blockReason
 			if blockReason != "protected-resource" {
 				jr.Resource = "" // block-mode is not about a specific resource
@@ -291,7 +301,7 @@ func runGuard(args []string) error {
 				fmt.Fprintln(os.Stderr, string(b))
 			}
 		} else {
-			cmdDesc := guard.GetCommandDescription(forwarded)
+			cmdDesc := guard.GetCommandDescription(redacted)
 			switch blockReason {
 			case "protected-resource":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
@@ -336,7 +346,7 @@ func runGuard(args []string) error {
 			os.Exit(guard.ExitNeedsConfirm)
 		}
 
-		cmdDesc := guard.GetCommandDescription(forwarded)
+		cmdDesc := guard.GetCommandDescription(redacted)
 		// Describe what is protected so the user knows why they're confirming.
 		// Namespace protection (#19) may trigger gating even on an unprotected
 		// context (including from the context's baked-in namespace), so the

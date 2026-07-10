@@ -200,6 +200,72 @@ Every attempt — blocked, aborted, or confirmed — is appended to the audit lo
 
 By default the audit log captures **every** command the agent runs — including the ones it was allowed to run — not just the ones that were gated. So when Claude shells into your cluster, you get a complete, timestamped record of everything it executed, which is invaluable for post-incident review. Tune this with `config audit-mode` (`all` | `gated` | `off`).
 
+### Secret redaction
+
+Secret-bearing flag **values** are redacted from every surface the guard
+produces — the audit log, `--json` output, and user-facing messages — while the
+flag name (and, for `--from-literal`, the key) is kept so the record stays
+useful:
+
+```bash
+kubectl create secret generic db --from-literal=password=hunter2
+# audit log records: create secret generic db --from-literal=password=***
+```
+
+Redacted:
+
+| Form | Example | Logged as |
+|------|---------|-----------|
+| Credential flags | `--token`, `--password`, `--docker-password`, `--docker-email`, `--client-key`, `--client-certificate`, `--certificate-authority`, `--tls-private-key` | `--token=***` |
+| `key=value` flags | `--from-literal`, `--env` (`-e`), `--exec-env`, `--auth-provider-arg` | `--env=DB_PASSWORD=***` |
+| `set env` positionals | `kubectl set env deploy/api DB_PASSWORD=hunter2` | `set env deploy/api DB_PASSWORD=***` |
+| JSON/YAML blobs | `--patch` (`-p`), `--overrides`, `--exec-arg` | `patch secret db -p ***` |
+| `config set` credential properties | `kubectl config set users.admin.token hunter2` | `config set users.admin.token ***` |
+
+Both `--flag=value` and `--flag value` forms are covered — as are pflag's
+attached shorthand forms (`-ePASSWORD=x`), kubectl's own credential flags when
+they appear in an `exec`/`run` payload after `--` (`exec pod -- app --token x`),
+and `kubectl patch secret db -p '{"stringData":{"password":"…"}}'`, the usual way
+to set a secret from the CLI. The **key is preserved** so the log still records
+*which* variable was set, just not to what. kubectl still receives the real,
+unredacted command.
+
+A patch/overrides body is redacted **whole**: the guard cannot prove an
+arbitrary JSON blob is free of secret material, so it applies the same "cannot
+prove it is safe" stance it uses for `--raw`. The verb and target still appear,
+so `patch deploy/web -p ***` tells you what was patched, just not with what.
+
+Redaction of positional `key=value` and of short flags is deliberately
+verb-scoped, because kubectl reuses letters: `-p` is `--patch` on `patch` but
+the boolean `--previous` on `logs`, so `kubectl logs -p nginx` is logged
+verbatim. Likewise `set image deploy/x nginx=nginx:latest` and
+`label pod nginx env=prod` carry no secrets and stay legible.
+
+**Caveats.** Redaction only covers secrets that appear in `argv`:
+
+- `--from-file=./creds.txt` and `--cert`/`--key` put only a *path* in argv. The
+  file's contents are never seen by the guard, so they are never logged — but
+  the guard also cannot redact them.
+- A value piped on **stdin** (`--env -`, `--from-file -`) is out of view entirely.
+- An `exec`/`run` **payload after `--`** is an arbitrary foreign command line.
+  The guard redacts kubectl's *own* credential flags there (`--token`,
+  `--password`, …), but it cannot know an application's flag names or inline
+  env assignments, so `exec pod -- env PASSWORD=hunter2 app`,
+  `-- app --db-password=hunter2`, and `-- sh -c 'export TOKEN=…'` are logged
+  verbatim. Blanking every `key=value` or unknown `--flag` in a payload would
+  destroy the audit record of what actually ran; keep secrets out of exec
+  payloads (reference a mounted Secret or stdin instead).
+- Your **shell history** is outside the guard's control. `HISTCONTROL=ignorespace`
+  plus a leading space, or `--from-file`, avoids it.
+- A secret embedded in a **manifest** applied with `-f` is not in argv. With
+  `diff_before_confirm: true`, `kubectl diff` output is printed to your terminal
+  before the prompt and can show Secret contents; it is never written to the
+  audit log.
+- **Arbitrary data fields** are not redacted, because the guard cannot tell a
+  secret from ordinary metadata and blanking them would make the log useless:
+  `kubectl annotate pod x secret=hunter2` and `kubectl label pod x key=hunter2`
+  are logged verbatim. Annotations and labels are not a place to put credentials.
+
 ### Identifying who drove a command
 
 Every audit entry records an **`actor`** — *who* drove the command — alongside the OS `user` whose account ran it. Without this, `kubectl get secret` run by Claude and typed by a human look identical in the log. Set `KUBECTL_GUARD_ACTOR` to a short label so agent activity is distinguishable:

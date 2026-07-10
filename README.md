@@ -146,7 +146,7 @@ without a prompt using either **environment variables** or `config init`:
 # Option 1: env vars (take effect on first run when no config exists)
 export KUBECTL_GUARD_PROTECTED_CONTEXTS=prod-*,prod-cluster
 export KUBECTL_GUARD_PROTECTED_RESOURCES=secret
-export KUBECTL_GUARD_CONFIRM_MODE=type-name   # optional: simple|type-name
+export KUBECTL_GUARD_CONFIRM_MODE=type-name   # optional: simple|type-name|agent-relay
 
 # Option 2: write the config in one shot
 kubectl-guard config init \
@@ -228,6 +228,34 @@ Type "prod-cluster" to confirm (anything else aborts):
 ```
 
 Every attempt — blocked, aborted, or confirmed — is appended to the audit log (`~/.kubectl-guard-audit.log`), so you have a full record of what your agent tried to do.
+
+### Agent-relay: human-in-the-loop *through* the agent
+
+Type-to-confirm correctly blocks an autonomous agent — but it also blocks the
+legitimate case where a human *is* in the loop, reachable through the agent's own
+UI. **Agent-relay mode** turns a gated command into a structured request the
+agent can relay to its human and resume:
+
+```bash
+kubectl-guard config confirm-mode agent-relay
+# or, per-invocation / per-session:  export KUBECTL_GUARD_AGENT_RELAY=1
+```
+
+On a command that would normally prompt, the guard does **not** touch stdin.
+Instead it prints a needs-confirmation object on **stderr** and exits `4`:
+
+```json
+{"decision":"needs-confirmation","reason":"agent-relay","context":"prod-cluster","command":"delete pod nginx","prompt":"Approve \"delete pod\" on protected context \"prod-cluster\"? Re-run with --yes to proceed."}
+```
+
+The agent framework catches exit code `4` + the JSON, relays `prompt` to its
+human, and — once approved — re-runs the **same command with `--yes`**, which
+runs it (audited as `auto-confirmed`). If the human declines, the agent aborts.
+This makes the guard composable with agent UIs instead of competing with them.
+
+A hard **`Blocked`** (protected resource, or `context_mode: block`) is *not*
+relayable — it stays a hard refusal (exit `2`) regardless of confirm mode, so
+agent-relay can never downgrade a block into an approvable request.
 
 By default the audit log captures **every** command the agent runs — including the ones it was allowed to run — not just the ones that were gated. So when Claude shells into your cluster, you get a complete, timestamped record of everything it executed, which is invaluable for post-incident review. Tune this with `config audit-mode` (`all` | `gated` | `off`).
 
@@ -451,8 +479,10 @@ Fields:
 - **`protected_resources`** — resources blocked everywhere, reads included
 - **`context_mode`** — `confirm` (default, prompts) or `block` (hard-refuse)
 - **`namespace_mode`** — `confirm` (default) or `block`, for protected namespaces
-- **`confirm_mode`** — `simple` (y/N prompt) or `type-name` (type the
-  context name to confirm)
+- **`confirm_mode`** — `simple` (y/N prompt), `type-name` (type the context
+  name to confirm), or `agent-relay` (emit a needs-confirmation JSON on stderr
+  and exit `4` instead of prompting, for agent frameworks — see
+  [Agent-relay](#agent-relay-human-in-the-loop-through-the-agent))
 - **`audit_mode`** — `all` (default, logs every command including allowed
   passthrough), `gated` (only interventions: blocked/confirmed/aborted/denied),
   or `off` (logs nothing)
@@ -612,7 +642,8 @@ than blocking on stdin.
 | `KUBECTL_GUARD_ACTOR` | Labels *who* drove the command in the audit log (e.g. `claude-code`). |
 | `KUBECTL_GUARD_PROTECTED_CONTEXTS` | Comma-separated context patterns for headless first-run config. |
 | `KUBECTL_GUARD_PROTECTED_RESOURCES` | Comma-separated resources to block everywhere for headless first-run config. |
-| `KUBECTL_GUARD_CONFIRM_MODE` | `simple` \| `type-name`, applied on headless first-run config. |
+| `KUBECTL_GUARD_CONFIRM_MODE` | `simple` \| `type-name` \| `agent-relay`, applied on headless first-run config. |
+| `KUBECTL_GUARD_AGENT_RELAY` | Truthy: emit a needs-confirmation JSON on stderr and exit `4` on a gated command instead of prompting (agent-relay). |
 | `KUBECTL_GUARD_NO_PROMPT` | Truthy: skip the setup wizard (headless). The resulting posture is set by `KUBECTL_GUARD_BOOTSTRAP`. |
 | `KUBECTL_GUARD_BOOTSTRAP` | `deny` (default) \| `empty` \| `prompt` — headless first-run posture when there is no config. `deny` refuses state-altering commands and writes no config. |
 | `KUBECTL_GUARD_CONFIRM` | Truthy (`yes`): auto-confirm gated commands (audited as `auto-confirmed`). |

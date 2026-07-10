@@ -16,9 +16,10 @@ const (
 	EnvProtectedResources = "KUBECTL_GUARD_PROTECTED_RESOURCES"
 	EnvConfirmMode        = "KUBECTL_GUARD_CONFIRM_MODE"
 	EnvNoPrompt           = "KUBECTL_GUARD_NO_PROMPT"
-	EnvConfirm            = "KUBECTL_GUARD_CONFIRM"   // audited auto-confirm of RequireConfirmation
-	EnvBypass             = "KUBECTL_GUARD_BYPASS"    // audited full bypass (discouraged)
-	EnvBootstrap          = "KUBECTL_GUARD_BOOTSTRAP" // headless first-run posture
+	EnvConfirm            = "KUBECTL_GUARD_CONFIRM"     // audited auto-confirm of RequireConfirmation
+	EnvBypass             = "KUBECTL_GUARD_BYPASS"      // audited full bypass (discouraged)
+	EnvBootstrap          = "KUBECTL_GUARD_BOOTSTRAP"   // headless first-run posture
+	EnvAgentRelay         = "KUBECTL_GUARD_AGENT_RELAY" // emit needs-confirmation JSON instead of prompting
 )
 
 // Headless bootstrap modes. They decide what happens on the first run when
@@ -70,7 +71,7 @@ func InitFromEnv() (cfg *Config, ok bool) {
 	cfg = &Config{}
 	cfg.ProtectedContexts = append(cfg.ProtectedContexts, splitCSV(os.Getenv(EnvProtectedContexts))...)
 	cfg.ProtectedResources = append(cfg.ProtectedResources, splitCSV(os.Getenv(EnvProtectedResources))...)
-	if m := strings.TrimSpace(os.Getenv(EnvConfirmMode)); m == ConfirmModeSimple || m == ConfirmModeTypeName {
+	if m := strings.TrimSpace(os.Getenv(EnvConfirmMode)); isValidConfirmMode(m) {
 		cfg.ConfirmMode = m
 	}
 	cfg.ApplyDefaults()
@@ -83,11 +84,20 @@ func InitFromFlags(protectedContexts, protectedResources, confirmMode string) *C
 	cfg := &Config{}
 	cfg.ProtectedContexts = append(cfg.ProtectedContexts, splitCSV(protectedContexts)...)
 	cfg.ProtectedResources = append(cfg.ProtectedResources, splitCSV(protectedResources)...)
-	if m := strings.TrimSpace(confirmMode); m == ConfirmModeSimple || m == ConfirmModeTypeName {
+	if m := strings.TrimSpace(confirmMode); isValidConfirmMode(m) {
 		cfg.ConfirmMode = m
 	}
 	cfg.ApplyDefaults()
 	return cfg
+}
+
+// isValidConfirmMode reports whether m names a known confirmation mode.
+func isValidConfirmMode(m string) bool {
+	switch m {
+	case ConfirmModeSimple, ConfirmModeTypeName, ConfirmModeAgentRelay:
+		return true
+	}
+	return false
 }
 
 // splitCSV splits a comma-separated env/flag value, trimming whitespace and

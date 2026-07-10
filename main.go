@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -88,6 +89,18 @@ func run() error {
 			return runDoctor()
 		case "explain":
 			return runExplain(os.Args[2:])
+		case "completion", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
+			// `completion <shell>` generates the guard's own completion script;
+			// `__complete`/`__completeNoDesc` are cobra's hidden runtime requests the
+			// sourced script issues. Only handle these when invoked by our own name.
+			// When invoked as the `kubectl` shim, these belong to KUBECTL's native
+			// (also cobra-based) completion — hijacking `kubectl __complete ...` would
+			// break the user's real kubectl tab-completion — so fall through to the
+			// normal guard path exactly as before this feature existed.
+			if invokedAsGuard() {
+				return runRootCompletion()
+			}
+			return runGuard(os.Args[1:])
 		case "--version", "-V":
 			fmt.Printf("kubectl-guard %s\n", version)
 			return nil
@@ -702,7 +715,62 @@ func runGuard(args []string) error {
 	return nil
 }
 
-func runConfigCommand() error {
+// firstArgComplete returns a ValidArgsFunction that dynamically completes only
+// the FIRST positional argument from get(), with no fallback file completion.
+func firstArgComplete(get func() []string) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+		if len(args) != 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		return get(), cobra.ShellCompDirectiveNoFileComp
+	}
+}
+
+// loadProtectedList returns a slice from the on-disk config for completion
+// (protected contexts/namespaces/resources), best-effort — nil on any error so
+// completion never fails the shell.
+func loadProtectedList(get func(*config.Config) []string) []string {
+	exists, err := config.Exists()
+	if err != nil || !exists {
+		return nil
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return nil
+	}
+	return get(cfg)
+}
+
+// availableContexts lists kubectl contexts for completing add-context,
+// best-effort (nil if kubectl/kubeconfig is unavailable).
+func availableContexts() []string {
+	contexts, err := guard.GetAllContexts()
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(contexts))
+	for _, c := range contexts {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
+// commonResourceKinds is a static completion list for add-resource — common
+// kinds users protect; not exhaustive (any kind is still accepted).
+func commonResourceKinds() []string {
+	return []string{
+		"secret", "configmap", "pod", "deployment", "statefulset", "daemonset",
+		"node", "namespace", "persistentvolume", "persistentvolumeclaim",
+		"serviceaccount", "role", "rolebinding", "clusterrole", "clusterrolebinding",
+		"ingress", "service", "job", "cronjob",
+	}
+}
+
+// newConfigCommand builds the `config` cobra command tree (setup, init, list,
+// the add/remove families, the mode setters, audit, validate, path). It is used
+// both to execute a `config` invocation (runConfigCommand) and to model the CLI
+// surface for shell-completion generation (newRootCommand).
+func newConfigCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "config",
 		Short: "Manage kubectl-guard configuration",
@@ -771,26 +839,42 @@ func runConfigCommand() error {
 	})
 
 	// add-context / add (alias) / remove-context / remove (alias) /
-	// add-resource / remove-resource all share one shape.
-	addCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool) {
+	// add-resource / remove-resource all share one shape. valid is an optional
+	// dynamic ValidArgsFunction (nil for none).
+	addCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool, valid func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective)) {
 		rootCmd.AddCommand(&cobra.Command{
-			Use:    use,
-			Short:  short,
-			Args:   cobra.ExactArgs(1),
-			Hidden: hidden,
+			Use:               use,
+			Short:             short,
+			Args:              cobra.ExactArgs(1),
+			Hidden:            hidden,
+			ValidArgsFunction: valid,
 			RunE: func(_ *cobra.Command, a []string) error {
 				return mutateConfig(func(c *config.Config) bool { return fn(c, a[0]) }, fmt.Sprintf(doneTmpl, a[0]), fmt.Sprintf(noopTmpl, a[0]))
 			},
 		})
 	}
-	addCmd("add-context <pattern>", "Add a context/pattern to the protected list", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", false)
-	addCmd("add <pattern>", "Alias for add-context", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", true)
-	addCmd("remove-context <pattern>", "Remove a context/pattern from the protected list", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", false)
-	addCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true)
-	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false)
-	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false)
-	addCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*)", (*config.Config).AddNamespace, "Protected namespace: %s", "Namespace already protected: %s", false)
-	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false)
+	// Dynamic completions: add-* offers candidates to add (available contexts,
+	// common resource kinds), remove-* offers what is currently protected.
+	completeAddContext := firstArgComplete(availableContexts)
+	completeRemoveContext := firstArgComplete(func() []string {
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedContexts })
+	})
+	completeAddResource := firstArgComplete(commonResourceKinds)
+	completeRemoveResource := firstArgComplete(func() []string {
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedResources })
+	})
+	completeRemoveNamespace := firstArgComplete(func() []string {
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedNamespaces })
+	})
+
+	addCmd("add-context <pattern>", "Add a context/pattern to the protected list", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", false, completeAddContext)
+	addCmd("add <pattern>", "Alias for add-context", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", true, completeAddContext)
+	addCmd("remove-context <pattern>", "Remove a context/pattern from the protected list", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", false, completeRemoveContext)
+	addCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true, completeRemoveContext)
+	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false, completeAddResource)
+	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false, completeRemoveResource)
+	addCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*)", (*config.Config).AddNamespace, "Protected namespace: %s", "Namespace already protected: %s", false, nil)
+	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false, completeRemoveNamespace)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "confirm-mode [simple|type-name|agent-relay]",
@@ -1257,9 +1341,59 @@ func runConfigCommand() error {
 		},
 	})
 
-	// Parse args starting from "config"
-	rootCmd.SetArgs(os.Args[2:])
-	return rootCmd.Execute()
+	return rootCmd
+}
+
+// runConfigCommand executes a `kubectl-guard config ...` invocation. It parses
+// args starting after "config" (os.Args[2:]), matching the top-level dispatch.
+func runConfigCommand() error {
+	cmd := newConfigCommand()
+	cmd.SetArgs(os.Args[2:])
+	return cmd.Execute()
+}
+
+// newRootCommand builds a cobra command tree that models kubectl-guard's OWN
+// subcommands (config + its subtree, doctor, explain). Its only job is to back
+// shell-completion generation and dynamic completion — the actual top-level
+// dispatch stays the manual switch in run(), because a cobra root would try to
+// parse kubectl passthrough (`kubectl-guard get pods`) as its own command. Cobra
+// auto-attaches the `completion` subcommand to a root that has children.
+func newRootCommand() *cobra.Command {
+	root := &cobra.Command{
+		Use:   "kubectl-guard",
+		Short: "Protect production clusters and sensitive resources from accidental kubectl commands",
+	}
+	root.AddCommand(newConfigCommand())
+	root.AddCommand(&cobra.Command{
+		Use:   "doctor",
+		Short: "Check PATH-shadowing interception, config, and posture",
+		RunE:  func(_ *cobra.Command, _ []string) error { return runDoctor() },
+	})
+	root.AddCommand(&cobra.Command{
+		Use:   "explain",
+		Short: "Preflight: would a kubectl command be gated, and why?",
+		RunE:  func(_ *cobra.Command, args []string) error { return runExplain(args) },
+	})
+	return root
+}
+
+// invokedAsGuard reports whether the binary was invoked by its own name
+// (kubectl-guard, or a dev/test build thereof) rather than as the `kubectl`
+// shim. It disambiguates `completion`/`__complete`, which BOTH kubectl-guard and
+// kubectl (both cobra-based) define: invoked as ourselves they mean the guard's
+// completion; invoked as the kubectl shim they are kubectl's own and must pass
+// through untouched.
+func invokedAsGuard() bool {
+	return strings.Contains(filepath.Base(os.Args[0]), "kubectl-guard")
+}
+
+// runRootCompletion drives the modeled root command for both `completion <shell>`
+// (script generation) and cobra's hidden `__complete`/`__completeNoDesc` runtime
+// requests (dynamic completion), which the sourced script issues.
+func runRootCompletion() error {
+	root := newRootCommand()
+	root.SetArgs(os.Args[1:])
+	return root.Execute()
 }
 
 // mutateConfig loads (or creates) the config, applies fn, saves on change, and

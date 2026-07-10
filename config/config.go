@@ -225,6 +225,13 @@ type Config struct {
 	// default-safe verb (e.g. logs) as requiring confirmation. See ClassifyOverride.
 	CommandOverrides CommandOverrides `yaml:"command_overrides,omitempty"`
 
+	// RequireConfirmWeakening, when true, makes a `config` change that WEAKENS
+	// protection (removing a protected target, downgrading a mode, disabling the
+	// audit/impersonation guards, …) require interactive confirmation; additive
+	// changes stay frictionless. Every config change is audited regardless. Off by
+	// default. See WeakensProtection.
+	RequireConfirmWeakening bool `yaml:"require_confirm_weakening,omitempty"`
+
 	// UnknownVerb is the strict-mode policy for a verb the guard cannot classify as
 	// safe or state-altering, on a PROTECTED context/namespace: "allow" (default),
 	// "gate" (require confirmation), or "deny" (refuse). Unknown verbs on

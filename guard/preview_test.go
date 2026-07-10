@@ -110,10 +110,10 @@ func TestPreviewArgs(t *testing.T) {
 		{name: "skip on --server", args: []string{"delete", "pods", "-l", "x", "--server", "https://evil:6443"}, want: nil},
 		{name: "skip on --cluster", args: []string{"delete", "pods", "-l", "x", "--cluster", "prod"}, want: nil},
 		{name: "skip on --as", args: []string{"delete", "pods", "-l", "x", "--as", "system:masters"}, want: nil},
-		{name: "skip on --token", args: []string{"delete", "pods", "-l", "x", "--token", "abc"}, want: nil},
+		{name: "skip on --token", args: []string{"delete", "pods", "-l", "x", "--token", "t"}, want: nil},
 		{name: "skip on --user", args: []string{"delete", "pods", "-l", "x", "--user", "admin"}, want: nil},
 		{name: "skip on --username", args: []string{"delete", "pods", "-l", "x", "--username", "bob"}, want: nil},
-		{name: "skip on --password", args: []string{"delete", "pods", "-l", "x", "--password", "sekret"}, want: nil},
+		{name: "skip on --password", args: []string{"delete", "pods", "-l", "x", "--password", "p"}, want: nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -593,6 +593,29 @@ Fields:
   gated (it changes nothing, whatever its scope). Composes most-restrictive with
   context/namespace protection. Set it with
   `kubectl-guard config blast-radius gate`
+- **`command_overrides`** — tailor the built-in safe/state-altering verb
+  classification without forking. `state_altering` marks a custom/plugin verb as
+  requiring confirmation on protected contexts; `unsafe_safe` promotes a
+  default-safe verb (e.g. `logs`, if apps log secrets) to gated; `safe`
+  downgrades a verb to read-only pass-through for the **context/namespace** gates
+  (a deliberate, documented loosening — the guard trusts your list). A `safe`
+  override does **not** disable the orthogonal policies: `protected_resources`,
+  `blast_radius`, and `sensitive_access` still apply (e.g. `delete` marked safe is
+  still blocked by a protected `secret`, and a wide `delete --all` is still gated
+  by `blast_radius`). Matching is case-insensitive; a verb
+  listed as both safe and state-altering resolves **most-restrictive** (gated).
+  Overrides are verb-level (they do not distinguish subcommands). Manage with
+  `kubectl-guard config command-override <safe|dangerous|remove> <verb>`:
+
+  ```yaml
+  command_overrides:
+    state_altering: [my-dangerous-plugin]
+    unsafe_safe:    [logs]   # treat logs as requiring confirmation
+    safe:           [my-read-only-plugin]
+  ```
+
+  (Unknown verbs the guard has never heard of still pass through unless you list
+  them — see the strict-mode option to gate unknown verbs instead.)
 - **`actor_policies`** — per-actor overrides of `context_mode` / `namespace_mode`,
   so a known agent label can be held to a stricter posture than a human. The
   actor is resolved exactly as for auditing (`KUBECTL_GUARD_ACTOR` → the `actor`

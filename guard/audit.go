@@ -26,6 +26,7 @@ const (
 	OutcomeAutoConfirmed = "auto-confirmed" // gated command, auto-approved via --yes/KUBECTL_GUARD_CONFIRM (audited)
 	OutcomeBypassed      = "bypassed"       // guard fully bypassed via KUBECTL_GUARD_BYPASS (audited, discouraged)
 	OutcomeDryRun        = "dry-run"        // state-altering command allowed because --dry-run changes nothing
+	OutcomeRelayed       = "relayed"        // agent-relay mode: emitted needs-confirmation JSON, did not prompt
 )
 
 // AuditEntry is a single line in the audit log.

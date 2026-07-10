@@ -394,14 +394,6 @@ func runGuard(args []string) error {
 			return guard.ExecKubectl(forwarded)
 		}
 
-		if jsonMode {
-			// An agent framework cannot answer an interactive prompt; abort
-			// immediately with structured output instead of blocking on stdin.
-			emitDecision()
-			audit(guard.OutcomeAborted, "")
-			os.Exit(guard.ExitNeedsConfirm)
-		}
-
 		cmdDesc := guard.GetCommandDescription(redacted)
 		// Describe what is protected so the user knows why they're confirming.
 		// Namespace protection (#19) may trigger gating even on an unprotected
@@ -421,6 +413,36 @@ func runGuard(args []string) error {
 			reason, target = "protected namespace", guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
 		}
 		message := fmt.Sprintf("%s on %s: %s", cmdDesc, reason, target)
+
+		// Agent-relay mode: instead of prompting stdin, emit a structured
+		// needs-confirmation object (including a human-readable prompt) and exit
+		// with the needs-confirmation code, so an agent framework can relay the
+		// request to its own human and re-run with --yes once approved. This is a
+		// decision axis independent of --json: it is active whenever the confirm
+		// mode is agent-relay or KUBECTL_GUARD_AGENT_RELAY is set.
+		agentRelay := (cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay) || boolEnv(config.EnvAgentRelay)
+		if agentRelay {
+			jr := guard.JSONResult{
+				Decision: "needs-confirmation",
+				Reason:   "agent-relay",
+				Context:  ctx,
+				Command:  cmdStr,
+				Prompt:   fmt.Sprintf("Approve %q on %s %q? Re-run with --yes to proceed.", cmdDesc, reason, target),
+			}
+			if b, mErr := json.Marshal(jr); mErr == nil {
+				fmt.Fprintln(os.Stderr, string(b))
+			}
+			audit(guard.OutcomeRelayed, "agent-relay")
+			os.Exit(guard.ExitNeedsConfirm)
+		}
+
+		if jsonMode {
+			// An agent framework cannot answer an interactive prompt; abort
+			// immediately with structured output instead of blocking on stdin.
+			emitDecision()
+			audit(guard.OutcomeAborted, "")
+			os.Exit(guard.ExitNeedsConfirm)
+		}
 
 		// Optional: preview the change with `kubectl diff` before prompting.
 		// Only for diffable commands (apply/create/replace -f). A failed diff
@@ -529,7 +551,7 @@ func runConfigCommand() error {
 	}
 	initCmd.Flags().String("protected-contexts", "", "comma-separated context patterns to protect (e.g. 'prod-*,prod-cluster')")
 	initCmd.Flags().String("protected-resources", "", "comma-separated resources to block on every context (e.g. 'secret')")
-	initCmd.Flags().String("confirm-mode", "", "confirmation mode for protected contexts (simple|type-name)")
+	initCmd.Flags().String("confirm-mode", "", "confirmation mode for protected contexts (simple|type-name|agent-relay)")
 	rootCmd.AddCommand(initCmd)
 
 	rootCmd.AddCommand(&cobra.Command{
@@ -563,7 +585,7 @@ func runConfigCommand() error {
 	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false)
 
 	rootCmd.AddCommand(&cobra.Command{
-		Use:   "confirm-mode [simple|type-name]",
+		Use:   "confirm-mode [simple|type-name|agent-relay]",
 		Short: "Show or set the confirmation mode for protected contexts",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -576,7 +598,7 @@ func runConfigCommand() error {
 				return nil
 			}
 			if !cfg.SetConfirmMode(args[0]) {
-				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.ConfirmModeSimple, config.ConfirmModeTypeName)
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.ConfirmModeSimple, config.ConfirmModeTypeName, config.ConfirmModeAgentRelay)
 			}
 			if err := config.Save(cfg); err != nil {
 				return err
@@ -840,9 +862,11 @@ Config subcommands:
   remove-resource <name>     Stop blocking a resource
   add-namespace <pattern>    Gate state changes in matching namespaces (glob)
   remove-namespace <pattern> Stop protecting matching namespaces
-  confirm-mode [simple|type-name]
+  confirm-mode [simple|type-name|agent-relay]
                              Show or set the confirmation prompt style
-                             (type-name requires typing the context/namespace name)
+                             (type-name requires typing the context/namespace name;
+                             agent-relay emits a needs-confirmation JSON on stderr
+                             and exits 4 instead of prompting, for agent frameworks)
   context-mode [confirm|block]
                              Show or set how protected contexts are enforced
   namespace-mode [confirm|block]

@@ -33,6 +33,9 @@ type JSONResult struct {
 	Context  string `json:"context,omitempty"`  // resolved or declared context
 	Command  string `json:"command"`            // the kubectl command string
 	Resource string `json:"resource,omitempty"` // protected resource token (Blocked)
+	// Prompt is the human-readable approval request, set in agent-relay mode so
+	// an agent framework can show it to its own human before re-running with --yes.
+	Prompt string `json:"prompt,omitempty"`
 }
 
 // JSONForResult builds the structured decision object for a non-Allow result.

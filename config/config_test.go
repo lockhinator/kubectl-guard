@@ -277,6 +277,12 @@ func TestApplyDefaults(t *testing.T) {
 	if cfg.ConfirmMode != ConfirmModeTypeName {
 		t.Errorf("expected type-name, got %q", cfg.ConfirmMode)
 	}
+	if !cfg.SetConfirmMode(ConfirmModeAgentRelay) {
+		t.Error("SetConfirmMode should accept agent-relay")
+	}
+	if cfg.ConfirmMode != ConfirmModeAgentRelay {
+		t.Errorf("expected agent-relay, got %q", cfg.ConfirmMode)
+	}
 	if cfg.SetConfirmMode("bogus") {
 		t.Error("SetConfirmMode should reject invalid mode")
 	}

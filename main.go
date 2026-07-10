@@ -255,6 +255,18 @@ func runGuard(args []string) error {
 	forwarded, yesFlag := guard.StripYes(forwarded)
 
 	result, ctx, cfg, err := guard.Check(forwarded)
+
+	// Tamper signal: a group/world-writable config can be rewritten by another
+	// user to disable protection. Strict mode already fails closed inside Check
+	// (Deny); here we surface the non-strict WARNING once, before any hand-off to
+	// kubectl (syscall.Exec leaves no chance to print afterward). Suppressed in
+	// --json mode so the machine-readable stderr contract for agents stays clean.
+	if !jsonMode {
+		if insecure, detail, permErr := config.InsecureConfigPerms(); permErr == nil && insecure && (cfg == nil || !cfg.StrictPerms()) {
+			ui.PrintWarning(detail + "; protection may have been tampered with. Secure it (chmod 600 the file, 700 its directory), or set strict_config_perms / KUBECTL_GUARD_STRICT to fail closed.")
+		}
+	}
+
 	// Secret-bearing values (--token, --from-literal=k=v, --patch bodies, key
 	// material, ...) are redacted once, here. Every surface that DISPLAYS the
 	// command — the audit log, --json output, and user-facing messages — derives

@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -237,6 +238,14 @@ type Config struct {
 	// "gate" (require confirmation), or "deny" (refuse). Unknown verbs on
 	// UNPROTECTED targets always pass, so plugins keep working elsewhere.
 	UnknownVerb string `yaml:"unknown_verb,omitempty"`
+
+	// StrictConfigPerms, when true, turns a group/world-writable config file from a
+	// warning into a fatal fail-closed error (every command Denied until the mode is
+	// fixed). Save writes the config 0600; a looser mode means another user (or a
+	// misbehaving dotfiles manager) can rewrite the policy — e.g. empty the protected
+	// lists — and silently disable protection. Off by default. Also settable via the
+	// KUBECTL_GUARD_STRICT env var. See InsecureConfigPerms / StrictPerms.
+	StrictConfigPerms bool `yaml:"strict_config_perms,omitempty"`
 
 	// InCluster is the policy for running with no named context (in a pod, or CI
 	// with an in-cluster kubeconfig): "namespace" (default) gates by the resolved
@@ -578,6 +587,58 @@ func Load() (*Config, error) {
 
 	cfg.ApplyDefaults()
 	return &cfg, nil
+}
+
+// InsecureConfigPerms reports whether the config file OR its parent directory is
+// writable by group/other — either lets another user disable protection by
+// rewriting the policy (e.g. emptying the protected lists). Two vectors:
+//
+//   - A writable FILE (mode & 0o022) can be rewritten in place. Only the write
+//     bits matter — a group/world READABLE config (e.g. 0644 rw-r--r--) cannot be
+//     rewritten by others, so 0600/0640/0644 are safe; 0660/0664/0666 are not.
+//   - A writable parent DIRECTORY lets an attacker atomically REPLACE the config
+//     with a fresh 0600 file (rename), so a file-only check gives false assurance.
+//     A sticky world-writable directory (e.g. /tmp) is safe, because only the
+//     owner may rename or delete their own file there, so the sticky bit exempts it.
+//
+// Returns insecure=false when the file does not exist (nothing to tamper) so
+// callers need not special-case first run. detail describes the specific problem
+// for the warning/deny message.
+func InsecureConfigPerms() (insecure bool, detail string, err error) {
+	path, err := Path()
+	if err != nil {
+		return false, "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	if m := info.Mode().Perm(); m&0o022 != 0 {
+		return true, fmt.Sprintf("config file %s is group/world-writable (mode %#o)", path, uint32(m)), nil
+	}
+	// The file's own mode is safe, but a writable, non-sticky parent directory
+	// lets an attacker replace the file wholesale while keeping it 0600.
+	dir := filepath.Dir(path)
+	if di, derr := os.Stat(dir); derr == nil {
+		dm := di.Mode()
+		if dm.Perm()&0o022 != 0 && dm&os.ModeSticky == 0 {
+			return true, fmt.Sprintf("config directory %s is group/world-writable (mode %#o) and not sticky; the config can be replaced", dir, uint32(dm.Perm())), nil
+		}
+	}
+	return false, "", nil
+}
+
+// StrictPerms reports whether strict config-permission enforcement is active,
+// from either the config field or the KUBECTL_GUARD_STRICT env var. When on, a
+// writable config fails closed instead of merely warning.
+func (c *Config) StrictPerms() bool {
+	if c != nil && c.StrictConfigPerms {
+		return true
+	}
+	return boolEnv(EnvStrict)
 }
 
 // Save writes the config to disk atomically.

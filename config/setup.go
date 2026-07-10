@@ -20,7 +20,18 @@ const (
 	EnvBypass             = "KUBECTL_GUARD_BYPASS"      // audited full bypass (discouraged)
 	EnvBootstrap          = "KUBECTL_GUARD_BOOTSTRAP"   // headless first-run posture
 	EnvAgentRelay         = "KUBECTL_GUARD_AGENT_RELAY" // emit needs-confirmation JSON instead of prompting
+	EnvStrict             = "KUBECTL_GUARD_STRICT"      // fail closed on a group/world-writable config
 )
+
+// boolEnv reports whether an env var is set to a truthy value (1, t, true, yes,
+// y, case-insensitive). Empty/unset is false.
+func boolEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "t", "true", "yes", "y":
+		return true
+	}
+	return false
+}
 
 // Headless bootstrap modes. They decide what happens on the first run when
 // there is no config file, no KUBECTL_GUARD_* env config, and prompting is

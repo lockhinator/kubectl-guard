@@ -56,6 +56,11 @@ func (c *Config) Validate() []string {
 			problems = append(problems, fmt.Sprintf("sensitive_verbs: entry %d is empty", i))
 		}
 	}
+	if c.BlastRadius != "" && !validBlastRadiusMode(c.BlastRadius) {
+		problems = append(problems, fmt.Sprintf(
+			"blast_radius: %q is not valid (want %q, %q, or %q)",
+			c.BlastRadius, BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock))
+	}
 
 	for _, p := range c.ProtectedContexts {
 		if err := validateGlobPattern(p); err != nil {
@@ -136,6 +141,14 @@ func validInClusterMode(m string) bool {
 func validSensitiveAccessMode(m string) bool {
 	switch m {
 	case SensitiveAccessOff, SensitiveAccessGate, SensitiveAccessBlock:
+		return true
+	}
+	return false
+}
+
+func validBlastRadiusMode(m string) bool {
+	switch m {
+	case BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock:
 		return true
 	}
 	return false

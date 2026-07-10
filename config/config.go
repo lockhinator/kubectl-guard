@@ -36,6 +36,17 @@ const (
 	AuditModeOff   = "off"   // log nothing
 )
 
+// Blast-radius policies gate wide-scope / bulk mutations independently of
+// context, because a command's danger is also about HOW MUCH it changes, not
+// only WHERE it runs: `delete --all`, `apply --prune`, a label/field selector on
+// a destructive verb, `--all-namespaces`, and force deletion are dangerous even
+// on a "dev" cluster — and are exactly the mistakes an agent makes.
+const (
+	BlastRadiusOff   = "off"   // default: wide mutations gate only on protected targets
+	BlastRadiusGate  = "gate"  // require confirmation on any context
+	BlastRadiusBlock = "block" // refuse on any context
+)
+
 // Sensitive-access policies gate interactive / data-movement verbs (exec, cp,
 // attach, debug, port-forward, proxy) on EVERY context — not just protected ones
 // — because their risk is about what they can read/reach (secrets in a pod, a
@@ -150,6 +161,13 @@ type Config struct {
 	// Empty uses the defaults: exec, cp, attach, debug, port-forward, proxy.
 	SensitiveVerbs []string `yaml:"sensitive_verbs,omitempty"`
 
+	// BlastRadius gates wide-scope / bulk mutations on EVERY context: "off"
+	// (default), "gate" (confirm), or "block" (refuse). Triggers are a destructive
+	// verb with --all, a label/field selector, --all-namespaces, a force delete
+	// (--force / --grace-period=0), or `apply --prune`. A genuine --dry-run is not
+	// gated (it changes nothing). See guard.BlastRadius for the classifier.
+	BlastRadius string `yaml:"blast_radius,omitempty"`
+
 	// InCluster is the policy for running with no named context (in a pod, or CI
 	// with an in-cluster kubeconfig): "namespace" (default) gates by the resolved
 	// serviceaccount namespace, "deny" fails closed, "allow" passes through. Empty
@@ -209,6 +227,18 @@ func (c *Config) IsSensitiveVerb(verb string) bool {
 		}
 	}
 	return false
+}
+
+// BlastRadiusMode returns the blast-radius policy, defaulting to off. An invalid
+// value is caught by Validate (fail-closed), so off is only reached for the
+// genuine default.
+func (c *Config) BlastRadiusMode() string {
+	switch c.BlastRadius {
+	case BlastRadiusGate, BlastRadiusBlock:
+		return c.BlastRadius
+	default:
+		return BlastRadiusOff
+	}
 }
 
 // InClusterMode returns the configured in-cluster policy, defaulting to
@@ -462,6 +492,17 @@ func (c *Config) SetNamespaceMode(mode string) bool {
 		return false
 	}
 	c.NamespaceMode = mode
+	return true
+}
+
+// SetBlastRadiusMode sets the blast-radius policy if valid. The valid-value
+// check is validBlastRadiusMode (config/validate.go), shared with Validate, so
+// the setter and the validator can never disagree.
+func (c *Config) SetBlastRadiusMode(mode string) bool {
+	if !validBlastRadiusMode(mode) {
+		return false
+	}
+	c.BlastRadius = mode
 	return true
 }
 

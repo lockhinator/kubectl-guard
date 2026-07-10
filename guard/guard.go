@@ -171,6 +171,15 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	sensitiveActive := cfg.SensitiveAccessMode() != config.SensitiveAccessOff &&
 		cfg.IsSensitiveVerb(commandVerb(args))
 
+	// Blast-radius policy: a wide-scope / bulk mutation (delete --all, apply
+	// --prune, a selector or --all-namespaces on a destructive verb, a force
+	// delete) is gated on EVERY context because its danger is about how much it
+	// destroys, not where it runs. Unlike sensitive-access it is about the
+	// state-mutation axis, so a genuine --dry-run (which changes nothing) is NOT
+	// gated: it is deliberately excluded from the dry-run skip below, letting that
+	// early return pass a dry-run of a wide mutation through.
+	blastActive := IsBlastRadiusActive(cfg, args)
+
 	// --server points at an arbitrary API server the guard cannot map to a
 	// context name. When context protection is configured, fail closed rather
 	// than allow a command against an unverified (possibly production) cluster.
@@ -224,12 +233,13 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 			return Deny, "", cfg, fmt.Errorf("running in-cluster with no named context and in_cluster=deny; refusing (set in_cluster: namespace to gate by the serviceaccount namespace instead)")
 		case config.InClusterAllow:
 			// in_cluster: allow passes the (unevaluable) context protection
-			// through, but sensitive-access is orthogonal — it gates on what the
-			// verb can read/reach, not on the context — so a sensitive verb must
-			// still be gated even in-cluster. Fall through to the unified gate
-			// below (contextProtected stays false); only a non-sensitive command
-			// gets the blanket allow here.
-			if !sensitiveActive {
+			// through, but sensitive-access and blast-radius are orthogonal — they
+			// gate on what the verb can read/reach and on how much it destroys, not
+			// on the context — so a sensitive verb or a wide/bulk mutation must
+			// still be gated even in-cluster. Fall through to the unified gate below
+			// (contextProtected stays false); only a command that is neither gets
+			// the blanket allow here.
+			if !sensitiveActive && !blastActive {
 				return Allow, "", cfg, nil
 			}
 		default: // InClusterNamespace: context protection cannot be evaluated
@@ -273,13 +283,14 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 		namespaceProtected = namespaceTargetProtected(cfg, p, ctx, inClusterNamespace, nsFor)
 	}
 
-	if contextProtected || namespaceProtected || sensitiveActive {
+	if contextProtected || namespaceProtected || sensitiveActive || blastActive {
 		// Block mode: hard-refuse with no prompt. If ANY matching signal is in
 		// block mode, block wins (most restrictive). --yes cannot bypass this: it
 		// only auto-confirms RequireConfirmation, and Blocked is a separate result.
 		if (contextProtected && cfg.ContextMode == config.ContextModeBlock) ||
 			(namespaceProtected && cfg.NamespaceMode == config.NamespaceModeBlock) ||
-			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) {
+			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) ||
+			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) {
 			return Blocked, ctx, cfg, nil
 		}
 		return RequireConfirmation, ctx, cfg, nil

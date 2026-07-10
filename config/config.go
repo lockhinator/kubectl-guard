@@ -531,8 +531,14 @@ func (c *Config) SetAuditMode(mode string) bool {
 	return true
 }
 
-// Path returns the full path to the config file.
+// Path returns the full path to the config file. The KUBECTL_GUARD_CONFIG env
+// var overrides the location (for team / containerized / CI use where $HOME is
+// not the right place, e.g. a mounted /etc/kubectl-guard/config.yaml). Without
+// it, the default is ~/.kubectl-guard.yaml, unchanged.
 func Path() (string, error) {
+	if p := strings.TrimSpace(os.Getenv(EnvConfig)); p != "" {
+		return p, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -540,8 +546,15 @@ func Path() (string, error) {
 	return filepath.Join(home, configFileName), nil
 }
 
-// AuditPath returns the configured audit log path, or the default.
+// AuditPath returns the audit log path. Precedence, highest first: the
+// KUBECTL_GUARD_AUDIT_LOG env var (a per-invocation override, symmetric with
+// KUBECTL_GUARD_CONFIG), then the config's audit_log field, then the default
+// ~/.kubectl-guard-audit.log. The env var wins over the config field so a
+// container/CI runner can redirect the log without editing a mounted config.
 func AuditPath(cfg *Config) (string, error) {
+	if p := strings.TrimSpace(os.Getenv(EnvAuditLog)); p != "" {
+		return p, nil
+	}
 	if cfg != nil && cfg.AuditLog != "" {
 		return cfg.AuditLog, nil
 	}

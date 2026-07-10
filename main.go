@@ -1591,13 +1591,13 @@ Examples:
   kubectl delete pod nginx    # Prompts on protected contexts
 
 Environment:
-  Config file: ~/.kubectl-guard.yaml
-  Audit log:   ~/.kubectl-guard-audit.log
+  Config file: ~/.kubectl-guard.yaml   (override: KUBECTL_GUARD_CONFIG=/path)
+  Audit log:   ~/.kubectl-guard-audit.log  (override: KUBECTL_GUARD_AUDIT_LOG=/path)
   KUBECTL_GUARD_BOOTSTRAP=deny|empty|prompt  Headless first-run posture when no
                  config exists (default deny: refuse state-altering commands,
                  allow reads, write nothing).
   See the README for the other KUBECTL_GUARD_* variables (actor, headless
-  bootstrap, CONFIRM, BYPASS).
+  bootstrap, CONFIRM, BYPASS, STRICT).
 `
 	fmt.Print(strings.TrimSpace(help) + "\n")
 }

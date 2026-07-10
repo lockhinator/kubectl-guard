@@ -29,3 +29,6 @@ Thumbs.db
 
 # Dependency directories
 vendor/
+
+# Local agent/tooling scratch (not part of the project)
+.pi-subagents/

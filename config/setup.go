@@ -21,6 +21,8 @@ const (
 	EnvBootstrap          = "KUBECTL_GUARD_BOOTSTRAP"   // headless first-run posture
 	EnvAgentRelay         = "KUBECTL_GUARD_AGENT_RELAY" // emit needs-confirmation JSON instead of prompting
 	EnvStrict             = "KUBECTL_GUARD_STRICT"      // fail closed on a group/world-writable config
+	EnvConfig             = "KUBECTL_GUARD_CONFIG"      // override the config file location
+	EnvAuditLog           = "KUBECTL_GUARD_AUDIT_LOG"   // override the audit log location
 )
 
 // boolEnv reports whether an env var is set to a truthy value (1, t, true, yes,

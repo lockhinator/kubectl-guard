@@ -170,6 +170,19 @@ func TestIsStateAltering(t *testing.T) {
 		{"debug", []string{"debug", "nginx"}, true},
 		{"attach", []string{"attach", "nginx"}, true},
 
+		// High-risk access vectors: no cluster mutation, but they open a live
+		// channel into it, so they are gated like state-altering commands (#71).
+		{"port-forward", []string{"port-forward", "svc/prod-postgres", "5432:5432"}, true},
+		{"port-forward uppercase", []string{"PORT-FORWARD", "svc/db", "5432:5432"}, true},
+		{"proxy", []string{"proxy"}, true},
+		{"proxy with port", []string{"proxy", "--port=8080"}, true},
+
+		// certificate approve/deny issues or refuses a client cert — credential
+		// issuance, not a read.
+		{"certificate approve", []string{"certificate", "approve", "my-csr"}, true},
+		{"certificate deny", []string{"certificate", "deny", "my-csr"}, true},
+		{"certificate uppercase", []string{"CERTIFICATE", "approve", "my-csr"}, true},
+
 		// config/auth mutating subcommands are state-altering
 		{"config use-context", []string{"config", "use-context", "prod"}, true},
 		{"config delete-context", []string{"config", "delete-context", "prod"}, true},
@@ -480,11 +493,11 @@ func TestParseArgs(t *testing.T) {
 // case below failed before the cluster-aware parser was added.
 func TestParseArgsShortCluster(t *testing.T) {
 	tests := []struct {
-		name            string
-		args            []string
-		wantFilenames   []string
-		wantKustomize   string
-		wantPositional  []string
+		name           string
+		args           []string
+		wantFilenames  []string
+		wantKustomize  string
+		wantPositional []string
 	}{
 		// -Rf dir: -R (boolean) then -f dir -> recursive apply of dir.
 		{"-Rf dir", []string{"apply", "-Rf", "dir"}, []string{"dir"}, "", []string{"apply"}},
@@ -522,16 +535,16 @@ func TestMatchesProtectedResourceFile(t *testing.T) {
 	multiDoc := []byte("kind: ConfigMap\n---\nkind: Secret\n")
 
 	files := map[string][]byte{
-		"secret.yaml":  secretManifest,
-		"deploy.yaml":  deployManifest,
-		"multi.yaml":   multiDoc,
+		"secret.yaml": secretManifest,
+		"deploy.yaml": deployManifest,
+		"multi.yaml":  multiDoc,
 	}
 
 	for name, content := range files {
 		path := filepath.Join(t.TempDir(), name)
 		if err := os.WriteFile(path, content, 0600); err != nil {
 			t.Fatal(err)
-	}
+		}
 		files[name] = []byte(path) // reuse map to hold the real path
 	}
 

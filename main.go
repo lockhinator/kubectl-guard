@@ -134,7 +134,7 @@ func runBypass(args []string) error {
 	if exists, err := config.Exists(); err == nil && exists {
 		if cfg, err := config.Load(); err == nil {
 			e := guard.AuditEntry{
-				Command: strings.Join(args, " "),
+				Command: guard.RedactCommand(args),
 				Outcome: guard.OutcomeBypassed,
 				Reason:  "KUBECTL_GUARD_BYPASS",
 			}
@@ -174,7 +174,17 @@ func runGuard(args []string) error {
 	forwarded, yesFlag := guard.StripYes(forwarded)
 
 	result, ctx, cfg, err := guard.Check(forwarded)
-	cmdStr := strings.Join(forwarded, " ")
+	// Secret-bearing values (--token, --from-literal=k=v, --patch bodies, key
+	// material, ...) are redacted once, here. Every surface that DISPLAYS the
+	// command — the audit log, --json output, and user-facing messages — derives
+	// from `redacted`; every surface that DECIDES (protection matching, namespace
+	// resolution) keeps using `forwarded`, and kubectl is exec'd with `forwarded`.
+	//
+	// Message and JSON builders take the redacted slice, not just the joined
+	// string: they surface individual tokens (the resource name, the command
+	// description), and a raw token would bypass the redactor entirely.
+	redacted := guard.RedactArgs(forwarded)
+	cmdStr := strings.Join(redacted, " ")
 
 	// Parse once to attribute impersonation (--as) and credential overrides
 	// (--token) in the audit log, so the record shows who a command ran AS,
@@ -207,7 +217,7 @@ func runGuard(args []string) error {
 	// only in --json mode for non-Allow results; for Allow nothing is emitted so
 	// kubectl's stdout stays clean for the agent.
 	emitDecision := func() {
-		jr := guard.JSONForResult(result, ctx, cmdStr, forwarded, err)
+		jr := guard.JSONForResult(result, ctx, cmdStr, redacted, err)
 		b, mErr := json.Marshal(jr)
 		if mErr != nil {
 			return
@@ -237,8 +247,9 @@ func runGuard(args []string) error {
 		// agents and CI configure the guard without a TTY.
 		if envCfg, ok := config.InitFromEnv(); ok {
 			if err := config.Save(envCfg); err != nil {
-				ui.PrintWarning("Failed to save config from environment: " + err.Error())
-				return nil
+				// The command did not run and no config was written; surface a
+				// non-zero exit rather than a misleading success.
+				return fmt.Errorf("failed to save config from environment: %w", err)
 			}
 			if p, perr := config.Path(); perr == nil {
 				ui.PrintInfo("Wrote initial config from KUBECTL_GUARD_* env vars: " + p)
@@ -246,15 +257,70 @@ func runGuard(args []string) error {
 			// Proceed to run the command against the freshly written config.
 			return runGuard(args)
 		}
-		if noPrompt {
-			empty := &config.Config{}
-			empty.ApplyDefaults()
-			if err := config.Save(empty); err != nil {
-				ui.PrintWarning("Failed to save config: " + err.Error())
-				return nil
+		// Headless first run with nothing to go on. The bootstrap mode decides the
+		// posture; it defaults to "deny" so an unconfigured guard never silently
+		// establishes a no-protection posture and persists it to disk. (Before
+		// v0.5.0 this branch always wrote an empty config, after which every later
+		// invocation found a valid — but unprotected — config and never prompted
+		// again. The guard became a no-op and nobody noticed.)
+		bootstrapMode, validMode := config.BootstrapMode()
+		// Only warn about an unrecognized value on the headless path, where the
+		// bootstrap mode actually governs; interactively it is irrelevant.
+		if !validMode && noPrompt {
+			ui.PrintWarning(fmt.Sprintf("Unrecognized %s=%q; falling back to %q (fail closed).",
+				config.EnvBootstrap, os.Getenv(config.EnvBootstrap), bootstrapMode))
+		}
+		if noPrompt && bootstrapMode != config.BootstrapPrompt {
+			if bootstrapMode == config.BootstrapEmpty {
+				empty := &config.Config{}
+				empty.ApplyDefaults()
+				if err := config.Save(empty); err != nil {
+					// The command did not run and no config was written; surface a
+					// non-zero exit rather than a misleading success.
+					return fmt.Errorf("failed to save config: %w", err)
+				}
+				ui.PrintWarning(fmt.Sprintf("%s=%s: wrote an empty config (no protection) and proceeding.",
+					config.EnvBootstrap, config.BootstrapEmpty))
+				return runGuard(args)
 			}
-			ui.PrintWarning("--no-prompt set with no env config: wrote an empty config (no protection) and proceeding.")
-			return runGuard(args)
+
+			// BootstrapDeny: refuse anything that is not a recognized safe read,
+			// and write nothing. This fails closed on unknown/future verbs too:
+			// the ticket's invariant is "an unconfigured guard must not run
+			// state-altering commands", and IsStateAltering returns false for any
+			// verb outside the classification map — so an unrecognized mutating
+			// verb (e.g. `certificate approve`) would otherwise slip through. Reads
+			// carry no mutation risk, so they pass. (Read-based secret exfiltration
+			// is a separate axis: it requires configuring protected_resources,
+			// which by definition does not exist on an unconfigured first run.)
+			if !guard.IsSafeCommand(forwarded) {
+				if jsonMode {
+					jr := guard.JSONResult{
+						Decision: "denied",
+						Reason:   "no-config-bootstrap-deny",
+						Command:  cmdStr,
+					}
+					if b, mErr := json.Marshal(jr); mErr == nil {
+						fmt.Fprintln(os.Stderr, string(b))
+					}
+				} else {
+					ui.PrintWarning("Refusing to run: the guard has no configuration, so it cannot confirm this command is a safe read on this cluster.")
+					ui.PrintInfo("Configure it, then re-run:")
+					ui.PrintInfo("  kubectl-guard config init --protected-contexts 'prod-*' --protected-resources secret")
+					ui.PrintInfo("  or set KUBECTL_GUARD_PROTECTED_CONTEXTS / KUBECTL_GUARD_PROTECTED_RESOURCES")
+					ui.PrintInfo(fmt.Sprintf("  or set %s=%s to run deliberately unprotected.",
+						config.EnvBootstrap, config.BootstrapEmpty))
+				}
+				os.Exit(guard.ExitDenied)
+			}
+			ui.PrintWarning("No guard configuration found; this read-only command runs unprotected. Run 'kubectl-guard config init' to configure.")
+			return guard.ExecKubectl(forwarded)
+		}
+		if noPrompt {
+			// bootstrapMode == prompt: an explicit opt-in to the wizard. Say so,
+			// because it overrides --no-prompt and needs a TTY to complete.
+			ui.PrintWarning(fmt.Sprintf("%s=%s overrides --no-prompt: launching the interactive setup wizard.",
+				config.EnvBootstrap, config.BootstrapPrompt))
 		}
 		contexts, err := guard.GetAllContexts()
 		if err != nil {
@@ -282,7 +348,7 @@ func runGuard(args []string) error {
 			}
 		}
 		if jsonMode {
-			jr := guard.JSONForResult(result, ctx, cmdStr, forwarded, err)
+			jr := guard.JSONForResult(result, ctx, cmdStr, redacted, err)
 			jr.Reason = blockReason
 			if blockReason != "protected-resource" {
 				jr.Resource = "" // block-mode is not about a specific resource
@@ -291,11 +357,13 @@ func runGuard(args []string) error {
 				fmt.Fprintln(os.Stderr, string(b))
 			}
 		} else {
-			cmdDesc := guard.GetCommandDescription(forwarded)
+			cmdDesc := guard.GetCommandDescription(redacted)
 			switch blockReason {
 			case "protected-resource":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s targets a protected resource (context: %s)", cmdDesc, ctx))
-				if guard.HasUninspectableSource(forwarded) {
+				if guard.HasRawPath(forwarded) {
+					ui.PrintInfo("Command uses --raw, a literal API path the guard cannot map to a resource type; blocked because resource protection is active.")
+				} else if guard.HasUninspectableSource(forwarded) {
 					ui.PrintInfo("Command reads from stdin/URL/kustomize, which cannot be inspected; blocked as a precaution.")
 				}
 			case "protected-context-block-mode":
@@ -326,15 +394,7 @@ func runGuard(args []string) error {
 			return guard.ExecKubectl(forwarded)
 		}
 
-		if jsonMode {
-			// An agent framework cannot answer an interactive prompt; abort
-			// immediately with structured output instead of blocking on stdin.
-			emitDecision()
-			audit(guard.OutcomeAborted, "")
-			os.Exit(guard.ExitNeedsConfirm)
-		}
-
-		cmdDesc := guard.GetCommandDescription(forwarded)
+		cmdDesc := guard.GetCommandDescription(redacted)
 		// Describe what is protected so the user knows why they're confirming.
 		// Namespace protection (#19) may trigger gating even on an unprotected
 		// context (including from the context's baked-in namespace), so the
@@ -353,6 +413,36 @@ func runGuard(args []string) error {
 			reason, target = "protected namespace", guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
 		}
 		message := fmt.Sprintf("%s on %s: %s", cmdDesc, reason, target)
+
+		// Agent-relay mode: instead of prompting stdin, emit a structured
+		// needs-confirmation object (including a human-readable prompt) and exit
+		// with the needs-confirmation code, so an agent framework can relay the
+		// request to its own human and re-run with --yes once approved. This is a
+		// decision axis independent of --json: it is active whenever the confirm
+		// mode is agent-relay or KUBECTL_GUARD_AGENT_RELAY is set.
+		agentRelay := (cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay) || boolEnv(config.EnvAgentRelay)
+		if agentRelay {
+			jr := guard.JSONResult{
+				Decision: "needs-confirmation",
+				Reason:   "agent-relay",
+				Context:  ctx,
+				Command:  cmdStr,
+				Prompt:   fmt.Sprintf("Approve %q on %s %q? Re-run with --yes to proceed.", cmdDesc, reason, target),
+			}
+			if b, mErr := json.Marshal(jr); mErr == nil {
+				fmt.Fprintln(os.Stderr, string(b))
+			}
+			audit(guard.OutcomeRelayed, "agent-relay")
+			os.Exit(guard.ExitNeedsConfirm)
+		}
+
+		if jsonMode {
+			// An agent framework cannot answer an interactive prompt; abort
+			// immediately with structured output instead of blocking on stdin.
+			emitDecision()
+			audit(guard.OutcomeAborted, "")
+			os.Exit(guard.ExitNeedsConfirm)
+		}
 
 		// Optional: preview the change with `kubectl diff` before prompting.
 		// Only for diffable commands (apply/create/replace -f). A failed diff
@@ -397,7 +487,7 @@ func runGuard(args []string) error {
 		// Log BEFORE ExecKubectl: syscall.Exec replaces this process, so
 		// anything after the call never runs.
 		outcome := guard.OutcomeAllowed
-		if guard.IsDryRun(forwarded) {
+		if guard.IsDryRun(forwarded) && guard.SupportsDryRun(forwarded) {
 			outcome = guard.OutcomeDryRun
 		}
 		audit(outcome, "")
@@ -461,7 +551,7 @@ func runConfigCommand() error {
 	}
 	initCmd.Flags().String("protected-contexts", "", "comma-separated context patterns to protect (e.g. 'prod-*,prod-cluster')")
 	initCmd.Flags().String("protected-resources", "", "comma-separated resources to block on every context (e.g. 'secret')")
-	initCmd.Flags().String("confirm-mode", "", "confirmation mode for protected contexts (simple|type-name)")
+	initCmd.Flags().String("confirm-mode", "", "confirmation mode for protected contexts (simple|type-name|agent-relay)")
 	rootCmd.AddCommand(initCmd)
 
 	rootCmd.AddCommand(&cobra.Command{
@@ -495,7 +585,7 @@ func runConfigCommand() error {
 	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false)
 
 	rootCmd.AddCommand(&cobra.Command{
-		Use:   "confirm-mode [simple|type-name]",
+		Use:   "confirm-mode [simple|type-name|agent-relay]",
 		Short: "Show or set the confirmation mode for protected contexts",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -508,7 +598,7 @@ func runConfigCommand() error {
 				return nil
 			}
 			if !cfg.SetConfirmMode(args[0]) {
-				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.ConfirmModeSimple, config.ConfirmModeTypeName)
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.ConfirmModeSimple, config.ConfirmModeTypeName, config.ConfirmModeAgentRelay)
 			}
 			if err := config.Save(cfg); err != nil {
 				return err
@@ -756,7 +846,10 @@ Protection model:
 Guard-only flags (stripped before forwarding to kubectl):
   --json         Emit a structured decision object on stderr for non-allow
   --yes          Auto-confirm a gated command (audited; block mode not bypassed)
-  --no-prompt    Headless: no interactive setup wizard
+  --no-prompt    Headless: no interactive setup wizard. With no config, the
+                 posture comes from KUBECTL_GUARD_BOOTSTRAP (deny by default:
+                 state-altering commands are refused, reads pass, nothing is
+                 written to disk).
 
 Config subcommands:
   setup                      Run the setup wizard
@@ -769,9 +862,11 @@ Config subcommands:
   remove-resource <name>     Stop blocking a resource
   add-namespace <pattern>    Gate state changes in matching namespaces (glob)
   remove-namespace <pattern> Stop protecting matching namespaces
-  confirm-mode [simple|type-name]
+  confirm-mode [simple|type-name|agent-relay]
                              Show or set the confirmation prompt style
-                             (type-name requires typing the context/namespace name)
+                             (type-name requires typing the context/namespace name;
+                             agent-relay emits a needs-confirmation JSON on stderr
+                             and exits 4 instead of prompting, for agent frameworks)
   context-mode [confirm|block]
                              Show or set how protected contexts are enforced
   namespace-mode [confirm|block]
@@ -801,8 +896,11 @@ Examples:
 Environment:
   Config file: ~/.kubectl-guard.yaml
   Audit log:   ~/.kubectl-guard-audit.log
-  See the README for KUBECTL_GUARD_* variables (actor, headless bootstrap,
-  CONFIRM, BYPASS).
+  KUBECTL_GUARD_BOOTSTRAP=deny|empty|prompt  Headless first-run posture when no
+                 config exists (default deny: refuse state-altering commands,
+                 allow reads, write nothing).
+  See the README for the other KUBECTL_GUARD_* variables (actor, headless
+  bootstrap, CONFIRM, BYPASS).
 `
 	fmt.Print(strings.TrimSpace(help) + "\n")
 }

@@ -12,13 +12,54 @@ import (
 // When the config file does not exist and these are set, the guard writes the
 // initial config from them instead of launching the interactive wizard.
 const (
-	EnvProtectedContexts = "KUBECTL_GUARD_PROTECTED_CONTEXTS"
+	EnvProtectedContexts  = "KUBECTL_GUARD_PROTECTED_CONTEXTS"
 	EnvProtectedResources = "KUBECTL_GUARD_PROTECTED_RESOURCES"
 	EnvConfirmMode        = "KUBECTL_GUARD_CONFIRM_MODE"
 	EnvNoPrompt           = "KUBECTL_GUARD_NO_PROMPT"
-	EnvConfirm            = "KUBECTL_GUARD_CONFIRM"  // audited auto-confirm of RequireConfirmation
-	EnvBypass             = "KUBECTL_GUARD_BYPASS"   // audited full bypass (discouraged)
+	EnvConfirm            = "KUBECTL_GUARD_CONFIRM"     // audited auto-confirm of RequireConfirmation
+	EnvBypass             = "KUBECTL_GUARD_BYPASS"      // audited full bypass (discouraged)
+	EnvBootstrap          = "KUBECTL_GUARD_BOOTSTRAP"   // headless first-run posture
+	EnvAgentRelay         = "KUBECTL_GUARD_AGENT_RELAY" // emit needs-confirmation JSON instead of prompting
 )
+
+// Headless bootstrap modes. They decide what happens on the first run when
+// there is no config file, no KUBECTL_GUARD_* env config, and prompting is
+// disabled (--no-prompt / KUBECTL_GUARD_NO_PROMPT).
+const (
+	// BootstrapDeny (the default) refuses state-altering commands and writes no
+	// config. Reads pass through. An unconfigured guard must not silently
+	// establish a no-protection posture.
+	BootstrapDeny = "deny"
+
+	// BootstrapEmpty writes an empty config (no protection) and proceeds. This
+	// is the pre-v0.5.0 behavior, kept for the intentionally-unprotected CI
+	// case, but now opt-in.
+	BootstrapEmpty = "empty"
+
+	// BootstrapPrompt runs the interactive setup wizard even under --no-prompt.
+	// It is an explicit opt-in and will block without a TTY.
+	BootstrapPrompt = "prompt"
+)
+
+// BootstrapMode returns the headless bootstrap posture from KUBECTL_GUARD_BOOTSTRAP
+// and whether the value was recognized. Unset means deny. An unrecognized value
+// also means deny, with valid=false so the caller can warn: a typo
+// ("KUBECTL_GUARD_BOOTSTRAP=emtpy") must fail closed, never silently write an
+// unprotected config.
+func BootstrapMode() (mode string, valid bool) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvBootstrap))) {
+	case "":
+		return BootstrapDeny, true
+	case BootstrapDeny:
+		return BootstrapDeny, true
+	case BootstrapEmpty:
+		return BootstrapEmpty, true
+	case BootstrapPrompt:
+		return BootstrapPrompt, true
+	default:
+		return BootstrapDeny, false
+	}
+}
 
 // InitFromEnv builds a Config from the KUBECTL_GUARD_* environment variables.
 // It returns the config and ok=true when at least one protection value
@@ -30,7 +71,7 @@ func InitFromEnv() (cfg *Config, ok bool) {
 	cfg = &Config{}
 	cfg.ProtectedContexts = append(cfg.ProtectedContexts, splitCSV(os.Getenv(EnvProtectedContexts))...)
 	cfg.ProtectedResources = append(cfg.ProtectedResources, splitCSV(os.Getenv(EnvProtectedResources))...)
-	if m := strings.TrimSpace(os.Getenv(EnvConfirmMode)); m == ConfirmModeSimple || m == ConfirmModeTypeName {
+	if m := strings.TrimSpace(os.Getenv(EnvConfirmMode)); isValidConfirmMode(m) {
 		cfg.ConfirmMode = m
 	}
 	cfg.ApplyDefaults()
@@ -43,11 +84,20 @@ func InitFromFlags(protectedContexts, protectedResources, confirmMode string) *C
 	cfg := &Config{}
 	cfg.ProtectedContexts = append(cfg.ProtectedContexts, splitCSV(protectedContexts)...)
 	cfg.ProtectedResources = append(cfg.ProtectedResources, splitCSV(protectedResources)...)
-	if m := strings.TrimSpace(confirmMode); m == ConfirmModeSimple || m == ConfirmModeTypeName {
+	if m := strings.TrimSpace(confirmMode); isValidConfirmMode(m) {
 		cfg.ConfirmMode = m
 	}
 	cfg.ApplyDefaults()
 	return cfg
+}
+
+// isValidConfirmMode reports whether m names a known confirmation mode.
+func isValidConfirmMode(m string) bool {
+	switch m {
+	case ConfirmModeSimple, ConfirmModeTypeName, ConfirmModeAgentRelay:
+		return true
+	}
+	return false
 }
 
 // splitCSV splits a comma-separated env/flag value, trimming whitespace and
@@ -83,7 +133,9 @@ func RunSetup(contextNames []string) bool {
 	// Run multi-select
 	selected, confirmed := ui.MultiSelect(items)
 	if !confirmed {
-		fmt.Println("Setup cancelled.")
+		// Diagnostics go to stderr so stdout stays clean for kubectl output and
+		// for --json agents.
+		fmt.Fprintln(os.Stderr, "Setup cancelled.")
 		return false
 	}
 
@@ -113,7 +165,7 @@ func RunSetup(contextNames []string) bool {
 		ui.PrintInfo("No contexts protected.")
 	}
 
-	fmt.Println()
+	fmt.Fprintln(os.Stderr)
 	ui.PrintInfo("Re-run your command to continue.")
 
 	return true

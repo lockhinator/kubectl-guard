@@ -4,7 +4,10 @@ on:
   push:
     branches: [main, master]
   pull_request:
-    branches: [main, master]
+    # release/** is included so feature PRs targeting a release branch run CI.
+    # pull_request workflows are read from the BASE branch, so this must exist
+    # on the release branch itself.
+    branches: [main, master, 'release/**']
 
 jobs:
   test:

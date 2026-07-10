@@ -13,6 +13,11 @@ import (
 const (
 	ConfirmModeSimple   = "simple"    // y/N prompt (default)
 	ConfirmModeTypeName = "type-name" // must type the context name exactly
+	// ConfirmModeAgentRelay does not prompt stdin at all. On a gated command it
+	// emits a structured "needs-confirmation" object on stderr and exits with
+	// the needs-confirmation code, so an agent framework can relay the request
+	// to its own human and re-run with --yes once approved.
+	ConfirmModeAgentRelay = "agent-relay"
 )
 
 // Protection modes for protected contexts/namespaces. "confirm" (default)
@@ -394,7 +399,7 @@ func (c *Config) RemoveResource(name string) bool {
 // SetConfirmMode sets the confirmation mode if the value is valid.
 func (c *Config) SetConfirmMode(mode string) bool {
 	switch mode {
-	case ConfirmModeSimple, ConfirmModeTypeName:
+	case ConfirmModeSimple, ConfirmModeTypeName, ConfirmModeAgentRelay:
 		c.ConfirmMode = mode
 		return true
 	}

@@ -142,6 +142,15 @@ var knownLongFlags = map[string]bool{
 	"--tls-server-name": true, "--request-timeout": true,
 	"--profile": true, "--profile-output": true,
 	"--v": true, "--vmodule": true, "--log-flush-frequency": true,
+	// Command-scoped value flags that carry SECRET material. These must be
+	// consumed here, not merely redacted by RedactCommand: an unconsumed value
+	// lands in the positional stream, where GetCommandDescription (the confirm
+	// prompt) and JSONForResult's "resource" field would print it verbatim,
+	// never having passed through the redactor.
+	"--patch": true, "--overrides": true, "--exec-arg": true,
+	"--from-literal": true, "--env": true, "--exec-env": true,
+	"--auth-provider-arg": true, "--docker-password": true,
+	"--docker-email": true, "--tls-private-key": true,
 }
 
 // recognizedVerb reports whether v is a kubectl verb the guard can classify.
@@ -150,6 +159,30 @@ func recognizedVerb(v string) bool {
 		return true
 	}
 	return safeCommands[v] || stateAlteringCommands[v]
+}
+
+// verbPositionalIndex returns the index into pos of the verb the guard resolves,
+// or -1 when no positional is a recognized verb. It is the single source of
+// truth for "which positional is the verb", so that every consumer agrees.
+//
+// Normally that is pos[0]. When pos[0] is unrecognized the guard scans forward
+// (see ExtractCommand): a global flag whose value it failed to consume can leave
+// that value sitting in verb position. Any caller that indexes positionals
+// RELATIVE to the verb must use this, not a hardcoded 0 — otherwise it reads the
+// wrong tokens exactly when the fallback fires.
+func verbPositionalIndex(pos []string) int {
+	if len(pos) == 0 {
+		return -1
+	}
+	if recognizedVerb(strings.ToLower(pos[0])) {
+		return 0
+	}
+	for i := 1; i < len(pos); i++ {
+		if recognizedVerb(strings.ToLower(pos[i])) {
+			return i
+		}
+	}
+	return -1
 }
 
 // ProtectedResourceChecker is satisfied by *config.Config; kept as an interface
@@ -180,6 +213,11 @@ type ParsedArgs struct {
 	// both, so this preserves the boundary for consumers that must distinguish
 	// them — e.g. an "/etc/hosts" in an exec payload is not an API path.
 	PositionalsBeforeSep int
+
+	// PositionalIndexes[i] is the index in the original args slice of
+	// Positional[i]. It lets a caller map a positional back to the token it came
+	// from, without re-deriving which flags consumed a value.
+	PositionalIndexes []int
 
 	// Targeting & identity flags. --server points at a different API server
 	// (a different cluster) the guard cannot map to a context; --as* impersonate
@@ -423,7 +461,10 @@ func ParseArgs(args []string) ParsedArgs {
 			// cannot spoof context resolution (S1); but resource tokens after
 			// "--" must still be matched (H4).
 			p.PositionalsBeforeSep = len(p.Positional)
-			p.Positional = append(p.Positional, args[i+1:]...)
+			for j := i + 1; j < len(args); j++ {
+				p.Positional = append(p.Positional, args[j])
+				p.PositionalIndexes = append(p.PositionalIndexes, j)
+			}
 			return p
 		}
 		switch {
@@ -552,6 +593,7 @@ func ParseArgs(args []string) ParsedArgs {
 				p.VerbIndex = i
 			}
 			p.Positional = append(p.Positional, arg)
+			p.PositionalIndexes = append(p.PositionalIndexes, i)
 		}
 	}
 	// No "--" separator: every positional is a kubectl token.
@@ -673,21 +715,14 @@ func ExtractCommand(args []string) (cmd string, subCmd string) {
 	if len(pos) == 0 {
 		return "", ""
 	}
-	if first := strings.ToLower(pos[0]); recognizedVerb(first) {
-		if len(pos) >= 2 {
-			return first, pos[1]
-		}
-		return first, ""
+	i := verbPositionalIndex(pos)
+	if i < 0 {
+		return strings.ToLower(pos[0]), ""
 	}
-	for i := 1; i < len(pos); i++ {
-		if v := strings.ToLower(pos[i]); recognizedVerb(v) {
-			if i+1 < len(pos) {
-				return v, pos[i+1]
-			}
-			return v, ""
-		}
+	if i+1 < len(pos) {
+		return strings.ToLower(pos[i]), pos[i+1]
 	}
-	return strings.ToLower(pos[0]), ""
+	return strings.ToLower(pos[i]), ""
 }
 
 // ExtractResourceCandidates returns the positional arguments after the verb.
@@ -798,6 +833,326 @@ func HasUninspectableSource(args []string) bool {
 // guard cannot map to a resource type. Used to explain a Blocked decision.
 func HasRawPath(args []string) bool {
 	return ParseArgs(args).HasRaw
+}
+
+// redactedValue replaces a secret flag's value everywhere the guard surfaces a
+// command string. The flag name is kept so the record stays useful.
+const redactedValue = "***"
+
+// secretValueFlags carry secret material (or PII) as their entire value. Both
+// "--flag=value" and "--flag value" forms are redacted.
+//
+// --certificate-authority / --client-certificate / --client-key /
+// --tls-private-key usually name a file rather than inline material. The guard
+// redacts them anyway: proving a value is a path and not inline key material is
+// not worth the risk of being wrong, and a redacted path costs only a little
+// debuggability.
+// --patch/--overrides carry an arbitrary JSON/YAML blob that may embed secret
+// material directly (`patch secret db -p '{"stringData":{"password":"x"}}'` is
+// the usual way to set a secret from the CLI). The guard cannot prove such a
+// blob is free of secrets, so it redacts the whole value — the same "cannot
+// prove it is safe" stance taken for --raw and un-inspectable -f sources. The
+// verb and target resource are still logged, so the record shows what was
+// patched, just not with what. --patch-file and --from-file name a path, not
+// inline material, and are left alone.
+var secretValueFlags = map[string]bool{
+	"--token":                 true,
+	"--password":              true,
+	"--docker-password":       true,
+	"--docker-email":          true, // PII
+	"--client-key":            true,
+	"--client-certificate":    true,
+	"--certificate-authority": true,
+	"--patch":                 true,
+	"--overrides":             true,
+	"--exec-arg":              true,
+	// --tls-private-key is not a flag in kubectl v1.33, but the ticket calls for
+	// it; kept as a cheap guard in case a plugin or a future release adds it.
+	"--tls-private-key": true,
+}
+
+// secretConfigProperties are fragments of a kubeconfig property path whose
+// VALUE is credential material. `kubectl config set PROPERTY_NAME
+// PROPERTY_VALUE` writes the secret as a bare POSITIONAL with no flag in front
+// of it — kubectl's own help shows
+// `config set users.cluster-admin.client-key-data cert_data_here`.
+//
+// Matching is on the property name, not the value, so ordinary settings such as
+// `config set current-context prod` and `config set clusters.x.server https://…`
+// stay legible. Public material (certificate-authority-data,
+// client-certificate-data) is deliberately not matched.
+var secretConfigProperties = []string{
+	"token", "password", "secret", "client-key", "key-data", "credential",
+}
+
+// isSecretConfigProperty reports whether a `kubectl config set` property name
+// addresses credential material, so its value must be redacted.
+func isSecretConfigProperty(property string) bool {
+	lc := strings.ToLower(property)
+	for _, fragment := range secretConfigProperties {
+		if strings.Contains(lc, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// configSetRedactions returns the arg indexes RedactCommand must redact for a
+// `kubectl config set PROPERTY_NAME PROPERTY_VALUE`, keyed to how each should
+// be rendered.
+//
+// It works off ParseArgs' positional list rather than scanning raw tokens,
+// because the property is "the first positional after the subcommand" and only
+// ParseArgs knows which tokens were swallowed as flag values. Scanning raw
+// tokens instead lets an intervening `--kubeconfig /vault/secrets/kc` be
+// mistaken for the property name — which would blank the property and let the
+// real secret through.
+//
+// Positions are taken RELATIVE to the resolved verb, never from a hardcoded
+// pos[0]. ExtractCommand may resolve `config set` from a later positional (its
+// verb-shift fallback), and indexing from zero in that case reads "set" as the
+// property name, redacts nothing, and leaks the value.
+func configSetRedactions(p ParsedArgs) map[int]int {
+	pos, idx := p.Positional, p.PositionalIndexes
+	if len(idx) != len(pos) {
+		return nil // invariant broken; do not guess at indexes
+	}
+	v := verbPositionalIndex(pos)
+	// pos[v:] = [config, set, PROPERTY, VALUE]
+	if v < 0 || v+2 >= len(pos) {
+		return nil
+	}
+	property := pos[v+2]
+
+	// kubectl rejects the single-token `PROPERTY=VALUE` form, but the guard may
+	// still be asked to audit the attempt; do not record it in cleartext.
+	if key, _, found := strings.Cut(property, "="); found {
+		if isSecretConfigProperty(key) {
+			return map[int]int{idx[v+2]: redactValueOfPair}
+		}
+		return nil
+	}
+
+	if v+3 >= len(pos) || !isSecretConfigProperty(property) {
+		return nil
+	}
+	return map[int]int{idx[v+3]: redactWhole}
+}
+
+// keyValueSecretFlags carry a "key=value" pair whose VALUE is secret. The key
+// is preserved (it names what was set) and only the value is redacted, so
+// `--from-literal=password=hunter2` becomes `--from-literal=password=***`.
+//
+// --env covers `kubectl run --env=K=V` and `kubectl set env --env=K=V`;
+// environment variables are a primary carrier of credentials. --exec-env and
+// --auth-provider-arg carry kubeconfig credential material on
+// `kubectl config set-credentials`. Redacting the value while keeping the key
+// means the audit log still records WHICH variable was set, just not to what.
+var keyValueSecretFlags = map[string]bool{
+	"--from-literal":      true,
+	"--env":               true,
+	"--exec-env":          true,
+	"--auth-provider-arg": true,
+}
+
+// redactKeyValue redacts the value of a "key=value" token, keeping the key.
+// A token with no "=" is redacted whole, since we cannot tell key from value.
+// "-" is kubectl's read-from-stdin idiom (`--env -`), not a secret, and is kept
+// so the record still shows where the values came from.
+func redactKeyValue(token string) string {
+	if token == "-" {
+		return token
+	}
+	if eq := strings.IndexByte(token, '='); eq >= 0 {
+		return token[:eq+1] + redactedValue
+	}
+	return redactedValue
+}
+
+// redactsPositionalPairs reports whether the verb takes its KEY=VALUE pairs as
+// positional arguments rather than as flag values. `kubectl set env
+// RESOURCE/NAME KEY=VALUE` is the documented form, so the secret has no flag in
+// front of it for the redactor to match on.
+//
+// Deliberately scoped to `set env`: `set image deploy/x nginx=nginx:latest` and
+// `label pod nginx env=prod` carry no secrets and must stay legible.
+func redactsPositionalPairs(cmd, subCmd string) bool {
+	return cmd == "set" && strings.EqualFold(subCmd, "env")
+}
+
+// How a secret flag's value is rendered: the whole value, or just the value
+// half of a "key=value" pair.
+const (
+	redactNone = iota
+	redactWhole
+	redactValueOfPair
+)
+
+// secretShortAlias resolves a single-letter flag to the secret-bearing long
+// flag it aliases, for the given verb.
+//
+// It MUST be verb-scoped: kubectl reuses letters across commands, and the same
+// letter can be value-taking in one verb and boolean in another. `-p` is
+// --patch on `patch` (takes a value) but the boolean --previous on `logs`, so a
+// global alias would consume `nginx` in `kubectl logs -p nginx` and corrupt the
+// audit record. `-e` is --env on `set env` and is not a valid shorthand on
+// `run`. Verified against `kubectl <verb> --help` (v1.33).
+func secretShortAlias(cmd, subCmd string, c byte) (kind int, ok bool) {
+	switch {
+	case cmd == "patch" && c == 'p':
+		return redactWhole, true
+	case redactsPositionalPairs(cmd, subCmd) && c == 'e':
+		return redactValueOfPair, true
+	}
+	return redactNone, false
+}
+
+// redactShortCluster renders a bundled short-flag token (e.g. "-e", "-e=K=V",
+// "-eK=V", "-p", "-Re") when it carries a secret-bearing shorthand, mirroring
+// how pflag consumes values: the flag takes the rest of the token, or the next
+// argument. matched=false means the token holds no secret shorthand and should
+// be passed through untouched.
+//
+// The walk stops at the first value-taking flag, because that flag swallows the
+// remainder of the token — nothing after it is a separate shorthand.
+func redactShortCluster(cmd, subCmd, arg string) (out string, next int, matched bool) {
+	shorthands := arg[1:] // strip the leading "-"
+	for i := 0; i < len(shorthands); i++ {
+		c := shorthands[i]
+		if kind, ok := secretShortAlias(cmd, subCmd, c); ok {
+			prefix := arg[:i+2] // "-" plus every shorthand up to and including c
+			rest := shorthands[i+1:]
+			switch {
+			case rest == "":
+				// Value is the next argument.
+				return prefix, kind, true
+			case strings.HasPrefix(rest, "="):
+				return prefix + "=" + renderSecret(kind, rest[1:]), redactNone, true
+			default:
+				return prefix + renderSecret(kind, rest), redactNone, true
+			}
+		}
+		if shortConsumesValue(c) {
+			return "", redactNone, false // consumes the rest; no shorthand beyond
+		}
+	}
+	return "", redactNone, false
+}
+
+// shortConsumesValue reports whether a single-letter flag takes a value, i.e.
+// swallows the remainder of its token or the next argument.
+//
+// 'f' and 'k' are the manifest sources (-f file, -k dir). They are value-taking
+// but live outside shortTakesValue because parseShortCluster handles them
+// specially, so any other walker over a short cluster must add them back — or
+// it will step past a source's value and mis-bind the following token
+// (`set env -fe deploy/web FOO=bar` would redact the resource name).
+func shortConsumesValue(c byte) bool {
+	return c == 'f' || c == 'k' || shortTakesValue[c]
+}
+
+// renderSecret redacts a value according to kind.
+func renderSecret(kind int, value string) string {
+	if kind == redactValueOfPair {
+		return redactKeyValue(value)
+	}
+	return redactedValue
+}
+
+// RedactCommand renders args as a command string with secret-bearing flag
+// values replaced by "***". Every place the guard surfaces a command — the
+// audit log, --json output, and human-facing messages — must use this instead
+// of strings.Join, or the guard leaks the very secrets it exists to protect
+// into the one file it owns.
+//
+// Redaction is applied to every token, including those after the "--"
+// separator, so a kubectl credential flag that appears in an exec payload
+// (`exec pod -- app --token abc`) is still redacted. The audit string is written
+// for a human reading an incident, not to be replayed verbatim.
+//
+// Caveats, documented in the README: this cannot redact secrets that never
+// appear in argv — the *contents* of a `--from-file` path, or a value piped on
+// stdin — and it has no control over the user's shell history. Nor can it redact
+// secrets carried by an *application's* own flags or inline env assignments in an
+// exec/run payload after "--" (`-- env PASSWORD=x`, `-- app --db-password=x`): the
+// payload is an arbitrary foreign command line whose flag names the guard cannot
+// know, and blanking every key=value/unknown --flag there would destroy the audit
+// record of what ran. Only kubectl's own credential flags are matched in a payload.
+// RedactCommand renders RedactArgs as a single space-joined command string.
+func RedactCommand(args []string) string {
+	return strings.Join(RedactArgs(args), " ")
+}
+
+// RedactArgs returns a copy of args with secret-bearing values replaced by
+// "***". Callers that surface individual tokens (a resource name, a command
+// description) should derive them from this slice rather than the raw args, so
+// a secret can never reach a message or JSON field by skipping the redactor.
+// The input slice is never modified; kubectl is always given the real args.
+func RedactArgs(args []string) []string {
+	// next describes what to do with the NEXT token, for the "--flag value"
+	// (rather than "--flag=value") form.
+	next := redactNone
+
+	// Short-flag aliases and positional KEY=VALUE pairs are both verb-dependent,
+	// so resolve the verb once up front.
+	parsed := ParseArgs(args)
+	cmd, subCmd := ExtractCommand(args)
+	positionalPairs := redactsPositionalPairs(cmd, subCmd)
+
+	// `config set users.admin.token <value>` puts the secret in a bare
+	// positional. Resolve exactly which arg index that is, up front.
+	var byIndex map[int]int
+	if cmd == "config" && strings.EqualFold(subCmd, "set") {
+		byIndex = configSetRedactions(parsed)
+	}
+
+	out := make([]string, 0, len(args))
+	for i, arg := range args {
+		if next != redactNone {
+			out = append(out, renderSecret(next, arg))
+			next = redactNone
+			continue
+		}
+		if kind, ok := byIndex[i]; ok {
+			out = append(out, renderSecret(kind, arg))
+			continue
+		}
+
+		name, val, hasInline := splitLong(arg)
+		switch {
+		case secretValueFlags[name]:
+			if hasInline {
+				out = append(out, name+"="+redactedValue)
+			} else {
+				out = append(out, name)
+				next = redactWhole
+			}
+		case keyValueSecretFlags[name]:
+			if hasInline {
+				out = append(out, name+"="+redactKeyValue(val))
+			} else {
+				out = append(out, name)
+				next = redactValueOfPair
+			}
+		case strings.HasPrefix(arg, "--"):
+			// A long flag that carries no secret.
+			out = append(out, arg)
+		case strings.HasPrefix(arg, "-") && len(arg) > 1:
+			// Possibly a bundled short-flag token carrying a secret shorthand.
+			if rendered, consumes, matched := redactShortCluster(cmd, subCmd, arg); matched {
+				out = append(out, rendered)
+				next = consumes
+			} else {
+				out = append(out, arg)
+			}
+		case positionalPairs && strings.Contains(arg, "="):
+			// A bare KEY=VALUE positional under `set env`.
+			out = append(out, redactKeyValue(arg))
+		default:
+			out = append(out, arg)
+		}
+	}
+	return out
 }
 
 // MatchesProtectedResource reports whether args target a protected resource,

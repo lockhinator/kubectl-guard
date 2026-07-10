@@ -191,6 +191,25 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// early return pass a dry-run of a wide mutation through.
 	blastActive := IsBlastRadiusActive(cfg, args)
 
+	// Global read-only / freeze mode (incident panic button). When active, EVERY
+	// command that is not a KNOWN-SAFE read is Blocked regardless of
+	// context/namespace/actor, so an operator can freeze all mutations instantly
+	// and everywhere. This fails SAFE: it gates on "not provably a safe read"
+	// (!IsSafeCommandWith), not "known-dangerous" (IsStateAlteringWith) — otherwise
+	// an unknown/plugin mutating verb the guard cannot classify (e.g. a krew plugin
+	// that spawns a privileged pod) would slip the panic button. The tradeoff is
+	// that read-only plugins are also blocked under freeze, which is the correct
+	// default for an incident. A genuine --dry-run of a KNOWN state-altering verb
+	// still passes (it changes nothing); a --dry-run token on an unknown verb buys
+	// no pass (the plugin may ignore it). --yes does NOT override — this is
+	// absolute, unlike a confirm. KUBECTL_GUARD_BYPASS still bypasses (the
+	// documented, loudly-audited escape hatch). Checked before context/namespace
+	// gating because it does not depend on which context is targeted.
+	genuineDryRun := IsStateAlteringWith(cfg, args) && p.IsDryRun() && SupportsDryRun(args)
+	if cfg.ReadOnlyActive() && !IsSafeCommandWith(cfg, args) && !genuineDryRun {
+		return Blocked, ctx, cfg, nil
+	}
+
 	// --server points at an arbitrary API server the guard cannot map to a
 	// context name. When context protection is configured, fail closed rather
 	// than allow a command against an unverified (possibly production) cluster.

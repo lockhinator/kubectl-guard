@@ -97,6 +97,25 @@ func TestInsecureConfigPermsParentDir(t *testing.T) {
 	}
 }
 
+// TestReadOnlyActive verifies freeze is on from either the config field or
+// KUBECTL_GUARD_READONLY. #94.
+func TestReadOnlyActive(t *testing.T) {
+	if !(&Config{ReadOnly: true}).ReadOnlyActive() {
+		t.Error("read_only: true should be active")
+	}
+	if (&Config{}).ReadOnlyActive() {
+		t.Error("default should be off")
+	}
+	t.Setenv(EnvReadOnly, "1")
+	if !(&Config{}).ReadOnlyActive() {
+		t.Error("KUBECTL_GUARD_READONLY=1 should activate")
+	}
+	t.Setenv(EnvReadOnly, "0")
+	if (&Config{}).ReadOnlyActive() {
+		t.Error("KUBECTL_GUARD_READONLY=0 should not activate")
+	}
+}
+
 // TestLoadWrapsInvalidYAML: Load wraps a raw yaml library error with actionable
 // context (the config path + "is not valid YAML") instead of leaking the bare
 // library string. #38.

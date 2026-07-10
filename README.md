@@ -534,6 +534,15 @@ Fields:
   show the result on stderr before the confirmation prompt for diffable commands
   (`apply`/`create`/`replace -f`). Off by default (adds latency and needs
   server-side dry-run RBAC; a failed diff warns and prompts anyway)
+- **`preview_before_confirm`** — when true, preview **what a gated command will
+  affect** before prompting: `kubectl diff` for diffable applies (as above), and
+  a read-only `kubectl get <same target/selector> -o name` for non-diffable
+  destructive commands (`delete`/`scale`/`label`/`annotate`/`patch`/`taint`/
+  `cordon`/`uncordon`/`drain`/`autoscale`). This answers "*which* objects?" at the
+  prompt — `kubectl delete pod -l app=x` might match one pod or fifty. Output goes
+  to stderr, capped at the first 20 objects plus a total count. Best-effort: a
+  failed preview warns and prompts anyway. Off by default (adds a read round-trip
+  per gated command)
 - **`confirm_timeout_seconds`** — how long the confirmation prompt waits for an
   answer. `0` (default) waits forever. When positive, an unanswered prompt
   **aborts** (fail-safe: an unanswered "are you sure?" resolves to *no*) with the

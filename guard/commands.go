@@ -143,6 +143,15 @@ var shortTakesValue = map[byte]bool{
 var knownLongFlags = map[string]bool{
 	// Command-scoped value flags.
 	"--selector": true, "--output": true, "--container": true,
+	// Unambiguously value-taking flags of the previewable destructive verbs
+	// (scale/autoscale/patch/drain/...). Listed so their SPACE form
+	// (`scale --replicas 0 deploy/web`) consumes the value instead of leaking it
+	// into the positional stream, where PreviewArgs would read "0" as a resource
+	// target. None is ever boolean, so consuming their value cannot hide a verb or
+	// un-gate a command (it only removes a false-positive resource candidate).
+	"--replicas": true, "--current-replicas": true, "--min": true,
+	"--max": true, "--cpu-percent": true, "--timeout": true,
+	"--patch-file": true,
 	// kubectl global (persistent) value-taking flags.
 	"--cluster": true, "--user": true, "--username": true, "--password": true,
 	"--cache-dir": true, "--certificate-authority": true,
@@ -246,6 +255,16 @@ type ParsedArgs struct {
 	HasAs              bool     // any --as / --as-group / --as-uid present
 	Token              string   // --token
 	HasToken           bool
+	// HasUser is set by --user, which selects a different kubeconfig auth identity.
+	// Captured so the read-only preview (PreviewArgs) can skip rather than run
+	// against a different identity than the real command.
+	HasUser bool
+	// HasBasicAuth is set by --username/--password (HTTP basic-auth identity
+	// override). Like --user, it changes the identity the command runs as, so the
+	// preview skips rather than resolve against the invoking identity instead.
+	// (Basic auth was removed from the Kubernetes API server in v1.19; captured for
+	// parity with the other identity overrides.)
+	HasBasicAuth bool
 
 	// DryRun captures --dry-run (client|server|none). A bare --dry-run is
 	// treated as client. State-altering commands in dry-run mode change no
@@ -272,6 +291,13 @@ type ParsedArgs struct {
 	// `delete TYPE -l label` / `delete TYPE --field-selector metadata.name=x` the
 	// affected objects are chosen server-side, so they are not knowable from argv.
 	HasSelector bool
+
+	// Selector and FieldSelector capture the VALUES of -l/--selector and
+	// --field-selector, so a read-only preview (PreviewArgs) can reconstruct the
+	// same selection with `kubectl get`. HasSelector stays the single "a selector
+	// was given" signal; these carry the values for that reconstruction.
+	Selector      string
+	FieldSelector string
 
 	// Prune is kubectl's `apply --prune`: after applying the manifest, DELETE any
 	// live resource (matching the selector/allowlist) that is not present in it.
@@ -472,13 +498,19 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 			return false
 		case c == 'l':
 			// -l / --selector stands in for a NAME argument; record that the
-			// command's targets cannot be enumerated from argv. It consumes the
-			// rest of the token, or the next argument.
+			// command's targets cannot be enumerated from argv, and capture its
+			// value for the read-only preview. It consumes the rest of the token
+			// (e.g. "-lapp=x", with an optional "="), or the next argument.
 			p.HasSelector = true
 			if len(shorthands) > 1 {
+				p.Selector = strings.TrimPrefix(shorthands[1:], "=")
 				return false
 			}
-			return len(rest) > 0
+			if len(rest) > 0 {
+				p.Selector = rest[0]
+				return true
+			}
+			return false
 		case shortTakesValue[c]:
 			// consumes the rest of the token, or the next argument.
 			if len(shorthands) > 1 {
@@ -603,6 +635,21 @@ func ParseArgs(args []string) ParsedArgs {
 					p.Token = args[i+1]
 					skipNext = true
 				}
+			case "--user":
+				// --user selects a different kubeconfig auth identity. Record it so
+				// the preview can skip; consume its value (it is in knownLongFlags,
+				// but capture the presence here).
+				p.HasUser = true
+				if !hasInline && i+1 < len(args) {
+					skipNext = true
+				}
+			case "--username", "--password":
+				// HTTP basic-auth identity override — capture presence so the preview
+				// can skip. Value is consumed (both are in knownLongFlags).
+				p.HasBasicAuth = true
+				if !hasInline && i+1 < len(args) {
+					skipNext = true
+				}
 			case "--namespace":
 				p.HasNamespace = true
 				if hasInline {
@@ -683,8 +730,17 @@ func ParseArgs(args []string) ParsedArgs {
 				// but names it nowhere the guard can check). Verified accepted on
 				// `kubectl delete` (v1.33).
 				p.HasSelector = true
-				if !hasInline && i+1 < len(args) {
+				var selVal string
+				if hasInline {
+					selVal = val
+				} else if i+1 < len(args) {
+					selVal = args[i+1]
 					skipNext = true
+				}
+				if name == "--field-selector" {
+					p.FieldSelector = selVal
+				} else {
+					p.Selector = selVal
 				}
 			case "--raw":
 				p.HasRaw = true
@@ -935,6 +991,136 @@ func DiffArgs(args []string) []string {
 	out := make([]string, len(args))
 	copy(out, args)
 	out[p.VerbIndex] = "diff"
+	return out
+}
+
+// previewableVerbs are destructive verbs that act on EXISTING objects
+// addressable by `kubectl get`, so a read-only preview can list what they would
+// affect before the confirmation prompt. Verbs that CREATE an object
+// (run/expose/create) are excluded — there is nothing live to get — as are the
+// pure-access verbs and manifest-only flows (handled by `kubectl diff`).
+// `set` is deliberately excluded: it takes a subcommand (`set image …`) in the
+// first positional, which is not a resource type, so a `get`-preview cannot be
+// reconstructed from its positionals the way it can for the others.
+var previewableVerbs = map[string]bool{
+	"delete": true, "scale": true, "label": true, "annotate": true,
+	"patch": true, "taint": true, "cordon": true,
+	"uncordon": true, "drain": true, "autoscale": true,
+}
+
+// nodeTargetVerbs address a NODE by bare name with NO type token
+// (`kubectl drain NODE`, `cordon NODE`), so the preview must supply the implicit
+// `nodes` type — `get NODE` would read NODE as a resource TYPE and wrongly report
+// nothing. They also accept `-l` to select nodes by label.
+var nodeTargetVerbs = map[string]bool{
+	"cordon": true, "uncordon": true, "drain": true,
+}
+
+// isTargetToken reports whether a positional after the verb is a resource
+// reference, as opposed to a label/annotation/taint assignment that
+// label/annotate/taint take positionally:
+//   - add with value: `team=a`, `key=val:NoSchedule`      (contains "=")
+//   - taint add, no value: `key:NoSchedule`                (contains ":")
+//   - remove: `team-`, `key-`, `key:NoSchedule-`           (ends with "-")
+//
+// A resource NAME or type/name token can contain none of these: RFC 1123 names
+// are alphanumeric plus "-"/"." and must start and end alphanumeric (so no "="/
+// ":" and no trailing "-"), and a type/name uses "/" as its only separator. So a
+// token with "=", ":", or a trailing "-" is an assignment, not a target, and
+// target collection stops there.
+func isTargetToken(tok string) bool {
+	return !strings.Contains(tok, "=") && !strings.Contains(tok, ":") && !strings.HasSuffix(tok, "-")
+}
+
+// PreviewArgs builds a read-only `kubectl get <same targets/selector> -o name`
+// command that lists the objects a targeted destructive command would affect,
+// for a pre-confirmation preview. It preserves the target resource tokens, the
+// label/field selector, and the --namespace/--all-namespaces/--context/
+// --kubeconfig targeting flags, so the preview resolves the SAME objects the real
+// command would.
+//
+// It returns nil when no meaningful preview can be built: a non-previewable verb,
+// a manifest/-f/-k or --raw command (which names no object to get — those are
+// covered by `kubectl diff`), or a command with neither a target nor a selector.
+//
+// The preview is best-effort: an unusual space-form of a command-scoped value
+// flag not in knownLongFlags could still leak its value as a bogus target, at
+// worst yielding an inaccurate object list (never a mutation, never a gating
+// change) — the confirmation prompt still shows regardless.
+//
+// It ALSO returns nil when the command carries an API-server or identity override
+// the preview cannot faithfully reproduce — --server / --cluster (a different
+// cluster), or --as* / --token / --user / --username/--password (a different
+// identity). Forwarding only
+// --namespace/--context while dropping those would run the preview against the
+// WRONG cluster or as the WRONG identity, showing an object list that does not
+// match what the real command hits — worse than no preview (a `--server
+// https://prod` whose preview hits the operator's dev cluster could read as
+// "nothing there" and lull a reviewer into approving). Better to skip and prompt.
+func PreviewArgs(args []string) []string {
+	verb, _ := ExtractCommand(args)
+	if !previewableVerbs[verb] {
+		return nil
+	}
+	p := ParseArgs(args)
+	// Manifest/raw/kustomize-driven commands name no positional object to get.
+	if p.HasRaw || len(p.Filenames) > 0 || p.Kustomize != "" {
+		return nil
+	}
+	// An API-server or identity override cannot be faithfully reproduced in the
+	// read-only preview; skip rather than show a mismatched list (see doc above).
+	if p.HasServer || p.HasClusterOverride || p.HasAs || p.HasToken || p.HasUser || p.HasBasicAuth {
+		return nil
+	}
+	v := verbPositionalIndex(p.Positional)
+	if v < 0 {
+		return nil
+	}
+	// Resource tokens after the verb (TYPE, NAME..., or type/name), before the
+	// "--" separator so an exec-style payload is never read as a target. Stop at
+	// the first non-target token (isTargetToken): for label/annotate/taint the
+	// positionals after the resource are KEY=VALUE / KEY- assignments, not names.
+	var targets []string
+	if v+1 < p.PositionalsBeforeSep {
+		for _, tok := range p.Positional[v+1 : p.PositionalsBeforeSep] {
+			if !isTargetToken(tok) {
+				break
+			}
+			targets = append(targets, tok)
+		}
+	}
+	// Need at least a target OR a selector OR --all to list something.
+	if len(targets) == 0 && !p.HasSelector && !p.All {
+		return nil
+	}
+
+	out := []string{"get"}
+	// Node-name verbs (drain/cordon/uncordon) address a bare NODE with no type
+	// token; supply the implicit `nodes` type so `get` reads the positionals as
+	// node NAMES, not as a resource type.
+	if nodeTargetVerbs[verb] {
+		out = append(out, "nodes")
+	}
+	out = append(out, targets...)
+	if p.Selector != "" {
+		out = append(out, "--selector", p.Selector)
+	}
+	if p.FieldSelector != "" {
+		out = append(out, "--field-selector", p.FieldSelector)
+	}
+	if p.HasNamespace && p.Namespace != "" {
+		out = append(out, "--namespace", p.Namespace)
+	}
+	if p.AllNamespaces {
+		out = append(out, "--all-namespaces")
+	}
+	if p.Context != "" {
+		out = append(out, "--context", p.Context)
+	}
+	if p.Kubeconfig != "" {
+		out = append(out, "--kubeconfig", p.Kubeconfig)
+	}
+	out = append(out, "-o", "name")
 	return out
 }
 

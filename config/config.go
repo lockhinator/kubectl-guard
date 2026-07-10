@@ -155,6 +155,15 @@ type Config struct {
 	// Off by default (diff adds latency and needs server-side dry-run RBAC).
 	DiffBeforeConfirm bool `yaml:"diff_before_confirm,omitempty"`
 
+	// PreviewBeforeConfirm, when true, previews what a gated command will affect
+	// before prompting: `kubectl diff` for diffable applies (like
+	// DiffBeforeConfirm), and a read-only `kubectl get <target/selector> -o name`
+	// for non-diffable destructive commands (delete/scale/label/... — where the
+	// affected objects are otherwise invisible at the prompt, e.g. `delete pod -l
+	// app=x` might match one pod or fifty). Best-effort: a failed preview warns and
+	// prompts anyway. Off by default (adds a read round-trip per gated command).
+	PreviewBeforeConfirm bool `yaml:"preview_before_confirm,omitempty"`
+
 	// ConfirmTimeoutSeconds bounds how long the confirmation prompt waits for an
 	// answer. 0 (default) waits forever, preserving the previous behavior. When
 	// positive, an unanswered prompt aborts (fail-safe: an unanswered "are you

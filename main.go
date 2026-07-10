@@ -490,10 +490,14 @@ func runGuard(args []string) error {
 			os.Exit(guard.ExitNeedsConfirm)
 		}
 
-		// Optional: preview the change with `kubectl diff` before prompting.
-		// Only for diffable commands (apply/create/replace -f). A failed diff
-		// (e.g. RBAC denies server-side dry-run) warns and prompts anyway.
-		if cfg != nil && cfg.DiffBeforeConfirm && guard.IsDiffable(forwarded) {
+		// Optional: preview what the command will affect before prompting.
+		// A diffable apply (apply/create/replace -f) is previewed with
+		// `kubectl diff`; a non-diffable destructive command (delete/scale/... with
+		// a target or selector) is previewed with a read-only `kubectl get … -o
+		// name`. diff_before_confirm covers only the diff; preview_before_confirm
+		// covers both. A failed preview warns and prompts anyway.
+		switch {
+		case cfg != nil && (cfg.DiffBeforeConfirm || cfg.PreviewBeforeConfirm) && guard.IsDiffable(forwarded):
 			if diffArgs := guard.DiffArgs(forwarded); diffArgs != nil {
 				out, derr := guard.RunKubectl(diffArgs...)
 				if derr != nil {
@@ -510,6 +514,10 @@ func runGuard(args []string) error {
 					}
 					fmt.Fprintln(os.Stderr, "--- end diff ---")
 				}
+			}
+		case cfg != nil && cfg.PreviewBeforeConfirm:
+			if previewArgs := guard.PreviewArgs(forwarded); previewArgs != nil {
+				printAffectedPreview(previewArgs)
 			}
 		}
 
@@ -973,6 +981,52 @@ func printConfig() error {
 	ui.PrintInfo("Audit log: " + auditPath)
 
 	return nil
+}
+
+// maxPreviewLines caps how many affected-object names the preview prints, so a
+// selector matching thousands of objects does not flood the terminal before the
+// prompt. Beyond the cap it prints a "… and N more" summary.
+const maxPreviewLines = 20
+
+// printAffectedPreview runs the read-only `kubectl get … -o name` preview and
+// prints the affected objects to stderr before the confirmation prompt. It is
+// best-effort: any failure warns and returns so the prompt still shows.
+func printAffectedPreview(previewArgs []string) {
+	out, err := guard.RunKubectl(previewArgs...)
+	if err != nil {
+		// exit 1 from `get` is "not found" — a valid, informative result (the
+		// selector/name matches nothing), not a preview failure.
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			fmt.Fprintln(os.Stderr, "--- preview: affected resources ---")
+			fmt.Fprintln(os.Stderr, "(no matching objects found)")
+			fmt.Fprintln(os.Stderr, "--- end preview ---")
+			return
+		}
+		ui.PrintWarning("Could not preview affected resources; prompting anyway.")
+		return
+	}
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		lines = nil
+	}
+	fmt.Fprintln(os.Stderr, "--- preview: affected resources ---")
+	if len(lines) == 0 {
+		fmt.Fprintln(os.Stderr, "(no matching objects found)")
+	} else {
+		shown := lines
+		if len(shown) > maxPreviewLines {
+			shown = shown[:maxPreviewLines]
+		}
+		for _, l := range shown {
+			fmt.Fprintln(os.Stderr, "  "+l)
+		}
+		if len(lines) > maxPreviewLines {
+			fmt.Fprintf(os.Stderr, "  … and %d more (%d total)\n", len(lines)-maxPreviewLines, len(lines))
+		} else {
+			fmt.Fprintf(os.Stderr, "  (%d total)\n", len(lines))
+		}
+	}
+	fmt.Fprintln(os.Stderr, "--- end preview ---")
 }
 
 // normalizeInheritMode maps the CLI "-" sentinel (and empty) to "", meaning

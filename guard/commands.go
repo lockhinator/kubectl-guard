@@ -234,12 +234,18 @@ type ParsedArgs struct {
 	// audit log.
 	Server    string // --server / -s
 	HasServer bool
-	AsUser    string   // --as
-	AsGroups  []string // --as-group (repeatable)
-	AsUID     string   // --as-uid
-	HasAs     bool     // any --as / --as-group / --as-uid present
-	Token     string   // --token
-	HasToken  bool
+	// HasClusterOverride is set by --cluster, which selects a named cluster from
+	// kubeconfig and thereby RETARGETS the API server the command hits — decoupled
+	// from the context NAME the guard gates on. Like --server, it is refused when
+	// protected contexts are configured (the guard cannot verify which cluster the
+	// command actually reaches).
+	HasClusterOverride bool
+	AsUser             string   // --as
+	AsGroups           []string // --as-group (repeatable)
+	AsUID              string   // --as-uid
+	HasAs              bool     // any --as / --as-group / --as-uid present
+	Token              string   // --token
+	HasToken           bool
 
 	// DryRun captures --dry-run (client|server|none). A bare --dry-run is
 	// treated as client. State-altering commands in dry-run mode change no
@@ -536,6 +542,14 @@ func ParseArgs(args []string) ParsedArgs {
 					p.Server = val
 				} else if i+1 < len(args) {
 					p.Server = args[i+1]
+					skipNext = true
+				}
+			case "--cluster":
+				// --cluster retargets the API server via a named kubeconfig
+				// cluster. Consume its value (like knownLongFlags did) and record
+				// its presence so the guard can refuse it under protected contexts.
+				p.HasClusterOverride = true
+				if !hasInline && i+1 < len(args) {
 					skipNext = true
 				}
 			case "--as":

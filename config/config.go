@@ -130,6 +130,29 @@ type Config struct {
 	// every command), "gated" (only interventions), or "off".
 	AuditMode string `yaml:"audit_mode,omitempty"`
 
+	// AuditMaxSizeMB enables size-based rotation of the audit log: when the file
+	// would exceed this many megabytes, it is rotated to <log>.1 (older archives
+	// shift to .2, .3, …). 0 (default) disables rotation — the log grows unbounded,
+	// the pre-v0.6.0 behavior.
+	AuditMaxSizeMB int `yaml:"audit_max_size_mb,omitempty"`
+
+	// AuditMaxFiles is how many rotated archives to keep (<log>.1 … <log>.N); the
+	// oldest is deleted on each rotation. Only meaningful when AuditMaxSizeMB > 0.
+	// Empty/0 uses the default (defaultAuditMaxFiles).
+	AuditMaxFiles int `yaml:"audit_max_files,omitempty"`
+
+	// AuditWebhookURL, when set, POSTs each audited entry as a JSON body to this
+	// http(s) URL (a SIEM, Slack, etc.). Best-effort and synchronous with a short
+	// timeout: a slow or failing webhook does not block the command beyond that
+	// timeout, and a delivery failure is never fatal. Local file logging still
+	// happens regardless.
+	AuditWebhookURL string `yaml:"audit_webhook_url,omitempty"`
+
+	// AuditSyslog, when true, also writes each audited entry to the local syslog
+	// (LOG_USER/LOG_INFO, tag "kubectl-guard"). Best-effort; local file logging
+	// still happens regardless.
+	AuditSyslog bool `yaml:"audit_syslog,omitempty"`
+
 	// Actor is a static default identity for who drove a command (e.g.
 	// "ci-deploy"), stamped into audit entries when KUBECTL_GUARD_ACTOR is
 	// unset. Empty falls back to the OS username.
@@ -314,6 +337,20 @@ func (c *Config) ShouldAudit(outcome string) bool {
 	default: // AuditModeAll
 		return true
 	}
+}
+
+// defaultAuditMaxFiles is how many rotated archives to keep when rotation is on
+// but audit_max_files was not set.
+const defaultAuditMaxFiles = 5
+
+// AuditMaxFilesOrDefault returns the configured archive count, or the default
+// when unset. It is never less than 1 when rotation is active, so a rotation
+// always preserves at least one archive rather than discarding the log.
+func (c *Config) AuditMaxFilesOrDefault() int {
+	if c.AuditMaxFiles > 0 {
+		return c.AuditMaxFiles
+	}
+	return defaultAuditMaxFiles
 }
 
 // SetAuditMode sets the audit mode if the value is valid. The valid-value check

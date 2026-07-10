@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +40,9 @@ var guardConfigSubcommands = map[string]bool{
 	"blast-radius":     true,
 	"actor-policy":     true,
 	"audit-mode":       true,
+	"audit-rotation":   true,
+	"audit-webhook":    true,
+	"audit-syslog":     true,
 	"audit":            true,
 	"path":             true,
 	"validate":         true,
@@ -824,6 +828,113 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "audit-rotation [<max-size-mb> [max-files]]",
+		Short: "Show or set audit-log size-based rotation",
+		Args:  cobra.MaximumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				if cfg.AuditMaxSizeMB <= 0 {
+					ui.PrintInfo("Audit rotation: off (log grows unbounded)")
+				} else {
+					ui.PrintInfo(fmt.Sprintf("Audit rotation: at %d MB, keeping %d archive(s)", cfg.AuditMaxSizeMB, cfg.AuditMaxFilesOrDefault()))
+				}
+				return nil
+			}
+			size, err := strconv.Atoi(args[0])
+			if err != nil || size < 0 {
+				return fmt.Errorf("max-size-mb must be a non-negative integer (0 disables rotation)")
+			}
+			cfg.AuditMaxSizeMB = size
+			if len(args) == 2 {
+				files, err := strconv.Atoi(args[1])
+				if err != nil || files < 0 {
+					return fmt.Errorf("max-files must be a non-negative integer")
+				}
+				cfg.AuditMaxFiles = files
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			if cfg.AuditMaxSizeMB == 0 {
+				ui.PrintSuccess("Audit rotation disabled")
+			} else {
+				ui.PrintSuccess(fmt.Sprintf("Audit rotation set: %d MB, %d archive(s)", cfg.AuditMaxSizeMB, cfg.AuditMaxFilesOrDefault()))
+			}
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "audit-webhook [<url>|off]",
+		Short: "Show or set a webhook that receives each audit entry as JSON",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				if cfg.AuditWebhookURL == "" {
+					ui.PrintInfo("Audit webhook: (none)")
+				} else {
+					ui.PrintInfo("Audit webhook: " + cfg.AuditWebhookURL)
+				}
+				return nil
+			}
+			if args[0] == "off" {
+				cfg.AuditWebhookURL = ""
+			} else {
+				if !config.ValidWebhookURL(args[0]) {
+					return fmt.Errorf("%q is not a valid http(s) URL", args[0])
+				}
+				cfg.AuditWebhookURL = args[0]
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			if cfg.AuditWebhookURL == "" {
+				ui.PrintSuccess("Audit webhook cleared")
+			} else {
+				ui.PrintSuccess("Audit webhook set: " + cfg.AuditWebhookURL)
+			}
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "audit-syslog [on|off]",
+		Short: "Show or toggle shipping audit entries to local syslog",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Audit syslog: " + onOff(cfg.AuditSyslog))
+				return nil
+			}
+			switch args[0] {
+			case "on":
+				cfg.AuditSyslog = true
+			case "off":
+				cfg.AuditSyslog = false
+			default:
+				return fmt.Errorf("expected 'on' or 'off'")
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Audit syslog: " + onOff(cfg.AuditSyslog))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "audit",
 		Short: "Show the audit log path and recent entries",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -979,6 +1090,15 @@ func printConfig() error {
 
 	auditPath, _ := config.AuditPath(cfg)
 	ui.PrintInfo("Audit log: " + auditPath)
+	if cfg.AuditMaxSizeMB > 0 {
+		ui.PrintInfo(fmt.Sprintf("Audit rotation: %d MB, %d archive(s)", cfg.AuditMaxSizeMB, cfg.AuditMaxFilesOrDefault()))
+	}
+	if cfg.AuditWebhookURL != "" {
+		ui.PrintInfo("Audit webhook: " + cfg.AuditWebhookURL)
+	}
+	if cfg.AuditSyslog {
+		ui.PrintInfo("Audit syslog: on")
+	}
 
 	return nil
 }
@@ -1027,6 +1147,14 @@ func printAffectedPreview(previewArgs []string) {
 		}
 	}
 	fmt.Fprintln(os.Stderr, "--- end preview ---")
+}
+
+// onOff renders a boolean toggle as "on"/"off" for config output.
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 // normalizeInheritMode maps the CLI "-" sentinel (and empty) to "", meaning
@@ -1143,6 +1271,10 @@ Config subcommands:
                              agent label can be held to block where a human
                              confirms); an override can only tighten, never weaken
   audit-mode [all|gated|off] Show or set what the audit log records
+  audit-rotation [<mb> [n]]  Rotate the audit log at <mb> megabytes, keeping n
+                             archives (0 mb disables; default n is 5)
+  audit-webhook [<url>|off]  POST each audit entry as JSON to a webhook
+  audit-syslog [on|off]      Also write each audit entry to local syslog
   audit                      Show the audit log path and recent entries
   validate                   Check the config for problems (exit non-zero if any;
                              an invalid config also fails closed at runtime)

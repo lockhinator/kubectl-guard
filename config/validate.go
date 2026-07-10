@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -60,6 +61,15 @@ func (c *Config) Validate() []string {
 		problems = append(problems, fmt.Sprintf(
 			"blast_radius: %q is not valid (want %q, %q, or %q)",
 			c.BlastRadius, BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock))
+	}
+	if c.AuditMaxSizeMB < 0 {
+		problems = append(problems, fmt.Sprintf("audit_max_size_mb: %d is negative (use 0 to disable rotation)", c.AuditMaxSizeMB))
+	}
+	if c.AuditMaxFiles < 0 {
+		problems = append(problems, fmt.Sprintf("audit_max_files: %d is negative", c.AuditMaxFiles))
+	}
+	if c.AuditWebhookURL != "" && !ValidWebhookURL(c.AuditWebhookURL) {
+		problems = append(problems, fmt.Sprintf("audit_webhook_url: %q is not a valid http(s) URL", c.AuditWebhookURL))
 	}
 	for i, ap := range c.ActorPolicies {
 		if strings.TrimSpace(ap.Actor) == "" {
@@ -169,6 +179,18 @@ func validBlastRadiusMode(m string) bool {
 		return true
 	}
 	return false
+}
+
+// ValidWebhookURL reports whether s is a well-formed absolute http(s) URL, so a
+// typo'd audit_webhook_url is caught at config time rather than silently failing
+// to ship every entry at runtime. Exported so the CLI setter and Validate share
+// one definition.
+func ValidWebhookURL(s string) bool {
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 // validateGlobPattern reports whether a context/namespace pattern is well-formed

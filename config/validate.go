@@ -62,6 +62,11 @@ func (c *Config) Validate() []string {
 			"blast_radius: %q is not valid (want %q, %q, or %q)",
 			c.BlastRadius, BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock))
 	}
+	if c.UnknownVerb != "" && !validUnknownVerbMode(c.UnknownVerb) {
+		problems = append(problems, fmt.Sprintf(
+			"unknown_verb: %q is not valid (want %q, %q, or %q)",
+			c.UnknownVerb, UnknownVerbAllow, UnknownVerbGate, UnknownVerbDeny))
+	}
 	if c.AuditMaxSizeMB < 0 {
 		problems = append(problems, fmt.Sprintf("audit_max_size_mb: %d is negative (use 0 to disable rotation)", c.AuditMaxSizeMB))
 	}
@@ -187,6 +192,14 @@ func validSensitiveAccessMode(m string) bool {
 func validBlastRadiusMode(m string) bool {
 	switch m {
 	case BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock:
+		return true
+	}
+	return false
+}
+
+func validUnknownVerbMode(m string) bool {
+	switch m {
+	case UnknownVerbAllow, UnknownVerbGate, UnknownVerbDeny:
 		return true
 	}
 	return false

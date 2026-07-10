@@ -1003,6 +1003,56 @@ func IsStateAlteringWith(cfg *config.Config, args []string) bool {
 	return stateAlteringCommands[cmd]
 }
 
+// IsUnknownCommand reports whether the LEADING verb — the actual command the user
+// invoked (the first positional token) — is one the guard cannot classify as a
+// built-in verb and that no command_override names. It is the third state of a
+// safe / state-altering / unknown classification, used by the unknown-verb strict
+// policy: a kubectl plugin, a future/renamed verb, or a gap in the built-in lists.
+//
+// It keys off the LEADING verb, NOT ExtractCommand's resolved verb, on purpose.
+// ExtractCommand's verb-shift fallback scans forward past an unrecognized leading
+// token to the first recognized verb — fail-safe for the safe/state-altering axis
+// (it can only add gating) but a BYPASS for the unknown axis: `my-plugin get pods`
+// would otherwise resolve `get` and be classified safe, laundering a plugin's
+// arguments into "known-safe" and escaping the strict policy. Keying off the
+// leading token fails CLOSED — a genuine unconsumed-global-flag case (its value
+// sitting in leading position) is also treated as unknown and gated, which is the
+// safe direction on a protected target.
+//
+// An empty command (no verb) is NOT unknown: it prints help / is treated as safe.
+// A recognized command with an UNRECOGNIZED subcommand (e.g. `config frobnicate`)
+// is not "unknown" either — its leading verb IS recognized, and IsStateAlteringWith
+// already classifies such a subcommand conservatively as state-altering.
+func IsUnknownCommand(cfg *config.Config, args []string) bool {
+	verb := leadingVerb(args)
+	if verb == "" {
+		return false // no verb (bare flags / help)
+	}
+	if cfg != nil && cfg.ClassifyOverride(verb) != config.ClassNone {
+		return false // the user classified it → known
+	}
+	return !recognizedVerb(verb)
+}
+
+// leadingVerb returns the lower-cased FIRST positional token — the command the
+// user actually invoked — or "" when there is none. Unlike commandVerb (which
+// uses ExtractCommand's verb-shift fallback), it never scans forward into a
+// plugin's arguments, so it names the real leading verb for the unknown-verb
+// policy and its messaging.
+func leadingVerb(args []string) string {
+	p := ParseArgs(args)
+	if len(p.Positional) == 0 {
+		return ""
+	}
+	return strings.ToLower(p.Positional[0])
+}
+
+// LeadingVerb is the exported form of leadingVerb, for callers surfacing the
+// user-invoked verb (e.g. the unknown-verb deny message).
+func LeadingVerb(args []string) string {
+	return leadingVerb(args)
+}
+
 // IsDiffable reports whether a command can be previewed with `kubectl diff`:
 // it must apply a manifest (apply/create/replace with a -f/-k source), so there
 // is something to diff. delete/scale/exec/patch have no manifest to diff and

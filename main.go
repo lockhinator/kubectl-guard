@@ -44,6 +44,7 @@ var guardConfigSubcommands = map[string]bool{
 	"audit-webhook":    true,
 	"audit-syslog":     true,
 	"command-override": true,
+	"unknown-verb":     true,
 	"audit":            true,
 	"path":             true,
 	"validate":         true,
@@ -936,6 +937,30 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "unknown-verb [allow|gate|deny]",
+		Short: "Show or set how unrecognized verbs are treated on protected targets",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Unknown verb: " + cfg.UnknownVerbMode())
+				return nil
+			}
+			if !cfg.SetUnknownVerb(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.UnknownVerbAllow, config.UnknownVerbGate, config.UnknownVerbDeny)
+			}
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Unknown verb policy set: " + cfg.UnknownVerb)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "command-override [safe <verb> | dangerous <verb> | remove <verb>]",
 		Short: "Override the built-in safe/state-altering classification of a verb",
 		Long: "Tailor command classification without forking. `safe` makes a verb\n" +
@@ -1134,6 +1159,7 @@ func printConfig() error {
 
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
+	ui.PrintInfo("Unknown verb: " + cfg.UnknownVerbMode())
 
 	printActorPolicies(cfg)
 	printCommandOverrides(cfg)
@@ -1345,6 +1371,10 @@ Config subcommands:
                              Override the built-in safe/state-altering
                              classification of a verb (e.g. a plugin, or treat
                              logs as requiring confirmation)
+  unknown-verb [allow|gate|deny]
+                             How to treat a verb the guard cannot classify on a
+                             protected target: allow (default), gate (confirm),
+                             or deny (refuse). Unprotected targets always pass
   audit                      Show the audit log path and recent entries
   validate                   Check the config for problems (exit non-zero if any;
                              an invalid config also fails closed at runtime)

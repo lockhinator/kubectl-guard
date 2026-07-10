@@ -36,6 +36,16 @@ const (
 	AuditModeOff   = "off"   // log nothing
 )
 
+// Unknown-verb policy for a verb the guard cannot classify (a plugin, a future
+// kubectl verb, or a gap in the built-in lists) on a PROTECTED context/namespace.
+// "allow" (default) keeps the prior behavior; a security tool cannot prove an
+// unknown verb is safe, so "gate"/"deny" fail toward gating on protected targets.
+const (
+	UnknownVerbAllow = "allow" // default: unknown verbs pass (current behavior)
+	UnknownVerbGate  = "gate"  // gate an unknown verb on a protected target
+	UnknownVerbDeny  = "deny"  // refuse an unknown verb on a protected target
+)
+
 // Blast-radius policies gate wide-scope / bulk mutations independently of
 // context, because a command's danger is also about HOW MUCH it changes, not
 // only WHERE it runs: `delete --all`, `apply --prune`, a label/field selector on
@@ -215,6 +225,12 @@ type Config struct {
 	// default-safe verb (e.g. logs) as requiring confirmation. See ClassifyOverride.
 	CommandOverrides CommandOverrides `yaml:"command_overrides,omitempty"`
 
+	// UnknownVerb is the strict-mode policy for a verb the guard cannot classify as
+	// safe or state-altering, on a PROTECTED context/namespace: "allow" (default),
+	// "gate" (require confirmation), or "deny" (refuse). Unknown verbs on
+	// UNPROTECTED targets always pass, so plugins keep working elsewhere.
+	UnknownVerb string `yaml:"unknown_verb,omitempty"`
+
 	// InCluster is the policy for running with no named context (in a pod, or CI
 	// with an in-cluster kubeconfig): "namespace" (default) gates by the resolved
 	// serviceaccount namespace, "deny" fails closed, "allow" passes through. Empty
@@ -382,6 +398,28 @@ func withoutFold(list []string, verb string) []string {
 		}
 	}
 	return out
+}
+
+// UnknownVerbMode returns the unknown-verb policy, defaulting to allow. An
+// invalid value is caught by Validate (fail-closed), so allow is only reached for
+// the genuine default.
+func (c *Config) UnknownVerbMode() string {
+	switch c.UnknownVerb {
+	case UnknownVerbGate, UnknownVerbDeny:
+		return c.UnknownVerb
+	default:
+		return UnknownVerbAllow
+	}
+}
+
+// SetUnknownVerb sets the unknown-verb policy if valid. The valid-value check is
+// validUnknownVerbMode (config/validate.go), shared with Validate.
+func (c *Config) SetUnknownVerb(mode string) bool {
+	if !validUnknownVerbMode(mode) {
+		return false
+	}
+	c.UnknownVerb = mode
+	return true
 }
 
 // BlastRadiusMode returns the blast-radius policy, defaulting to off. An invalid

@@ -1,7 +1,9 @@
 package guard
 
 import (
+	"bufio"
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1458,22 +1460,92 @@ func pathContainsProtectedKind(path string, cfg ProtectedResourceChecker) bool {
 	return fileContainsProtectedKind(path, cfg)
 }
 
+// maxManifestDocBytes caps a single YAML document during the streaming scan.
+// A Kubernetes object is bounded by etcd's ~1.5MB request limit, so 64MB is ~40x
+// headroom and no real manifest reaches it. If one document somehow exceeds it,
+// the scan cannot prove the document is free of a protected kind, so it fails
+// CLOSED (treats the file as protected) rather than reading unboundedly or
+// silently skipping the rest — matching the conservative stance elsewhere in
+// MatchesProtectedResource for un-inspectable sources.
+const maxManifestDocBytes = 64 * 1024 * 1024
+
+// splitYAMLDocs is a bufio.SplitFunc that yields one YAML document per token,
+// splitting on the literal "\n---" separator. This is byte-for-byte the same
+// document boundary the previous implementation used
+// (bytes.Split(data, []byte("\n---"))), so the streaming scan detects exactly the
+// same documents — including the robustness that split had for leading "---",
+// CRLF, consecutive separators, and a malformed document followed by a real one.
+// It is validated against that behavior by TestStreamingScanMatchesBytesSplit.
+func splitYAMLDocs(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if i := bytes.Index(data, []byte("\n---")); i >= 0 {
+		return i + len("\n---"), data[:i], nil
+	}
+	if atEOF {
+		if len(data) == 0 {
+			return 0, nil, nil
+		}
+		return len(data), data, nil
+	}
+	// Separator not yet in view: ask bufio.Scanner for more data.
+	return 0, nil, nil
+}
+
+// newDocScanner builds the streaming YAML-document scanner used by
+// fileContainsProtectedKind. The buffer starts small and grows only as a single
+// document requires, capped at maxManifestDocBytes so peak memory is the largest
+// single document rather than the whole file.
+func newDocScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxManifestDocBytes)
+	scanner.Split(splitYAMLDocs)
+	return scanner
+}
+
 // fileContainsProtectedKind reports whether a single regular file is a
 // YAML/JSON manifest (possibly multi-document) whose kind is protected.
+//
+// The file is scanned by STREAMING one document at a time rather than reading it
+// all into memory: a helm-generated manifest can be tens of MB across thousands
+// of resources, and the previous os.ReadFile + unmarshal-all approach held the
+// whole thing (and, via yaml.v3, a multiple of it) resident at once. Streaming
+// bounds memory to the largest single document, and — because it returns on the
+// first protected kind — a manifest whose protected resource is early (the common
+// case) is decided after reading only a few KB, never touching the rest.
 func fileContainsProtectedKind(path string, cfg ProtectedResourceChecker) bool {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
+		// Match the previous behavior: an unreadable file is not treated as a
+		// match here (MatchesProtectedResource handles un-inspectable SOURCES —
+		// stdin/URL/kustomize — separately and conservatively).
 		return false
 	}
-	for _, doc := range bytes.Split(data, []byte("\n---")) {
+	defer func() { _ = f.Close() }()
+	return readerContainsProtectedKind(f, cfg)
+}
+
+// readerContainsProtectedKind streams the YAML documents from r and reports
+// whether any document's kind is protected. It returns as soon as the first
+// protected kind is seen — so for the common case (a protected resource in an
+// early document) it reads only that far and never touches the rest of r. It is
+// separate from fileContainsProtectedKind so the short-circuit can be exercised
+// through a byte-counting reader in tests.
+func readerContainsProtectedKind(r io.Reader, cfg ProtectedResourceChecker) bool {
+	scanner := newDocScanner(r)
+	for scanner.Scan() {
 		var meta struct {
 			Kind string `yaml:"kind"`
 		}
-		if yaml.Unmarshal(doc, &meta) == nil && meta.Kind != "" {
+		if yaml.Unmarshal(scanner.Bytes(), &meta) == nil && meta.Kind != "" {
 			if cfg.IsResourceProtected(meta.Kind) {
 				return true
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		// The only expected error is bufio.ErrTooLong on a single document larger
+		// than the cap. We could not scan it, so we cannot prove it is safe: fail
+		// closed. This is unreachable for any real Kubernetes manifest.
+		return true
 	}
 	return false
 }

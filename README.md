@@ -374,6 +374,27 @@ The OS `user` is always recorded regardless, so you keep full attribution. `conf
   `--all-namespaces`/`-A` is gated whenever any namespace is protected.
   Composes with context protection: a command is gated if *either* the context
   or the namespace is protected.
+
+  Protecting a namespace also guards **the namespace object itself**. A command
+  whose target *is* a protected namespace is gated even on an unprotected
+  context and with no `-n` flag, because otherwise the target namespace would
+  resolve to `default` and the most destructive command of all would sail
+  through:
+
+  ```bash
+  kubectl delete namespace kube-system   # gated
+  kubectl delete ns/prod-app             # gated (type/name form)
+  kubectl edit namespace kube-system     # gated
+  kubectl delete ns,pod kube-system      # gated (comma type list)
+  ```
+
+  Because kubectl's own usage is `delete TYPE (NAME | -l label | --all)`, a
+  namespace command that supplies **no names** cannot be checked against the
+  protected patterns. `kubectl delete namespace --all` and
+  `kubectl delete ns -l env=prod` are therefore gated whenever *any* namespace
+  is protected — the guard cannot prove a protected namespace is not among the
+  targets. Reads (`kubectl get namespace kube-system`) are unaffected; use
+  `protected_resources` to block reads.
 - **Block mode** — set `context_mode: block` and/or `namespace_mode: block` to
   hard-refuse state-altering commands with **no confirmation option** (for CI
   service accounts or a strict "agents must never touch prod" policy). Block

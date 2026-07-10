@@ -369,8 +369,15 @@ func runGuard(args []string) error {
 			case "protected-context-block-mode":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
 			default: // protected-namespace-block-mode
-				ns := "all namespaces"
-				if !parsed.AllNamespaces {
+				// Prefer the namespace OBJECT the command targets by name
+				// (`delete namespace kube-system`) over the namespace it would
+				// be considered to run in, which is "default" and misleading.
+				ns, ok := guard.ProtectedNamespaceNameTarget(cfg, forwarded)
+				switch {
+				case ok:
+				case parsed.AllNamespaces:
+					ns = "all namespaces"
+				default:
 					ns = guard.ResolvedTargetNamespace(cfg, forwarded, ctx)
 				}
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected namespace %q (block mode: no confirmation offered)", cmdDesc, ns))
@@ -401,7 +408,13 @@ func runGuard(args []string) error {
 		// message names whichever actually applies.
 		reason := "protected context"
 		target := ctx
-		switch {
+		switch nameTarget, byName := guard.ProtectedNamespaceNameTarget(cfg, forwarded); {
+		case byName:
+			// The command's OBJECT is a protected namespace (e.g.
+			// `delete namespace kube-system`). Name that, rather than the
+			// namespace the command would otherwise be considered to run in,
+			// which is "default" and would read as nonsense.
+			reason, target = "protected namespace", nameTarget
 		case parsed.AllNamespaces && cfg != nil && cfg.HasProtectedNamespaces():
 			reason, target = "protected namespace", "all namespaces"
 		case parsed.HasNamespace && parsed.Namespace != "" && cfg != nil && cfg.IsNamespaceProtected(parsed.Namespace):
@@ -834,7 +847,11 @@ Protection model:
   - Protected NAMESPACES: state-altering commands are gated when the target
     namespace (--namespace/-n, the context's namespace, or "default", and any
     namespace under --all-namespaces/-A) matches (or blocked in
-    namespace_mode: block).
+    namespace_mode: block). A command whose TARGET OBJECT is a protected
+    namespace is also gated, on any context and with no -n
+    ("delete namespace kube-system", "delete ns/prod-app"); a namespace command
+    naming no names ("delete ns --all", "delete ns -l x=y") is gated whenever
+    any namespace is protected, since its targets cannot be known in advance.
   - Protected RESOURCES: any command touching the resource is blocked
     everywhere (reads included), e.g. block all secret access.
   - Dry-run (--dry-run=client|server) skips the prompt; real-mutation forms

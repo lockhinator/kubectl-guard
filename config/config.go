@@ -266,6 +266,13 @@ type Config struct {
 	// KUBECTL_GUARD_STRICT env var. See InsecureConfigPerms / StrictPerms.
 	StrictConfigPerms bool `yaml:"strict_config_perms,omitempty"`
 
+	// RequireJustification, when true, requires a free-text reason at confirmation
+	// time for a gated command; the reason is recorded on the audit entry (for
+	// compliance / post-incident review). An empty reason aborts (fail closed).
+	// Non-interactive approvals supply it with --reason; --yes without a reason
+	// aborts. Off by default. See ui reason capture and the --reason flag.
+	RequireJustification bool `yaml:"require_justification,omitempty"`
+
 	// ReadOnly is the global freeze / incident panic button. When true, EVERY
 	// state-altering command is Blocked regardless of context/namespace/actor;
 	// reads pass, a genuine --dry-run passes, and --yes does NOT override (it is

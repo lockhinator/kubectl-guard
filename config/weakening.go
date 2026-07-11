@@ -65,6 +65,9 @@ func WeakensProtection(old, new *Config) []string {
 	if old.RequireConfirmWeakening && !new.RequireConfirmWeakening {
 		w = append(w, "disabled require_confirm_weakening")
 	}
+	if old.RequireJustification && !new.RequireJustification {
+		w = append(w, "disabled require_justification")
+	}
 	if old.AuditSyslog && !new.AuditSyslog {
 		w = append(w, "disabled audit_syslog shipping")
 	}

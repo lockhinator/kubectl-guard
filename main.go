@@ -55,6 +55,7 @@ var guardConfigSubcommands = map[string]bool{
 	"command-override":      true,
 	"unknown-verb":          true,
 	"confirm-weakening":     true,
+	"require-justification": true,
 	"audit":                 true,
 	"path":                  true,
 	"validate":              true,
@@ -338,6 +339,9 @@ func runGuard(args []string) error {
 	}
 	// --yes is a guard-only audited auto-confirm of RequireConfirmation.
 	forwarded, yesFlag := guard.StripYes(forwarded)
+	// --reason is a guard-only free-text justification for a gated command
+	// (require_justification). Parsed/stripped here so it never reaches kubectl.
+	forwarded, reasonFlag, hasReason := guard.StripReason(forwarded)
 
 	result, ctx, cfg, err := guard.Check(forwarded)
 
@@ -369,6 +373,11 @@ func runGuard(args []string) error {
 	// not just who invoked the guard.
 	parsed := guard.ParseArgs(forwarded)
 
+	// justification holds the free-text reason a human/agent supplied to approve a
+	// gated command (require_justification, or a provided --reason). Set at
+	// confirm/auto-confirm time and recorded on the audit entry via the closure.
+	var justification string
+
 	// audit writes an attributed audit entry for this invocation. It is a
 	// thin wrapper so every decision path records impersonation/token the same
 	// way. cfg may be nil (Deny before config load); in that case it is a no-op.
@@ -377,10 +386,11 @@ func runGuard(args []string) error {
 			return
 		}
 		e := guard.AuditEntry{
-			Context: ctx,
-			Command: cmdStr,
-			Outcome: outcome,
-			Reason:  reason,
+			Context:       ctx,
+			Command:       cmdStr,
+			Outcome:       outcome,
+			Reason:        reason,
+			Justification: justification,
 		}
 		if imp := parsed.ImpersonationString(); imp != "" {
 			e.Impersonate = imp
@@ -606,6 +616,27 @@ func runGuard(args []string) error {
 		// affected by this (they stay a hard block in their own branch).
 		autoConfirm := yesFlag || boolEnv(config.EnvConfirm)
 		if autoConfirm {
+			// Justification: a non-interactive approval must carry --reason when
+			// require_justification is on, else fail closed (the command must not run
+			// without a recorded reason). A provided reason is recorded either way.
+			if cfg != nil && cfg.RequireJustification {
+				r := strings.TrimSpace(reasonFlag)
+				if !hasReason || r == "" {
+					audit(guard.OutcomeAborted, "justification-required")
+					if jsonMode {
+						jr := guard.JSONResult{Decision: "needs-confirmation", Reason: "justification-required", Context: ctx, Command: cmdStr, Prompt: "Re-run with --yes --reason \"<why>\" to supply the required justification."}
+						if b, mErr := json.Marshal(jr); mErr == nil {
+							fmt.Fprintln(os.Stderr, string(b))
+						}
+					} else {
+						fmt.Fprintln(os.Stderr, "Aborted: this command requires a justification. Re-run with --reason \"<why>\".")
+					}
+					os.Exit(guard.ExitNeedsConfirm)
+				}
+				justification = r
+			} else if hasReason {
+				justification = strings.TrimSpace(reasonFlag)
+			}
 			if !jsonMode {
 				ui.PrintWarning("Auto-confirming gated command (--yes / KUBECTL_GUARD_CONFIRM=yes); logged as auto-confirmed.")
 			}
@@ -660,12 +691,18 @@ func runGuard(args []string) error {
 		// mode is agent-relay or KUBECTL_GUARD_AGENT_RELAY is set.
 		agentRelay := (cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay) || boolEnv(config.EnvAgentRelay)
 		if agentRelay {
+			rerun := "Re-run with --yes to proceed."
+			if cfg != nil && cfg.RequireJustification {
+				// The relayed request notes a reason is required so the agent can
+				// collect it from its human before re-running.
+				rerun = "Re-run with --yes --reason \"<why>\" to proceed (a justification is required)."
+			}
 			jr := guard.JSONResult{
 				Decision: "needs-confirmation",
 				Reason:   "agent-relay",
 				Context:  ctx,
 				Command:  cmdStr,
-				Prompt:   fmt.Sprintf("Approve %q on %s %q? Re-run with --yes to proceed.", cmdDesc, reason, target),
+				Prompt:   fmt.Sprintf("Approve %q on %s %q? %s", cmdDesc, reason, target, rerun),
 			}
 			if b, mErr := json.Marshal(jr); mErr == nil {
 				fmt.Fprintln(os.Stderr, string(b))
@@ -772,6 +809,24 @@ func runGuard(args []string) error {
 
 		switch outcome {
 		case ui.ConfirmApproved:
+			// Compliance justification: when require_justification is on, use a
+			// reason supplied on the command line (--reason), otherwise prompt for
+			// one after approval. An empty reason (neither given nor typed) aborts
+			// (fail closed).
+			if cfg != nil && cfg.RequireJustification {
+				r := strings.TrimSpace(reasonFlag)
+				if !hasReason || r == "" {
+					r = ui.PromptReason(timeout)
+				}
+				if r == "" {
+					audit(guard.OutcomeAborted, "justification-required")
+					fmt.Fprintln(os.Stderr, "Aborted: a justification is required (empty reason).")
+					os.Exit(guard.ExitNeedsConfirm)
+				}
+				justification = r
+			} else if hasReason {
+				justification = strings.TrimSpace(reasonFlag)
+			}
 			audit(guard.OutcomeConfirmed, "")
 			return execKubectl(forwarded)
 		case ui.ConfirmTimedOut:
@@ -1356,6 +1411,35 @@ func newConfigCommand() *cobra.Command {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "require-justification [on|off]",
+		Short: "Show or toggle requiring a free-text reason to approve a gated command",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Require justification: " + onOff(cfg.RequireJustification))
+				return nil
+			}
+			switch args[0] {
+			case "on":
+				cfg.RequireJustification = true
+			case "off":
+				cfg.RequireJustification = false
+			default:
+				return fmt.Errorf("expected 'on' or 'off'")
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Require justification: " + onOff(cfg.RequireJustification))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "unknown-verb [allow|gate|deny]",
 		Short: "Show or set how unrecognized verbs are treated on protected targets",
 		Args:  cobra.MaximumNArgs(1),
@@ -1881,6 +1965,8 @@ Protection model:
 Guard-only flags (stripped before forwarding to kubectl):
   --json         Emit a structured decision object on stderr for non-allow
   --yes          Auto-confirm a gated command (audited; block mode not bypassed)
+  --reason <why> Free-text justification recorded on the audit entry for a gated
+                 command; required with --yes when require_justification is on
   --no-prompt    Headless: no interactive setup wizard. With no config, the
                  posture comes from KUBECTL_GUARD_BOOTSTRAP (deny by default:
                  state-altering commands are refused, reads pass, nothing is

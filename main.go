@@ -238,7 +238,7 @@ func runDoctor(args []string) error {
 // doctorPostureKeys fixes the display order of the posture map.
 var doctorPostureKeys = []string{
 	"enforced_baseline",
-	"protected_contexts", "protected_namespaces", "protected_resources",
+	"protected_contexts", "protected_namespaces", "protected_clusters", "protected_resources",
 	"sensitive_kinds", "context_mode", "namespace_mode", "confirm_mode",
 	"blast_radius", "sensitive_access", "unknown_verb", "audit_mode", "read_only",
 }

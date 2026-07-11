@@ -109,14 +109,17 @@ const (
 	// InClusterDeny reproduces the previous fail-closed behavior: refuse every
 	// state-altering command in-cluster when protected contexts are configured.
 	InClusterDeny = "deny"
-	// InClusterAllow passes commands through in-cluster with NO namespace or
-	// context gating — a full passthrough. (Applying namespace protection here
-	// would be identical to InClusterNamespace, since context protection is
-	// unevaluable in-cluster either way, which is why "allow" is distinct.)
-	// Resource protection still applies (it is global and evaluated earlier), and
-	// so does sensitive-access gating: sensitive verbs are gated on EVERY context,
-	// which "allow" does not override. A deliberately-permissive opt-in for the
-	// context/namespace axis only.
+	// InClusterAllow relaxes only the UNEVALUABLE axes in-cluster: the context
+	// name (unknowable without a kubeconfig) and the IMPLICIT run-in namespace
+	// (the serviceaccount-namespace fallback that InClusterNamespace would gate
+	// on). It is NOT a full passthrough. The context-INDEPENDENT signals still
+	// gate: protected resources (global), sensitive-access, blast-radius,
+	// sensitive-kind, AND namespace protection for an EXPLICITLY-named target
+	// (-n <ns>, -A, or the namespace as the command's object) — those are
+	// evaluable from argv regardless of the unresolvable context, so "allow"
+	// differs from "namespace" precisely by relaxing the SA-namespace fallback,
+	// not the explicit target. A deliberately-permissive opt-in for the
+	// unevaluable context / implicit-namespace axes only.
 	InClusterAllow = "allow"
 )
 

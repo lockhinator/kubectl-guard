@@ -46,14 +46,14 @@ metadata:
   namespace: prod
 type: Opaque
 data:
-  password: aHVudGVyMg==
-  username: YWRtaW4=
+  password: pw-sentinel
+  username: user-sentinel
 stringData:
-  token: plaintext-token
+  token: tok-sentinel
 `
 	out := redact(t, in, "yaml")
 	// The raw secret values must be gone.
-	for _, secret := range []string{"aHVudGVyMg==", "YWRtaW4=", "plaintext-token"} {
+	for _, secret := range []string{"pw-sentinel", "user-sentinel", "tok-sentinel"} {
 		if strings.Contains(out, secret) {
 			t.Errorf("secret value %q survived redaction:\n%s", secret, out)
 		}
@@ -140,13 +140,13 @@ func TestRedactEmptyStreamNoError(t *testing.T) {
 // secret it mirrors survives redaction verbatim.
 func TestRedactLastAppliedAnnotation(t *testing.T) {
 	cases := map[string]string{
-		"Secret":     "apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\n  annotations:\n    kubectl.kubernetes.io/last-applied-configuration: '{\"data\":{\"password\":\"U0VOVElORUw=\"}}'\ndata:\n  password: U0VOVElORUw=\n",
-		"Deployment": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  annotations:\n    kubectl.kubernetes.io/last-applied-configuration: '{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"env\":[{\"value\":\"U0VOVElORUw=\"}]}]}}}}'\nspec:\n  template:\n    spec:\n      containers:\n      - name: c\n        env:\n        - name: K\n          value: U0VOVElORUw=\n",
+		"Secret":     "apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\n  annotations:\n    kubectl.kubernetes.io/last-applied-configuration: '{\"data\":{\"password\":\"val-sentinel\"}}'\ndata:\n  password: val-sentinel\n",
+		"Deployment": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  annotations:\n    kubectl.kubernetes.io/last-applied-configuration: '{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"env\":[{\"value\":\"val-sentinel\"}]}]}}}}'\nspec:\n  template:\n    spec:\n      containers:\n      - name: c\n        env:\n        - name: K\n          value: val-sentinel\n",
 	}
 	for name, doc := range cases {
 		t.Run(name, func(t *testing.T) {
 			out := redact(t, doc, "yaml")
-			if strings.Contains(out, "U0VOVElORUw=") {
+			if strings.Contains(out, "val-sentinel") {
 				t.Errorf("%s: secret survived in the last-applied annotation:\n%s", name, out)
 			}
 			if !strings.Contains(out, "last-applied-configuration: '"+RedactedMarker+"'") {

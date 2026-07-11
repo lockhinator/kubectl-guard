@@ -9,11 +9,11 @@ import (
 	"testing"
 )
 
-// sentinelSecretB64 is base64("SENTINEL"); it is the `data.password` value of the
+// sentinelSecret is the `data.password` value of the
 // canned Secret the fake kubectl emits. The structured redactor blanks it, so its
 // PRESENCE in stdout proves the guard left the output untouched (syscall.Exec
 // passthrough) and its ABSENCE proves redaction ran.
-const sentinelSecretB64 = "U0VOVElORUw="
+const sentinelSecret = "val-sentinel"
 
 // cannedSecretYAML is the exact document the fake kubectl prints for any command
 // (except its internal config/api-resources answers). It is a valid Secret.
@@ -24,7 +24,7 @@ metadata:
   namespace: default
 type: Opaque
 data:
-  password: ` + sentinelSecretB64 + `
+  password: ` + sentinelSecret + `
 `
 
 // writeSecretFakeKubectl installs a fake kubectl that answers the guard's internal
@@ -86,7 +86,7 @@ func TestRedactOutputStructuredBlanksSecret(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if strings.Contains(stdout, sentinelSecretB64) {
+	if strings.Contains(stdout, sentinelSecret) {
 		t.Errorf("secret value survived structured redaction:\n%s", stdout)
 	}
 	if !strings.Contains(stdout, "***REDACTED (kubectl-guard)***") {
@@ -116,7 +116,7 @@ func TestRedactOutputOffByteIdentical(t *testing.T) {
 		if stdout != cannedSecretYAML {
 			t.Errorf("cfg %q: off-mode output not byte-identical to raw kubectl:\ngot:\n%q\nwant:\n%q", cfg, stdout, cannedSecretYAML)
 		}
-		if !strings.Contains(stdout, sentinelSecretB64) {
+		if !strings.Contains(stdout, sentinelSecret) {
 			t.Errorf("cfg %q: secret value should be present in off mode (no redaction):\n%s", cfg, stdout)
 		}
 	}
@@ -161,7 +161,7 @@ func TestRedactOutputNonQualifyingUsesPassthrough(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("exit = %d, want 0", code)
 			}
-			if !strings.Contains(stdout, sentinelSecretB64) {
+			if !strings.Contains(stdout, sentinelSecret) {
 				t.Errorf("%v was redacted but must use the untouched passthrough:\n%s", tc.args, stdout)
 			}
 			if strings.Contains(stdout, "***REDACTED") {
@@ -184,7 +184,7 @@ func TestRedactOutputJSONFormat(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(stdout, sentinelSecretB64) {
+	if !strings.Contains(stdout, sentinelSecret) {
 		t.Errorf("fail-open should pass the unparseable (non-JSON) read through unredacted:\n%s", stdout)
 	}
 }

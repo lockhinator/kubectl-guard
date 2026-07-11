@@ -35,12 +35,14 @@ func WeakensProtection(old, new *Config) []string {
 	w = append(w, removedEach("removed protected context", old.ProtectedContexts, new.ProtectedContexts)...)
 	w = append(w, removedEach("removed protected resource", old.ProtectedResources, new.ProtectedResources)...)
 	w = append(w, removedEach("removed protected namespace", old.ProtectedNamespaces, new.ProtectedNamespaces)...)
+	w = append(w, removedEach("removed sensitive kind", old.SensitiveKinds, new.SensitiveKinds)...)
 
 	// Mode downgrades (a lower strength rank is weaker).
 	w = weakerMode(w, "context_mode", contextModeRank, old.effectiveContextMode(), new.effectiveContextMode())
 	w = weakerMode(w, "namespace_mode", namespaceModeRank, old.effectiveNamespaceMode(), new.effectiveNamespaceMode())
 	w = weakerMode(w, "sensitive_access", sensitiveAccessRank, old.SensitiveAccessMode(), new.SensitiveAccessMode())
 	w = weakerMode(w, "blast_radius", blastRadiusRank, old.BlastRadiusMode(), new.BlastRadiusMode())
+	w = weakerMode(w, "sensitive_kind_mode", sensitiveKindRank, old.SensitiveKindMode(), new.SensitiveKindMode())
 	w = weakerMode(w, "unknown_verb", unknownVerbRank, old.UnknownVerbMode(), new.UnknownVerbMode())
 	w = weakerMode(w, "audit_mode", auditModeRank, auditModeOrDefault(old.AuditMode), auditModeOrDefault(new.AuditMode))
 	w = weakerMode(w, "in_cluster", inClusterRank, old.InClusterMode(), new.InClusterMode())
@@ -117,6 +119,7 @@ var (
 	namespaceModeRank   = map[string]int{NamespaceModeConfirm: 1, NamespaceModeBlock: 2}
 	sensitiveAccessRank = map[string]int{SensitiveAccessOff: 1, SensitiveAccessGate: 2, SensitiveAccessBlock: 3}
 	blastRadiusRank     = map[string]int{BlastRadiusOff: 1, BlastRadiusGate: 2, BlastRadiusBlock: 3}
+	sensitiveKindRank   = map[string]int{SensitiveKindOff: 1, SensitiveKindConfirm: 2, SensitiveKindBlock: 3}
 	unknownVerbRank     = map[string]int{UnknownVerbAllow: 1, UnknownVerbGate: 2, UnknownVerbDeny: 3}
 	auditModeRank       = map[string]int{AuditModeOff: 1, AuditModeGated: 2, AuditModeAll: 3}
 	inClusterRank       = map[string]int{InClusterAllow: 1, InClusterNamespace: 2, InClusterDeny: 3}

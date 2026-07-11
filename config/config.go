@@ -69,6 +69,17 @@ const (
 	SensitiveAccessBlock = "block" // refuse on any context
 )
 
+// Sensitive-kind policies gate STATE-ALTERING commands on a configured kind
+// (node, namespace, persistentvolume, a critical CRD) on EVERY context, while
+// leaving reads of that kind alone — the middle tier between "block all access to
+// a kind" (protected_resources) and "gate mutations by location"
+// (protected_contexts/namespaces).
+const (
+	SensitiveKindOff     = "off"     // default: mutations to the kind are not specially gated
+	SensitiveKindConfirm = "confirm" // require confirmation on any context
+	SensitiveKindBlock   = "block"   // refuse on any context
+)
+
 // In-cluster policies decide what happens when the guard runs with no named
 // context (inside a pod on the serviceaccount config, or CI with an in-cluster
 // kubeconfig) and protected contexts are configured. Without a context name the
@@ -213,6 +224,14 @@ type Config struct {
 	// SensitiveVerbs overrides which verbs the sensitive-access policy applies to.
 	// Empty uses the defaults: exec, cp, attach, debug, port-forward, proxy.
 	SensitiveVerbs []string `yaml:"sensitive_verbs,omitempty"`
+
+	// SensitiveKinds gates STATE-ALTERING commands whose target kind (resource
+	// token or -f manifest kind) matches, on EVERY context, while leaving reads
+	// alone. SensitiveKind is the mode: "off" (default), "confirm", or "block".
+	// Kinds are matched via NormalizeResource, so singular/plural/short-name all
+	// hit (node/nodes/no). See guard.IsSensitiveKindActive.
+	SensitiveKinds []string `yaml:"sensitive_kinds,omitempty"`
+	SensitiveKind  string   `yaml:"sensitive_kind_mode,omitempty"`
 
 	// BlastRadius gates wide-scope / bulk mutations on EVERY context: "off"
 	// (default), "gate" (confirm), or "block" (refuse). Triggers are a destructive
@@ -443,6 +462,76 @@ func (c *Config) SetUnknownVerb(mode string) bool {
 	}
 	c.UnknownVerb = mode
 	return true
+}
+
+// SensitiveKindMode returns the sensitive-kind policy, defaulting to off. An
+// invalid value is caught by Validate (fail-closed).
+func (c *Config) SensitiveKindMode() string {
+	switch c.SensitiveKind {
+	case SensitiveKindConfirm, SensitiveKindBlock:
+		return c.SensitiveKind
+	default:
+		return SensitiveKindOff
+	}
+}
+
+// HasSensitiveKinds reports whether any sensitive kinds are configured.
+func (c *Config) HasSensitiveKinds() bool {
+	return len(c.SensitiveKinds) > 0
+}
+
+// IsSensitiveKind reports whether candidate names a configured sensitive kind,
+// case-insensitively and treating singular/plural/short-name forms as equivalent
+// (node/nodes/no, namespace/ns, persistentvolume/pv).
+func (c *Config) IsSensitiveKind(candidate string) bool {
+	if candidate == "" || len(c.SensitiveKinds) == 0 {
+		return false
+	}
+	nc := NormalizeResource(candidate)
+	for _, k := range c.SensitiveKinds {
+		if NormalizeResource(k) == nc {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSensitiveKindMode sets the sensitive-kind policy if valid.
+func (c *Config) SetSensitiveKindMode(mode string) bool {
+	if !validSensitiveKindMode(mode) {
+		return false
+	}
+	c.SensitiveKind = mode
+	return true
+}
+
+// AddSensitiveKind adds a kind to the sensitive list if an equivalent entry is
+// not already present. Returns false if it was already sensitive.
+func (c *Config) AddSensitiveKind(name string) bool {
+	norm := NormalizeResource(name)
+	if norm == "" {
+		return false
+	}
+	for _, k := range c.SensitiveKinds {
+		if NormalizeResource(k) == norm {
+			return false
+		}
+	}
+	c.SensitiveKinds = append(c.SensitiveKinds, name)
+	return true
+}
+
+// RemoveSensitiveKind removes a kind from the sensitive list. Returns false if it
+// was not present.
+func (c *Config) RemoveSensitiveKind(name string) bool {
+	norm := NormalizeResource(name)
+	for i, k := range c.SensitiveKinds {
+		if NormalizeResource(k) == norm {
+			c.SensitiveKinds = append(c.SensitiveKinds[:i], c.SensitiveKinds[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // BlastRadiusMode returns the blast-radius policy, defaulting to off. An invalid

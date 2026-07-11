@@ -29,32 +29,35 @@ var version = "dev"
 // "config <subcommand>" (e.g. "config use-context", "config view") is a kubectl
 // command and must be forwarded through the guard rather than intercepted.
 var guardConfigSubcommands = map[string]bool{
-	"setup":             true,
-	"init":              true,
-	"list":              true,
-	"add":               true,
-	"remove":            true,
-	"add-context":       true,
-	"remove-context":    true,
-	"add-resource":      true,
-	"remove-resource":   true,
-	"add-namespace":     true,
-	"remove-namespace":  true,
-	"confirm-mode":      true,
-	"context-mode":      true,
-	"namespace-mode":    true,
-	"blast-radius":      true,
-	"actor-policy":      true,
-	"audit-mode":        true,
-	"audit-rotation":    true,
-	"audit-webhook":     true,
-	"audit-syslog":      true,
-	"command-override":  true,
-	"unknown-verb":      true,
-	"confirm-weakening": true,
-	"audit":             true,
-	"path":              true,
-	"validate":          true,
+	"setup":                 true,
+	"init":                  true,
+	"list":                  true,
+	"add":                   true,
+	"remove":                true,
+	"add-context":           true,
+	"remove-context":        true,
+	"add-resource":          true,
+	"remove-resource":       true,
+	"add-namespace":         true,
+	"remove-namespace":      true,
+	"confirm-mode":          true,
+	"context-mode":          true,
+	"namespace-mode":        true,
+	"blast-radius":          true,
+	"sensitive-kind":        true,
+	"add-sensitive-kind":    true,
+	"remove-sensitive-kind": true,
+	"actor-policy":          true,
+	"audit-mode":            true,
+	"audit-rotation":        true,
+	"audit-webhook":         true,
+	"audit-syslog":          true,
+	"command-override":      true,
+	"unknown-verb":          true,
+	"confirm-weakening":     true,
+	"audit":                 true,
+	"path":                  true,
+	"validate":              true,
 }
 
 func main() {
@@ -538,6 +541,8 @@ func runGuard(args []string) error {
 				blockReason = "sensitive-access-block"
 			case guard.IsBlastRadiusActive(cfg, forwarded) && cfg != nil && cfg.BlastRadiusMode() == config.BlastRadiusBlock:
 				blockReason = "blast-radius-block"
+			case guard.IsSensitiveKindActive(cfg, forwarded) && cfg != nil && cfg.SensitiveKindMode() == config.SensitiveKindBlock:
+				blockReason = "sensitive-kind-block"
 			default:
 				blockReason = "protected-namespace-block-mode"
 			}
@@ -573,6 +578,8 @@ func runGuard(args []string) error {
 					scope = why
 				}
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s — %s (blast_radius: block; refused on every context)", cmdDesc, scope))
+			case "sensitive-kind-block":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s mutates a sensitive kind (sensitive_kind_mode: block; refused on every context). Reads of the kind still pass.", cmdDesc))
 			default: // protected-namespace-block-mode
 				// Prefer the namespace OBJECT the command targets by name
 				// (`delete namespace kube-system`) over the namespace it would
@@ -619,6 +626,10 @@ func runGuard(args []string) error {
 			// Gated purely because it is a sensitive-access verb on an otherwise
 			// unprotected target — name that, not a "protected context".
 			reason, target = "sensitive access", "any context"
+		case guard.IsSensitiveKindActive(cfg, forwarded) && !cfg.IsContextProtected(ctx) && !byName:
+			// Gated as a mutation to a sensitive kind on an otherwise unprotected
+			// target — name that.
+			reason, target = "sensitive kind", "any context"
 		case byName:
 			// The command's OBJECT is a protected namespace (e.g.
 			// `delete namespace kube-system`). Name that, rather than the
@@ -1072,6 +1083,86 @@ func newConfigCommand() *cobra.Command {
 			}
 			ui.PrintSuccess("Blast radius set: " + cfg.BlastRadius)
 			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "sensitive-kind [off|confirm|block]",
+		Short: "Show or set gating of state-altering commands on sensitive kinds",
+		Long: "Gate mutations to a configured kind (node, namespace, persistentvolume,\n" +
+			"a critical CRD) on every context, while leaving reads alone. Manage the\n" +
+			"kind list with add-sensitive-kind / remove-sensitive-kind.\n\n" +
+			"Matches a resource token, an inspectable -f manifest kind, and the\n" +
+			"implicit node target of cordon/uncordon/drain. It does NOT gate\n" +
+			"un-inspectable sources (-f -, a URL, -k kustomize, or --raw); use\n" +
+			"protected_resources for a fail-closed block that also covers those.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Sensitive-kind mode: " + cfg.SensitiveKindMode())
+				if len(cfg.SensitiveKinds) > 0 {
+					ui.PrintInfo("Sensitive kinds: " + strings.Join(cfg.SensitiveKinds, ", "))
+				}
+				return nil
+			}
+			if !cfg.SetSensitiveKindMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.SensitiveKindOff, config.SensitiveKindConfirm, config.SensitiveKindBlock)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Sensitive-kind mode set: " + cfg.SensitiveKindMode())
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:               "add-sensitive-kind <kind>",
+		Short:             "Gate state-altering commands on this kind on every context (e.g. node)",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeAddResource,
+		RunE: func(_ *cobra.Command, a []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if !cfg.AddSensitiveKind(a[0]) {
+				ui.PrintInfo("Kind already sensitive: " + a[0])
+				return nil
+			}
+			// Adding a kind with the policy off would be a no-op; default it to
+			// confirm so the kind actually takes effect (the user can tighten to
+			// block or set it off explicitly).
+			activated := false
+			if cfg.SensitiveKindMode() == config.SensitiveKindOff {
+				cfg.SetSensitiveKindMode(config.SensitiveKindConfirm)
+				activated = true
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Sensitive kind added: " + a[0])
+			if activated {
+				ui.PrintInfo("Sensitive-kind mode was off; set to 'confirm'. Use 'config sensitive-kind block' to hard-refuse.")
+			}
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "remove-sensitive-kind <kind>",
+		Short: "Stop gating state-altering commands on this kind",
+		Args:  cobra.ExactArgs(1),
+		ValidArgsFunction: firstArgComplete(func() []string {
+			return loadProtectedList(func(c *config.Config) []string { return c.SensitiveKinds })
+		}),
+		RunE: func(_ *cobra.Command, a []string) error {
+			return mutateConfig(func(c *config.Config) bool { return c.RemoveSensitiveKind(a[0]) },
+				"Sensitive kind removed: "+a[0], "Kind not in sensitive list: "+a[0])
 		},
 	})
 
@@ -1610,6 +1701,9 @@ func printConfig() error {
 
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
+	if cfg.HasSensitiveKinds() {
+		ui.PrintInfo(fmt.Sprintf("Sensitive kinds (%s): %s", cfg.SensitiveKindMode(), strings.Join(cfg.SensitiveKinds, ", ")))
+	}
 	ui.PrintInfo("Unknown verb: " + cfg.UnknownVerbMode())
 	ui.PrintInfo("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
 

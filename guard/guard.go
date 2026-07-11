@@ -191,6 +191,13 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// early return pass a dry-run of a wide mutation through.
 	blastActive := IsBlastRadiusActive(cfg, args)
 
+	// Sensitive-kind policy: a state-altering command whose target kind (token or
+	// -f manifest) matches sensitive_kinds is gated on EVERY context, while reads
+	// of the kind pass. Orthogonal to context/namespace like sensitive-access and
+	// blast-radius, so it threads through the same seams (in-cluster fall-through,
+	// read-only early return, the gate, and block-mode).
+	sensitiveKindActive := IsSensitiveKindActive(cfg, args)
+
 	// Global read-only / freeze mode (incident panic button). When active, EVERY
 	// command that is not a KNOWN-SAFE read is Blocked regardless of
 	// context/namespace/actor, so an operator can freeze all mutations instantly
@@ -269,7 +276,7 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 			// still be gated even in-cluster. Fall through to the unified gate below
 			// (contextProtected stays false); only a command that is neither gets
 			// the blanket allow here.
-			if !sensitiveActive && !blastActive {
+			if !sensitiveActive && !blastActive && !sensitiveKindActive {
 				return Allow, "", cfg, nil
 			}
 		default: // InClusterNamespace: context protection cannot be evaluated
@@ -317,7 +324,7 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	unknownStrict := cfg.UnknownVerbMode() != config.UnknownVerbAllow && IsUnknownCommand(cfg, args)
 
 	stateAltering := IsStateAlteringWith(cfg, args)
-	if !stateAltering && !sensitiveActive && !blastActive && !unknownStrict {
+	if !stateAltering && !sensitiveActive && !blastActive && !sensitiveKindActive && !unknownStrict {
 		return Allow, ctx, cfg, nil
 	}
 
@@ -340,7 +347,7 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 			LeadingVerb(args))
 	}
 
-	if contextProtected || namespaceProtected || sensitiveActive || blastActive {
+	if contextProtected || namespaceProtected || sensitiveActive || blastActive || sensitiveKindActive {
 		// Per-actor policy: a matching actor policy can make context/namespace
 		// protection STRICTER for a known actor (e.g. an agent label gets block
 		// where a human gets confirm). It never weakens the global posture.
@@ -352,7 +359,8 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 		if (contextProtected && ctxMode == config.ContextModeBlock) ||
 			(namespaceProtected && nsMode == config.NamespaceModeBlock) ||
 			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) ||
-			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) {
+			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) ||
+			(sensitiveKindActive && cfg.SensitiveKindMode() == config.SensitiveKindBlock) {
 			return Blocked, ctx, cfg, nil
 		}
 		return RequireConfirmation, ctx, cfg, nil

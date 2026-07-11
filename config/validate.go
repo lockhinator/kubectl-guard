@@ -62,6 +62,11 @@ func (c *Config) Validate() []string {
 			"blast_radius: %q is not valid (want %q, %q, or %q)",
 			c.BlastRadius, BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock))
 	}
+	if c.SensitiveKind != "" && !validSensitiveKindMode(c.SensitiveKind) {
+		problems = append(problems, fmt.Sprintf(
+			"sensitive_kind_mode: %q is not valid (want %q, %q, or %q)",
+			c.SensitiveKind, SensitiveKindOff, SensitiveKindConfirm, SensitiveKindBlock))
+	}
 	if c.UnknownVerb != "" && !validUnknownVerbMode(c.UnknownVerb) {
 		problems = append(problems, fmt.Sprintf(
 			"unknown_verb: %q is not valid (want %q, %q, or %q)",
@@ -192,6 +197,14 @@ func validSensitiveAccessMode(m string) bool {
 func validBlastRadiusMode(m string) bool {
 	switch m {
 	case BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock:
+		return true
+	}
+	return false
+}
+
+func validSensitiveKindMode(m string) bool {
+	switch m {
+	case SensitiveKindOff, SensitiveKindConfirm, SensitiveKindBlock:
 		return true
 	}
 	return false

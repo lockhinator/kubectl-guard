@@ -175,6 +175,13 @@ type Config struct {
 	// still happens regardless.
 	AuditSyslog bool `yaml:"audit_syslog,omitempty"`
 
+	// AuditHMACKeyFile is a path to a file whose contents are the HMAC key for the
+	// tamper-evident audit chain (#78). When set (or KUBECTL_GUARD_AUDIT_KEY is
+	// exported), each entry's chain hash is an HMAC, so an attacker who can write
+	// the log cannot forge a valid continuation without the key. Unset ⇒ plain
+	// SHA-256 (tamper-evident but forgeable by a local attacker).
+	AuditHMACKeyFile string `yaml:"audit_hmac_key_file,omitempty"`
+
 	// Actor is a static default identity for who drove a command (e.g.
 	// "ci-deploy"), stamped into audit entries when KUBECTL_GUARD_ACTOR is
 	// unset. Empty falls back to the OS username.

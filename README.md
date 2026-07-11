@@ -112,6 +112,24 @@ above before the GoReleaser `windows` target is re-enabled.
 mise use -g github:lockhinator/kubectl-guard
 ```
 
+**Homebrew** (macOS and Linuxbrew):
+
+```bash
+brew install lockhinator/tap/kubectl-guard
+```
+
+**Linux packages** — `.deb`, `.rpm`, and `.apk` are attached to each
+[release](https://github.com/lockhinator/kubectl-guard/releases); download the
+one for your distro and arch, then:
+
+```bash
+sudo dpkg -i kubectl-guard_*_linux_amd64.deb     # Debian/Ubuntu
+sudo rpm -i  kubectl-guard_*_linux_amd64.rpm     # Fedora/RHEL/openSUSE
+sudo apk add --allow-untrusted kubectl-guard_*_linux_amd64.apk  # Alpine
+```
+
+Verify any downloaded artifact first — see [Verifying a release](#verifying-a-release).
+
 **From source:**
 
 ```bash
@@ -119,6 +137,12 @@ git clone https://github.com/lockhinator/kubectl-guard
 cd kubectl-guard
 make install
 ```
+
+> **Not a krew plugin, by design.** krew installs `kubectl` *subcommand* plugins
+> (`kubectl foo`), but kubectl-guard is a **shim** that wraps `kubectl` itself to
+> gate every command — the opposite of a subcommand. A krew plugin could not
+> intercept `kubectl delete`; it would only add `kubectl guard`. So kubectl-guard
+> is distributed as a standalone binary (above), not via krew.
 
 Then add the alias to your shell config (`~/.zshrc` or `~/.bashrc`):
 

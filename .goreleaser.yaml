@@ -71,6 +71,62 @@ sboms:
   - id: archive-sbom
     artifacts: archive
 
+# Homebrew tap (#96, macOS): `brew install lockhinator/tap/kubectl-guard`.
+# GoReleaser generates a Homebrew CASK (the formula-based `brews:` is deprecated)
+# and pushes it to lockhinator/homebrew-tap. Casks are macOS-only; Linux users
+# install the .deb/.rpm/.apk packages below. The tap repo AND a
+# HOMEBREW_TAP_GITHUB_TOKEN secret (a token with contents:write on the tap repo —
+# the default GITHUB_TOKEN cannot push to a DIFFERENT repo) must exist before the
+# first release. Until then the push is skipped (skip_upload gates on the token
+# being present), so a release is never blocked just because the tap is not set up
+# yet. The release job always exports HOMEBREW_TAP_GITHUB_TOKEN (empty when the
+# secret is unset), so the token template resolves without error.
+homebrew_casks:
+  - name: kubectl-guard
+    binaries:
+      - kubectl-guard
+    repository:
+      owner: lockhinator
+      name: homebrew-tap
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+    directory: Casks
+    homepage: 'https://github.com/lockhinator/kubectl-guard'
+    description: 'Protect production clusters and sensitive resources from accidental kubectl commands'
+    skip_upload: '{{ if .Env.HOMEBREW_TAP_GITHUB_TOKEN }}false{{ else }}true{{ end }}'
+    # The macOS binaries are cosign-signed for supply-chain provenance, but NOT
+    # Apple-notarized, so Homebrew's default com.apple.quarantine attribute would
+    # make Gatekeeper kill the binary on first run (`kubectl-guard doctor` in the
+    # caveats would fail). Strip the quarantine xattr post-install so a brew-cask
+    # install is usable — GoReleaser's documented workaround for unsigned casks.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kubectl-guard"]
+          end
+    caveats: |
+      kubectl-guard protects by intercepting kubectl. After install, enable
+      interception (see the README "Installation" section): alias kubectl to
+      kubectl-guard, or install the PATH-shadowing shim, then verify with
+      `kubectl-guard doctor`.
+
+# Linux packages (#96): .deb / .rpm / .apk, built in-process by GoReleaser's
+# bundled nfpm (no external tooling). Installs the binary to /usr/bin.
+nfpms:
+  - id: linux-packages
+    package_name: kubectl-guard
+    homepage: 'https://github.com/lockhinator/kubectl-guard'
+    description: 'Protect production clusters and sensitive resources from accidental kubectl commands'
+    maintainer: 'Cameron Lockhart <cameronl.lockhart@gmail.com>'
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+
+# No `scoops:` (Windows/Scoop) channel: native Windows is a non-goal (#88); WSL2
+# users install the linux packages inside their distro.
+
 # release-please already generates the changelog; don't duplicate it.
 changelog:
   disable: true

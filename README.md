@@ -252,6 +252,48 @@ without hanging, while refusing to mutate a cluster it cannot vouch for.
 export KUBECTL_GUARD_BOOTSTRAP=empty
 ```
 
+## Verifying a release
+
+kubectl-guard installs as a PATH-shadowing `kubectl` shim that intercepts *every*
+kubectl call, so a tampered release would be a total, silent bypass. Every
+release is therefore **cosign-signed** and carries **SLSA build provenance** and
+an **SBOM**. Verify a download before installing it — checksums alone prove
+integrity against the release page, not authenticity.
+
+Each GitHub Release includes the archives, `checksums.txt`, its cosign Sigstore
+bundle (`checksums.txt.sigstore.json` — signature + signing certificate + Rekor
+transparency-log entry), and an SPDX-JSON SBOM per archive (`*.sbom.json`).
+
+**1. Verify the cosign signature** of the checksums file (keyless — the signer is
+this repo's release workflow, no key to trust). Needs cosign v2.6+ or v3:
+
+```bash
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/lockhinator/kubectl-guard/\.github/workflows/release\.yml@.+$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  checksums.txt
+# → Verified OK
+```
+
+**2. Verify the archive against the (now-trusted) checksums:**
+
+```bash
+sha256sum --ignore-missing -c checksums.txt
+# → kubectl-guard_<version>_linux_amd64.tar.gz: OK
+```
+
+**3. Verify SLSA build provenance** — proves the artifact was built by this repo's
+workflow (needs the [GitHub CLI](https://cli.github.com/)):
+
+```bash
+gh attestation verify kubectl-guard_<version>_linux_amd64.tar.gz \
+  --repo lockhinator/kubectl-guard
+# → Verification succeeded!
+```
+
+Only install an artifact once all three checks pass.
+
 ## Using kubectl-guard with AI agents
 
 The agent-safe setup is two commands:

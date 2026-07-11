@@ -46,7 +46,9 @@ jobs:
     if: ${{ needs.release-please.outputs.releases_created == 'true' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # attach archives/signatures/SBOMs to the release
+      id-token: write # keyless cosign signing + provenance attestation (OIDC)
+      attestations: write # publish the SLSA build-provenance attestation
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,6 +60,14 @@ jobs:
         with:
           go-version: '1.24'
 
+      # cosign signs the checksums file (keyless, via the ambient OIDC token).
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # syft generates the per-archive SBOMs that GoReleaser attaches.
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -65,3 +75,14 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # SLSA build provenance for the release archives + checksums. Publishes a
+      # signed attestation to the GitHub attestations store, verifiable with
+      # `gh attestation verify <file> --repo lockhinator/kubectl-guard`. This is
+      # authenticity/provenance on top of cosign's signature (#77).
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt

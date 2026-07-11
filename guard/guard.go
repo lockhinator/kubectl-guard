@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/lockhinator/kubectl-guard/config"
 )
@@ -667,7 +666,12 @@ func ExecKubectl(args []string) error {
 	// Prepend "kubectl" to args for proper argv[0]
 	fullArgs := append([]string{"kubectl"}, args...)
 
-	return syscall.Exec(kubectl, fullArgs, os.Environ())
+	// execReplace is platform-specific: on unix it is syscall.Exec (process
+	// replacement, preserving kubectl's exit code); on native Windows — an
+	// explicit non-goal (see README "Platform support") — it returns an error
+	// (Windows has no execve). The binary short-circuits with a WSL2 message on
+	// GOOS=windows before reaching here, so the Windows stub is a belt-and-braces.
+	return execReplace(kubectl, fullArgs, os.Environ())
 }
 
 // RunKubectl runs the REAL kubectl and returns its output. It uses

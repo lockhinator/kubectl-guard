@@ -18,6 +18,12 @@ builds:
       - -s -w -X main.version={{.Version}}
     env:
       - CGO_ENABLED=0
+    # No windows target: native Windows is an explicit non-goal for v1.0 (issue
+    # #88). The interception/exec/lock model is unix-only; Windows users run the
+    # guard under WSL2 (a Linux distro), so the linux archives cover them. The
+    # binary still compiles for GOOS=windows and prints a WSL2 message, but we do
+    # not ship a Windows artifact. Re-adding a windows target needs the exec/lock/
+    # shim port first (see the README "Platform support" section).
     targets:
       - linux_amd64
       - linux_arm64

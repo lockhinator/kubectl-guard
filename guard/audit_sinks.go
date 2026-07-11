@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"log/syslog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -64,14 +62,6 @@ func shipWebhook(url string, body []byte) {
 	_ = resp.Body.Close()
 }
 
-// shipSyslog writes the audit line to the local syslog at LOG_INFO under
-// facility LOG_USER, tagged "kubectl-guard". A fresh connection per entry is fine
-// for a short-lived CLI process; any error (no syslog socket) is swallowed.
-func shipSyslog(body []byte) {
-	w, err := syslog.New(syslog.LOG_INFO|syslog.LOG_USER, "kubectl-guard")
-	if err != nil {
-		return
-	}
-	defer func() { _ = w.Close() }()
-	_ = w.Info(strings.TrimRight(string(body), "\n"))
-}
+// shipSyslog writes the audit line to the local syslog. It is platform-specific
+// (syslog_unix.go / syslog_windows.go): a real LOG_INFO/LOG_USER write on unix, a
+// no-op on native Windows (a non-goal — see the README "Platform support").

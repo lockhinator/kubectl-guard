@@ -75,3 +75,26 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+
+  # Validate the GoReleaser config (including the cosign `signs:` and syft
+  # `sboms:` blocks from #77) on every PR, so a release-pipeline typo is caught
+  # before a tag is cut rather than at release time. `check` validates the config
+  # schema only; it does not run cosign/syft or build anything.
+  goreleaser-check:
+    name: GoReleaser Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Validate GoReleaser config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: check

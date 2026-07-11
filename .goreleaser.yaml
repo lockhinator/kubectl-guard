@@ -41,6 +41,36 @@ archives:
 checksum:
   name_template: 'checksums.txt'
 
+# Keyless cosign signing (#77). Sign the checksums file (which itself covers
+# every archive's SHA-256), so a verifier checks ONE signature, then validates
+# each archive against the signed checksums. Keyless = no private key to manage:
+# in CI, cosign uses the workflow's ambient OIDC token (the release job grants
+# id-token: write), and the signer identity is the GitHub Actions workflow.
+#
+# cosign v3 (the cosign-installer@v3 default) removed --output-signature/
+# --output-certificate in favor of a single Sigstore BUNDLE, so we emit
+# checksums.txt.sigstore.json (signature + signing certificate + Rekor entry in
+# one file) and publish it as a release asset. `--yes` skips the CI confirmation.
+# Verify with: cosign verify-blob --bundle checksums.txt.sigstore.json ...
+# (see the README "Verifying a release" section).
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: '${artifact}.sigstore.json'
+    args:
+      - sign-blob
+      - '--bundle=${signature}'
+      - '${artifact}'
+      - '--yes'
+    output: true
+
+# SBOM (#77): an SPDX-JSON SBOM per archive via syft (GoReleaser's default
+# format), attached to the release so consumers can audit the build's dependency
+# tree. Requires syft on PATH (the release job installs it).
+sboms:
+  - id: archive-sbom
+    artifacts: archive
+
 # release-please already generates the changelog; don't duplicate it.
 changelog:
   disable: true

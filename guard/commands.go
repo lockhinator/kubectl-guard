@@ -842,6 +842,46 @@ func StripNoPrompt(args []string) (filtered []string, noPrompt bool) {
 // audited auto-confirm was requested. Like --json/--no-prompt, it belongs to
 // the guard and must never be forwarded to kubectl. Recognized as "--yes",
 // "--yes=true", or "--yes=false", and only before the "--" separator.
+// StripReason removes the guard-only --reason flag (a free-text justification for
+// a gated command) and returns the value. It accepts "--reason=<text>" and
+// "--reason <text>" (two tokens), honored only before the "--" separator so a
+// reason after "--" stays a kubectl arg. has is true whenever --reason appeared,
+// even with an empty value, so the caller can distinguish "no --reason" from
+// "--reason with empty text".
+func StripReason(args []string) (filtered []string, reason string, has bool) {
+	seenSep := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			seenSep = true
+			filtered = append(filtered, a)
+			continue
+		}
+		if !seenSep {
+			if a == "--reason" {
+				has = true
+				// Consume the next token as the value only if it looks like one — not
+				// the "--" separator and not another flag. This avoids eating a
+				// command verb or the separator when the value was forgotten
+				// (`--reason delete ...`, `--reason -- ...`); use --reason=<why> for a
+				// value that must start with "-".
+				if i+1 < len(args) && args[i+1] != "--" && !strings.HasPrefix(args[i+1], "-") {
+					reason = args[i+1]
+					i++ // consume the value token
+				}
+				continue
+			}
+			if strings.HasPrefix(a, "--reason=") {
+				reason = strings.TrimPrefix(a, "--reason=")
+				has = true
+				continue
+			}
+		}
+		filtered = append(filtered, a)
+	}
+	return filtered, reason, has
+}
+
 func StripYes(args []string) (filtered []string, yes bool) {
 	seenSep := false
 	for _, a := range args {

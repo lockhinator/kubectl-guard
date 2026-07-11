@@ -49,6 +49,10 @@ type AuditEntry struct {
 	Command     string `json:"command"`
 	Outcome     string `json:"outcome"` // allowed | confirmed | aborted | blocked | denied
 	Reason      string `json:"reason,omitempty"`
+	// Justification is the free-text reason a human/agent supplied to approve a
+	// gated command, when require_justification is on (or --reason is given). It
+	// records WHY a gated command was approved, for compliance review.
+	Justification string `json:"justification,omitempty"`
 }
 
 // AppendAudit appends entry as a JSON line to the configured audit log,

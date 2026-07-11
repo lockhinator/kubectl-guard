@@ -212,6 +212,48 @@ func orUnknown(s string) string {
 	return s
 }
 
+// runAuditVerify checks the tamper-evident audit chain and reports whether it is
+// intact or names the first broken line. Exits non-zero on a broken chain so CI /
+// monitoring can gate on it.
+func runAuditVerify(cfg *config.Config, path string) error {
+	// The HMAC key file is the root of trust for tamper-evidence: if any other
+	// user can read it they can forge valid entries. Warn on loose permissions.
+	if cfg != nil && cfg.AuditHMACKeyFile != "" {
+		if info, err := os.Stat(cfg.AuditHMACKeyFile); err == nil && info.Mode().Perm()&0o077 != 0 {
+			ui.PrintWarning(fmt.Sprintf("HMAC key file %s is group/world-accessible (mode %#o); the tamper-evidence guarantee depends on it being secret — chmod 600 it.", cfg.AuditHMACKeyFile, uint32(info.Mode().Perm())))
+		}
+	}
+	res, err := guard.VerifyAuditLog(path, guard.AuditKey(cfg))
+	if err != nil {
+		if os.IsNotExist(err) {
+			ui.PrintInfo("No audit log to verify.")
+			return nil
+		}
+		return err
+	}
+	ui.PrintInfo("Audit log: " + path)
+	ui.PrintInfo(fmt.Sprintf("Entries: %d (%d chained, %d legacy/unchained)", res.Total, res.Chained, res.Legacy))
+	if !res.Intact {
+		ui.PrintWarning(fmt.Sprintf("Audit chain BROKEN at line %d: %s", res.BreakLine, res.BreakReason))
+		os.Exit(1)
+	}
+	if res.Chained == 0 {
+		if res.Legacy > 0 {
+			// Every append since v1.0 writes a hash, so a log with only unchained
+			// lines is either genuinely pre-v1.0 OR had every hash stripped to erase
+			// history — indistinguishable from the file alone. Fail closed: integrity
+			// cannot be confirmed. (Tail truncation of a chained log is separately
+			// undetectable without an off-box tip anchor — see the shipping sinks.)
+			ui.PrintWarning("Log has only UNCHAINED entries and no tamper-evident ones: either it predates v1.0 or every hash was stripped to erase history — integrity CANNOT be confirmed. Run any kubectl-guard command to start the chain, then re-verify.")
+			os.Exit(1)
+		}
+		ui.PrintInfo("Audit log is empty; nothing to verify.")
+		return nil
+	}
+	ui.PrintSuccess("Audit chain is INTACT.")
+	return nil
+}
+
 // runFreeze toggles global read-only / freeze mode (the incident panic button).
 // Enabling it strengthens protection; disabling it (unfreeze) weakens protection,
 // so the change routes through saveConfig — audited, and gated by
@@ -1512,8 +1554,9 @@ func newConfigCommand() *cobra.Command {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
-		Use:   "audit",
-		Short: "Show the audit log path and recent entries",
+		Use:   "audit [verify]",
+		Short: "Show the audit log, or verify its tamper-evident chain",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadOrCreateConfig()
 			if err != nil {
@@ -1522,6 +1565,12 @@ func newConfigCommand() *cobra.Command {
 			path, err := config.AuditPath(cfg)
 			if err != nil {
 				return err
+			}
+			if len(args) == 1 && args[0] == "verify" {
+				return runAuditVerify(cfg, path)
+			}
+			if len(args) == 1 {
+				return fmt.Errorf("unknown audit subcommand %q (want 'verify')", args[0])
 			}
 			ui.PrintInfo("Audit log: " + path)
 			data, err := os.ReadFile(path)

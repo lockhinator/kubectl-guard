@@ -71,6 +71,9 @@ func WeakensProtection(old, new *Config) []string {
 	if old.AuditSyslog && !new.AuditSyslog {
 		w = append(w, "disabled audit_syslog shipping")
 	}
+	if old.AuditHMACKeyFile != "" && new.AuditHMACKeyFile == "" {
+		w = append(w, "removed audit_hmac_key_file (audit chain no longer forgery-resistant)")
+	}
 	// A configured webhook that is CLEARED or REDIRECTED (to a different, possibly
 	// dead/attacker endpoint) defeats audit shipping — a redirect is stealthier
 	// than clearing (a URL still appears set), so any change away from the current

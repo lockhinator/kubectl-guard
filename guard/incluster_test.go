@@ -73,7 +73,7 @@ func TestInClusterSpoofedEnvVarDoesNotDowngrade(t *testing.T) {
 
 	// Use the REAL defaultInCluster (not the seam), so the spoofed env var is
 	// evaluated as production would.
-	res, _, _, _ := checkWithResolvers([]string{"delete", "pod", "x"}, unresolvableContext, noContextNamespace, noShortNames, defaultInCluster)
+	res, _, _, _ := checkWithResolvers([]string{"delete", "pod", "x"}, unresolvableContext, noContextNamespace, noShortNames, defaultInCluster, noServerForContext)
 	if res != Deny {
 		t.Errorf("spoofed KUBERNETES_SERVICE_HOST (no SA file) = %v, want Deny (must not enter in-cluster mode)", res)
 	}
@@ -96,7 +96,7 @@ func inClusterAs(ns string) InClusterFunc {
 // given in-cluster resolver (which carries the serviceaccount namespace).
 func checkInCluster(t *testing.T, args []string, inCluster InClusterFunc) Result {
 	t.Helper()
-	res, _, _, _ := checkWithResolvers(args, unresolvableContext, noContextNamespace, noShortNames, inCluster)
+	res, _, _, _ := checkWithResolvers(args, unresolvableContext, noContextNamespace, noShortNames, inCluster, noServerForContext)
 	return res
 }
 
@@ -210,7 +210,7 @@ func TestInClusterResolvableContextUnaffected(t *testing.T) {
 	defer cleanup()
 
 	// staticContext resolves "prod-1" (protected) -> gate, regardless of in-cluster.
-	res, _, _, _ := checkWithResolvers([]string{"delete", "pod", "x"}, staticContext("prod-1"), noContextNamespace, noShortNames, inClusterAs("kube-system"))
+	res, _, _, _ := checkWithResolvers([]string{"delete", "pod", "x"}, staticContext("prod-1"), noContextNamespace, noShortNames, inClusterAs("kube-system"), noServerForContext)
 	if res != RequireConfirmation {
 		t.Errorf("resolvable protected context in-cluster = %v, want RequireConfirmation", res)
 	}
@@ -243,17 +243,17 @@ func TestClusterOverrideRefused(t *testing.T) {
 	defer cleanup()
 
 	// Resolvable but unprotected context + --cluster retarget: must Deny.
-	res, _, _, _ := checkWithResolvers([]string{"--cluster=prod-cluster", "delete", "pod", "x"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster)
+	res, _, _, _ := checkWithResolvers([]string{"--cluster=prod-cluster", "delete", "pod", "x"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster, noServerForContext)
 	if res != Deny {
 		t.Errorf("--cluster on an unprotected context = %v, want Deny", res)
 	}
 	// Separate-value form.
-	res, _, _, _ = checkWithResolvers([]string{"--cluster", "prod-cluster", "delete", "pod", "x"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster)
+	res, _, _, _ = checkWithResolvers([]string{"--cluster", "prod-cluster", "delete", "pod", "x"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster, noServerForContext)
 	if res != Deny {
 		t.Errorf("--cluster (separate value) = %v, want Deny", res)
 	}
 	// Without --cluster on the same unprotected context, it still passes.
-	res, _, _, _ = checkWithResolvers([]string{"delete", "pod", "x"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster)
+	res, _, _, _ = checkWithResolvers([]string{"delete", "pod", "x"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster, noServerForContext)
 	if res != Allow {
 		t.Errorf("no --cluster on unprotected context = %v, want Allow", res)
 	}
@@ -264,7 +264,7 @@ func TestClusterOverrideRefused(t *testing.T) {
 func TestClusterOverrideNotDeniedWithoutProtectedContexts(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{ProtectedResources: []string{"secret"}})
 	defer cleanup()
-	res, _, _, _ := checkWithResolvers([]string{"--cluster=x", "get", "pods"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster)
+	res, _, _, _ := checkWithResolvers([]string{"--cluster=x", "get", "pods"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster, noServerForContext)
 	if res != Allow {
 		t.Errorf("--cluster with no protected contexts = %v, want Allow", res)
 	}

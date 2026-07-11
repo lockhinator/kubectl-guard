@@ -36,6 +36,8 @@ var guardConfigSubcommands = map[string]bool{
 	"remove":                true,
 	"add-context":           true,
 	"remove-context":        true,
+	"add-cluster":           true,
+	"remove-cluster":        true,
 	"add-resource":          true,
 	"remove-resource":       true,
 	"add-namespace":         true,
@@ -312,6 +314,13 @@ func doctorPosture(cfg *config.Config) map[string]string {
 			parts = append(parts, formatPattern(pp))
 		}
 		p["protected_namespaces"] = strings.Join(parts, ", ")
+	}
+	if len(cfg.ProtectedClusters) > 0 {
+		var parts []string
+		for _, pc := range cfg.ProtectedClusters {
+			parts = append(parts, formatClusterKey(pc))
+		}
+		p["protected_clusters"] = strings.Join(parts, ", ")
 	}
 	if len(cfg.ProtectedResources) > 0 {
 		p["protected_resources"] = strings.Join(cfg.ProtectedResources, ", ")
@@ -1093,6 +1102,7 @@ func runGuard(args []string) error {
 		// refusal (context_mode/namespace_mode: block). Determine which so the
 		// message and audit reason are accurate.
 		blockReason := "protected-resource"
+		clusterServer := "" // set below when a protected-cluster match drove the block
 		if !guard.MatchesProtectedResource(cfg, forwarded) {
 			// Use the actor-effective modes, so an actor-policy upgrade (confirm →
 			// block for a known agent) is labeled as a context/namespace block, the
@@ -1101,6 +1111,10 @@ func runGuard(args []string) error {
 			if cfg != nil {
 				ctxMode, _ = guard.EffectiveTargetModes(cfg, forwarded, ctx)
 			}
+			// Resolve cluster-identity protection once for labeling (best-effort; no
+			// kubeconfig read unless protected_clusters is configured).
+			srv, clusterHit := guard.ClusterProtected(cfg, forwarded, ctx)
+			clusterServer = srv
 			switch {
 			case cfg != nil && cfg.ReadOnlyActive() && !guard.IsSafeCommandWith(cfg, forwarded):
 				// Global read-only/freeze is checked before context gating in the
@@ -1116,6 +1130,10 @@ func runGuard(args []string) error {
 				blockReason = "blast-radius-block"
 			case guard.IsSensitiveKindActive(cfg, forwarded) && cfg != nil && cfg.SensitiveKindMode() == config.SensitiveKindBlock:
 				blockReason = "sensitive-kind-block"
+			case clusterHit && cfg != nil && cfg.EffectiveClusterMode(clusterServer) == config.ContextModeBlock:
+				// The context NAME is unprotected but the resolved API server matches
+				// protected_clusters in block mode (#85).
+				blockReason = "protected-cluster-block-mode"
 			default:
 				blockReason = "protected-namespace-block-mode"
 			}
@@ -1153,6 +1171,8 @@ func runGuard(args []string) error {
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s — %s (blast_radius: block; refused on every context)", cmdDesc, scope))
 			case "sensitive-kind-block":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s mutates a sensitive kind (sensitive_kind_mode: block; refused on every context). Reads of the kind still pass.", cmdDesc))
+			case "protected-cluster-block-mode":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected cluster %q (block mode: no confirmation offered)", cmdDesc, clusterServer))
 			default: // protected-namespace-block-mode
 				// Prefer the namespace OBJECT the command targets by name
 				// (`delete namespace kube-system`) over the namespace it would
@@ -1215,6 +1235,7 @@ func runGuard(args []string) error {
 		reason := "protected context"
 		target := ctx
 		wide, blastReason := guard.BlastRadius(forwarded)
+		clusterServer, clusterHit := guard.ClusterProtected(cfg, forwarded, ctx)
 		switch nameTarget, byName := guard.ProtectedNamespaceNameTarget(cfg, forwarded); {
 		case guard.IsSensitiveAccess(cfg, forwarded) && !cfg.IsContextProtected(ctx) && !byName:
 			// Gated purely because it is a sensitive-access verb on an otherwise
@@ -1236,6 +1257,10 @@ func runGuard(args []string) error {
 			reason, target = "protected namespace", parsed.Namespace
 		case cfg != nil && cfg.IsContextProtected(ctx):
 			reason, target = "protected context", ctx
+		case clusterHit:
+			// The context NAME is unprotected but the resolved API server matches
+			// protected_clusters (#85) — name the cluster, not a "protected context".
+			reason, target = "protected cluster", clusterServer
 		case wide && cfg != nil && cfg.BlastRadiusMode() != config.BlastRadiusOff:
 			// Gated as a wide-scope / bulk mutation with no protected context or
 			// namespace in play — name the scope so the human sees WHY.
@@ -1529,6 +1554,9 @@ func newConfigCommand() *cobra.Command {
 			if len(cfg.ProtectedNamespaces) > 0 {
 				ui.PrintInfo("Protected namespaces: " + strings.Join(cfg.ProtectedNamespacePatterns(), ", "))
 			}
+			if len(cfg.ProtectedClusters) > 0 {
+				ui.PrintInfo("Protected clusters: " + strings.Join(cfg.ProtectedClusterKeys(), ", "))
+			}
 			ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 			return nil
 		},
@@ -1613,6 +1641,9 @@ func newConfigCommand() *cobra.Command {
 	completeRemoveNamespace := firstArgComplete(func() []string {
 		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedNamespacePatterns() })
 	})
+	completeRemoveCluster := firstArgComplete(func() []string {
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedClusterKeys() })
+	})
 
 	rootCmd.AddCommand(newAddProtectedCmd("add-context <pattern>", "Add a context/pattern to the protected list (optional --mode)", "Added context: %s", "Context already protected: %s", false, (*config.Config).AddContext, (*config.Config).AddContextWithMode, completeAddContext))
 	rootCmd.AddCommand(newAddProtectedCmd("add <pattern>", "Alias for add-context", "Added context: %s", "Context already protected: %s", true, (*config.Config).AddContext, (*config.Config).AddContextWithMode, completeAddContext))
@@ -1622,6 +1653,51 @@ func newConfigCommand() *cobra.Command {
 	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false, completeRemoveResource)
 	rootCmd.AddCommand(newAddProtectedCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*; optional --mode)", "Protected namespace: %s", "Namespace already protected: %s", false, (*config.Config).AddNamespace, (*config.Config).AddNamespaceWithMode, nil))
 	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false, completeRemoveNamespace)
+
+	// add-cluster protects by CLUSTER identity (the API server URL / a host glob),
+	// not the spoofable context name. It cannot reuse newAddProtectedCmd because
+	// AddProtectedCluster returns (changed, error): an invalid mode or empty value
+	// must surface to the user rather than be conflated with a no-op. The value is
+	// auto-detected as an exact server or a pattern (a glob metachar makes it a
+	// pattern), and a --mode confirm|block (- to inherit) sets the per-entry mode.
+	var clusterModeRaw string
+	addClusterCmd := &cobra.Command{
+		Use:   "add-cluster <server-or-pattern>",
+		Short: "Protect by cluster identity: an API server URL or host glob (optional --mode)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, a []string) error {
+			value := a[0]
+			mode := normalizeInheritMode(clusterModeRaw)
+			if c.Flags().Changed("mode") && mode != "" && !isValidProtectionMode(mode) {
+				return fmt.Errorf("invalid --mode %q (want %q, %q, or %q to inherit the global mode)",
+					clusterModeRaw, config.ContextModeConfirm, config.ContextModeBlock, "-")
+			}
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			// AddProtectedCluster returns (changed, error): an invalid mode or empty
+			// value surfaces to the user rather than being conflated with a no-op.
+			changed, err := cfg.AddProtectedCluster(value, mode)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				ui.PrintInfo("Cluster already protected: " + value)
+				return nil
+			}
+			// Route through saveConfig so a mode downgrade (block → confirm/inherit)
+			// on an existing entry is gated/audited as the weakening it is.
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Protected cluster: " + value)
+			return nil
+		},
+	}
+	addClusterCmd.Flags().StringVar(&clusterModeRaw, "mode", "", "per-entry protection mode: confirm | block | - (inherit the global context_mode)")
+	rootCmd.AddCommand(addClusterCmd)
+	addCmd("remove-cluster <value>", "Remove a protected cluster (server URL, pattern, or its list key)", (*config.Config).RemoveProtectedCluster, "Removed protected cluster: %s", "Cluster not in protected list: %s", false, completeRemoveCluster)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "confirm-mode [simple|type-name|agent-relay]",
@@ -2397,6 +2473,15 @@ func printConfig() error {
 		}
 	}
 
+	ui.PrintInfo("Protected clusters (by API server identity):")
+	if len(cfg.ProtectedClusters) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		for _, pc := range cfg.ProtectedClusters {
+			fmt.Printf("  - %s\n", formatClusterKey(pc))
+		}
+	}
+
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
 	if cfg.HasSensitiveKinds() {
@@ -2512,6 +2597,21 @@ func formatPattern(pp config.ProtectedPattern) string {
 	return fmt.Sprintf("%s (%s)", pp.Pattern, mode)
 }
 
+// formatClusterKey renders a protected cluster with its mode for `config list` /
+// doctor, mirroring formatPattern: "server=https://prod (block)" or
+// "server_pattern=*.prod.example.com (inherit)".
+func formatClusterKey(pc config.ProtectedCluster) string {
+	key := "server=" + pc.Server
+	if pc.ServerPattern != "" {
+		key = "server_pattern=" + pc.ServerPattern
+	}
+	mode := pc.Mode
+	if mode == "" {
+		mode = "inherit"
+	}
+	return fmt.Sprintf("%s (%s)", key, mode)
+}
+
 // printCommandOverrides lists the configured command classification overrides.
 func printCommandOverrides(cfg *config.Config) {
 	ui.PrintInfo("Command overrides:")
@@ -2586,6 +2686,10 @@ Usage:
 Protection model:
   - Protected CONTEXTS: state-altering commands require confirmation (or are
     hard-blocked in context_mode: block).
+  - Protected CLUSTERS: same gating, but keyed on the API server URL (cluster
+    identity) rather than the spoofable context name, so an aliased/renamed
+    context or a crafted --kubeconfig still gates. Strictly additive to context
+    protection.
   - Protected NAMESPACES: state-altering commands are gated when the target
     namespace (--namespace/-n, the context's namespace, or "default", and any
     namespace under --all-namespaces/-A) matches (or blocked in
@@ -2623,6 +2727,11 @@ Config subcommands:
   remove-resource <name>     Stop blocking a resource
   add-namespace <pattern>    Gate state changes in matching namespaces (glob)
   remove-namespace <pattern> Stop protecting matching namespaces
+  add-cluster <server|glob>  Protect by CLUSTER identity (the API server URL, or
+                             a host glob like '*.prod.example.com'), so an aliased
+                             or renamed context cannot dodge protection (optional
+                             --mode confirm|block)
+  remove-cluster <value>     Stop protecting a cluster (server URL, pattern, or key)
   confirm-mode [simple|type-name|agent-relay]
                              Show or set the confirmation prompt style
                              (type-name requires typing the context/namespace name;

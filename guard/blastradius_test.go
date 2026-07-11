@@ -167,7 +167,7 @@ func TestBlastRadiusNotBypassedByInClusterAllow(t *testing.T) {
 	})
 	defer cleanup()
 	res, _, _, _ := checkWithResolvers([]string{"delete", "pods", "--all"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != Blocked {
 		t.Errorf("delete --all in-cluster, in_cluster=allow, blast=block = %v, want Blocked", res)
 	}
@@ -180,7 +180,7 @@ func TestBlastRadiusNotBypassedByInClusterAllow(t *testing.T) {
 	})
 	defer cleanup2()
 	res, _, _, _ = checkWithResolvers([]string{"apply", "--prune", "-f", "m.yaml"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != RequireConfirmation {
 		t.Errorf("apply --prune in-cluster, in_cluster=allow, blast=gate = %v, want RequireConfirmation", res)
 	}
@@ -193,7 +193,7 @@ func TestBlastRadiusNotBypassedByInClusterAllow(t *testing.T) {
 	})
 	defer cleanup3()
 	res, _, _, _ = checkWithResolvers([]string{"delete", "pod", "x"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != Allow {
 		t.Errorf("single-object delete in-cluster, in_cluster=allow = %v, want Allow (blanket pass unaffected)", res)
 	}

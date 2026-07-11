@@ -3,6 +3,17 @@
 **Status:** decided · **Issue:** #76 · **Milestone:** v0.6.0 · **Scope of the
 decision:** through v1.0
 
+> **Update (v1.0, #108):** the narrow, opt-in door this note deliberately left
+> open (see "What would change our mind") has been implemented as
+> `redact_output: structured` (default `off`). It applies ONLY to the one
+> argv-decidable shape this note endorsed — a non-interactive `kubectl get -o
+> json|yaml` — blanking known secret fields (`Secret.data`/`stringData`, container
+> `env[].value` in Pods and workload pod templates). Everything else, including
+> every mutation and interactive verb, still hands off via `syscall.Exec`
+> untouched. It is defense-in-depth against *accidental* disclosure, **not** a
+> containment boundary. The blocking-only stance below remains the default and the
+> product's core model; redaction is an explicit opt-in on top of it.
+
 kubectl-guard is a **blocking-only** tool. It decides, from the command line it
 is given, whether a command may run — and then gets out of the way. It does not
 read, filter, or redact kubectl's output.

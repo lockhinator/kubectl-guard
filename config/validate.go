@@ -72,6 +72,11 @@ func (c *Config) Validate() []string {
 			"unknown_verb: %q is not valid (want %q, %q, or %q)",
 			c.UnknownVerb, UnknownVerbAllow, UnknownVerbGate, UnknownVerbDeny))
 	}
+	if c.RedactOutput != "" && !validRedactOutputMode(c.RedactOutput) {
+		problems = append(problems, fmt.Sprintf(
+			"redact_output: %q is not valid (want %q or %q)",
+			c.RedactOutput, RedactOutputOff, RedactOutputStructured))
+	}
 	if c.AuditMaxSizeMB < 0 {
 		problems = append(problems, fmt.Sprintf("audit_max_size_mb: %d is negative (use 0 to disable rotation)", c.AuditMaxSizeMB))
 	}
@@ -245,6 +250,14 @@ func validSensitiveKindMode(m string) bool {
 func validUnknownVerbMode(m string) bool {
 	switch m {
 	case UnknownVerbAllow, UnknownVerbGate, UnknownVerbDeny:
+		return true
+	}
+	return false
+}
+
+func validRedactOutputMode(m string) bool {
+	switch m {
+	case RedactOutputOff, RedactOutputStructured:
 		return true
 	}
 	return false

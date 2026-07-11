@@ -111,13 +111,31 @@ func (c *Config) Validate() []string {
 	}
 
 	for _, p := range c.ProtectedContexts {
-		if err := validateGlobPattern(p); err != nil {
-			problems = append(problems, fmt.Sprintf("protected_contexts: pattern %q %v", p, err))
+		if p.Pattern == "" {
+			// An empty pattern matches nothing, so it protects nothing — but a
+			// misspelled key (`patern:`) or a `{mode: block}` with no pattern decodes
+			// to this and would otherwise pass validation, silently dropping the
+			// intended protection. Fail closed.
+			problems = append(problems, "protected_contexts: an entry has an empty pattern (a missing or misspelled `pattern:` key protects nothing)")
+		} else if err := validateGlobPattern(p.Pattern); err != nil {
+			problems = append(problems, fmt.Sprintf("protected_contexts: pattern %q %v", p.Pattern, err))
+		}
+		if p.Mode != "" && !validContextMode(p.Mode) {
+			problems = append(problems, fmt.Sprintf(
+				"protected_contexts: pattern %q has invalid mode %q (want %q or %q)",
+				p.Pattern, p.Mode, ContextModeConfirm, ContextModeBlock))
 		}
 	}
 	for _, p := range c.ProtectedNamespaces {
-		if err := validateGlobPattern(p); err != nil {
-			problems = append(problems, fmt.Sprintf("protected_namespaces: pattern %q %v", p, err))
+		if p.Pattern == "" {
+			problems = append(problems, "protected_namespaces: an entry has an empty pattern (a missing or misspelled `pattern:` key protects nothing)")
+		} else if err := validateGlobPattern(p.Pattern); err != nil {
+			problems = append(problems, fmt.Sprintf("protected_namespaces: pattern %q %v", p.Pattern, err))
+		}
+		if p.Mode != "" && !validNamespaceMode(p.Mode) {
+			problems = append(problems, fmt.Sprintf(
+				"protected_namespaces: pattern %q has invalid mode %q (want %q or %q)",
+				p.Pattern, p.Mode, NamespaceModeConfirm, NamespaceModeBlock))
 		}
 	}
 

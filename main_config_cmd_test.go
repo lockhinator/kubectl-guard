@@ -68,7 +68,7 @@ func TestConfigCommandsInProc(t *testing.T) {
 
 	// Protected-list mutations round-trip through disk.
 	mustRun(t, "add-context", "prod-*")
-	if got := loadCfg(t).ProtectedContexts; len(got) != 1 || got[0] != "prod-*" {
+	if got := loadCfg(t).ProtectedContexts; len(got) != 1 || got[0].Pattern != "prod-*" {
 		t.Fatalf("ProtectedContexts = %v, want [prod-*]", got)
 	}
 	mustRun(t, "add-resource", "secret")
@@ -76,7 +76,7 @@ func TestConfigCommandsInProc(t *testing.T) {
 		t.Fatalf("ProtectedResources = %v, want [secret]", got)
 	}
 	mustRun(t, "add-namespace", "kube-system")
-	if got := loadCfg(t).ProtectedNamespaces; len(got) != 1 || got[0] != "kube-system" {
+	if got := loadCfg(t).ProtectedNamespaces; len(got) != 1 || got[0].Pattern != "kube-system" {
 		t.Fatalf("ProtectedNamespaces = %v, want [kube-system]", got)
 	}
 

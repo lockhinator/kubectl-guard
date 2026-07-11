@@ -31,10 +31,12 @@ func WeakensProtection(old, new *Config) []string {
 	}
 	var w []string
 
-	// Removed protected targets — the headline weakening.
-	w = append(w, removedEach("removed protected context", old.ProtectedContexts, new.ProtectedContexts)...)
+	// Removed protected targets — the headline weakening. Contexts/namespaces are
+	// per-pattern, so a REMOVED pattern OR a DOWNGRADED per-pattern effective mode
+	// both count (see weakenedPatterns).
+	w = append(w, weakenedPatterns("context", old.ProtectedContexts, new.ProtectedContexts, old.effectiveContextMode(), new.effectiveContextMode())...)
+	w = append(w, weakenedPatterns("namespace", old.ProtectedNamespaces, new.ProtectedNamespaces, old.effectiveNamespaceMode(), new.effectiveNamespaceMode())...)
 	w = append(w, removedEach("removed protected resource", old.ProtectedResources, new.ProtectedResources)...)
-	w = append(w, removedEach("removed protected namespace", old.ProtectedNamespaces, new.ProtectedNamespaces)...)
 	w = append(w, removedEach("removed sensitive kind", old.SensitiveKinds, new.SensitiveKinds)...)
 
 	// Mode downgrades (a lower strength rank is weaker).
@@ -166,6 +168,48 @@ func removedEach2(old, new []string) []string {
 // addedEach returns the items present in new but not in old (exact match).
 func addedEach(old, new []string) []string {
 	return removedEach2(new, old)
+}
+
+// weakenedPatterns reports weakening of a per-pattern protected list (contexts or
+// namespaces): a pattern present in old but removed in new, or a pattern whose
+// PER-PATTERN EFFECTIVE mode dropped (block → confirm, or block → inherit when the
+// new global is confirm). Effective mode = the pattern's explicit mode, or the
+// respective global mode when it inherits.
+//
+// A pure inherit→inherit pair (both Mode=="") is skipped: any change there is a
+// change in the GLOBAL mode, already reported by the context_mode/namespace_mode
+// comparison, so counting it here too would double-report. Explicit→inherit and
+// explicit→explicit downgrades are still caught, since those are pattern-specific.
+func weakenedPatterns(kind string, old, new []ProtectedPattern, oldGlobal, newGlobal string) []string {
+	// confirm=1, block=2 for both axes (the ranks share values).
+	rank := contextModeRank
+	newByPattern := make(map[string]ProtectedPattern, len(new))
+	for _, p := range new {
+		newByPattern[p.Pattern] = p
+	}
+	var w []string
+	for _, o := range old {
+		n, ok := newByPattern[o.Pattern]
+		if !ok {
+			w = append(w, fmt.Sprintf("removed protected %s: %s", kind, o.Pattern))
+			continue
+		}
+		if o.Mode == "" && n.Mode == "" {
+			continue // pure inherit both sides — covered by the global comparison.
+		}
+		oldEff := o.Mode
+		if oldEff == "" {
+			oldEff = oldGlobal
+		}
+		newEff := n.Mode
+		if newEff == "" {
+			newEff = newGlobal
+		}
+		if rank[newEff] < rank[oldEff] {
+			w = append(w, fmt.Sprintf("downgraded protected %s %q mode from %q to %q", kind, o.Pattern, oldEff, newEff))
+		}
+	}
+	return w
 }
 
 // weakenedActorPolicies reports removed policies and per-actor mode downgrades.

@@ -146,7 +146,7 @@ func TestParseArgsSelector(t *testing.T) {
 // namespace resolved to "default" and the command sailed through — despite
 // kube-system being protected by name.
 func TestDeleteProtectedNamespaceByName(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 
 	for _, args := range [][]string{
@@ -171,7 +171,7 @@ func TestDeleteProtectedNamespaceByName(t *testing.T) {
 // TestDeleteNamespaceGlobByName: protected namespace patterns are globs, and
 // they apply to the namespace-name target too.
 func TestDeleteNamespaceGlobByName(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("prod-*")})
 	defer cleanup()
 
 	if res, _, _, _ := checkWith([]string{"delete", "ns/prod-app"}, staticContext("dev")); res != RequireConfirmation {
@@ -185,7 +185,7 @@ func TestDeleteNamespaceGlobByName(t *testing.T) {
 // TestUnprotectedNamespaceByNameNotGated: the gate must be a scalpel, not a
 // blanket. Deleting an UNprotected namespace on an unprotected context passes.
 func TestUnprotectedNamespaceByNameNotGated(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 
 	for _, args := range [][]string{
@@ -205,7 +205,7 @@ func TestUnprotectedNamespaceByNameNotGated(t *testing.T) {
 // state-altering verbs. Reads of a protected namespace object still pass —
 // blocking reads is what protected_resources is for.
 func TestReadOfProtectedNamespaceByNameNotGated(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 
 	for _, args := range [][]string{
@@ -224,7 +224,7 @@ func TestReadOfProtectedNamespaceByNameNotGated(t *testing.T) {
 // is `TYPE (NAME | -l label | --all)`, so the targets are genuinely unknowable
 // from argv — the guard must not prove a negative and let them through.
 func TestWideNamespaceKindFailsClosed(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 
 	for _, args := range [][]string{
@@ -249,7 +249,7 @@ func TestWideNamespaceKindFailsClosed(t *testing.T) {
 // to COMPOSE with the existing -n / -A / context resolution (any match gates),
 // not replace it.
 func TestNamespaceNameComposesWithFlagAndContext(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 
 	// -n still gates, on a non-namespace kind.
@@ -265,7 +265,7 @@ func TestNamespaceNameComposesWithFlagAndContext(t *testing.T) {
 		t.Errorf("namespace-name target must gate regardless of -n: %v", res)
 	}
 	// Context protection still gates independently.
-	cleanup2 := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup2 := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup2()
 	if res, _, _, _ := checkWith([]string{"delete", "namespace", "scratch"}, staticContext("prod-1")); res != RequireConfirmation {
 		t.Errorf("context gating regressed: %v", res)
@@ -276,7 +276,7 @@ func TestNamespaceNameComposesWithFlagAndContext(t *testing.T) {
 // namespace-name route is no exception.
 func TestNamespaceNameBlockMode(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		NamespaceMode:       config.NamespaceModeBlock,
 	})
 	defer cleanup()
@@ -291,7 +291,7 @@ func TestNamespaceNameBlockMode(t *testing.T) {
 // not be matched. (`exec` itself gates on protected contexts; here the context
 // is unprotected, so any gating would have to come from the payload token.)
 func TestNamespaceNamePayloadAfterSeparator(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 
 	// exec-family verbs: "--" is a foreign-command boundary; must NOT gate.
@@ -312,7 +312,7 @@ func TestNamespaceNamePayloadAfterSeparator(t *testing.T) {
 // `kubectl delete -- namespace kube-system` really deletes kube-system (verified
 // against kubectl v1.33). It must gate, exactly like the form without "--".
 func TestDeleteNamespaceAfterSeparatorGated(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 
 	for _, args := range [][]string{
@@ -333,7 +333,7 @@ func TestDeleteNamespaceAfterSeparatorGated(t *testing.T) {
 // namespace positionally, so like -l/--all the affected namespaces are
 // unknowable from argv. It must fail closed when namespace protection is set.
 func TestFieldSelectorNamespaceFailsClosed(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 
 	for _, args := range [][]string{
@@ -355,7 +355,7 @@ func TestFieldSelectorNamespaceFailsClosed(t *testing.T) {
 
 	// A field-selector on a NON-namespace command must not be dragged into the
 	// namespace path.
-	cleanup3 := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup3 := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup3()
 	if res, _, _, _ := checkWith([]string{"delete", "pod", "--field-selector", "status.phase=Failed"}, staticContext("dev")); res != Allow {
 		t.Errorf("field-selector on pods must not gate via the namespace path: %v", res)
@@ -366,7 +366,7 @@ func TestFieldSelectorNamespaceFailsClosed(t *testing.T) {
 // user-facing messages use, so `delete namespace kube-system` reports
 // "kube-system" and not the meaningless "default" it would otherwise resolve.
 func TestProtectedNamespaceNameTargetForMessaging(t *testing.T) {
-	cfg := &config.Config{ProtectedNamespaces: []string{"kube-system", "prod-*"}}
+	cfg := &config.Config{ProtectedNamespaces: config.Patterns("kube-system", "prod-*")}
 
 	if got, ok := ProtectedNamespaceNameTarget(cfg, []string{"delete", "namespace", "kube-system"}); !ok || got != "kube-system" {
 		t.Errorf("got (%q, %v), want (\"kube-system\", true)", got, ok)

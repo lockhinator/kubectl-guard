@@ -11,7 +11,7 @@ import (
 // the global mode (confirm).
 func TestActorPolicyBlocksMatchedActor(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeConfirm,
 		ActorPolicies: []config.ActorPolicy{
 			{Actor: "claude-code", ContextMode: config.ContextModeBlock},
@@ -39,7 +39,7 @@ func TestActorPolicyBlocksMatchedActor(t *testing.T) {
 // TestActorPolicyGlobMatch: a glob actor pattern (`ci-*`) matches.
 func TestActorPolicyGlobMatch(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ActorPolicies: []config.ActorPolicy{
 			{Actor: "ci-*", ContextMode: config.ContextModeBlock},
 		},
@@ -58,7 +58,7 @@ func TestActorPolicyGlobMatch(t *testing.T) {
 // TestActorPolicyNamespaceMode: an actor policy can upgrade namespace_mode too.
 func TestActorPolicyNamespaceMode(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		NamespaceMode:       config.NamespaceModeConfirm,
 		ActorPolicies: []config.ActorPolicy{
 			{Actor: "claude-code", NamespaceMode: config.NamespaceModeBlock},
@@ -80,7 +80,7 @@ func TestActorPolicyNamespaceMode(t *testing.T) {
 // actor must never relax protection below the global posture.
 func TestActorPolicyCannotWeaken(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeBlock,
 		ActorPolicies: []config.ActorPolicy{
 			{Actor: "human-*", ContextMode: config.ContextModeConfirm},
@@ -96,7 +96,7 @@ func TestActorPolicyCannotWeaken(t *testing.T) {
 // TestActorPolicyUnsetUnchanged: no actor policies -> unchanged global behavior.
 func TestActorPolicyUnsetUnchanged(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeConfirm,
 	})
 	defer cleanup()

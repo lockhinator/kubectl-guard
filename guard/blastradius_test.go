@@ -99,7 +99,7 @@ func TestBlastRadiusBlock(t *testing.T) {
 // TestBlastRadiusOffUnchanged: with the default (off), a wide mutation behaves as
 // before — gated only on a protected context, not on an unprotected one.
 func TestBlastRadiusOffUnchanged(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	if res, _, _, _ := checkWith([]string{"delete", "pods", "--all"}, staticContext("dev")); res != Allow {
 		t.Errorf("delete --all on unprotected context with blast_radius off = %v, want Allow", res)
@@ -133,7 +133,7 @@ func TestBlastRadiusNotGatedByDryRun(t *testing.T) {
 func TestBlastRadiusComposesMostRestrictive(t *testing.T) {
 	// blast gate + context block: context block wins (Blocked).
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeBlock,
 		BlastRadius:       config.BlastRadiusGate,
 	})
@@ -144,7 +144,7 @@ func TestBlastRadiusComposesMostRestrictive(t *testing.T) {
 
 	// blast block + unprotected context: blast block wins (Blocked).
 	cleanup2 := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		BlastRadius:       config.BlastRadiusBlock,
 	})
 	defer cleanup2()
@@ -161,7 +161,7 @@ func TestBlastRadiusComposesMostRestrictive(t *testing.T) {
 func TestBlastRadiusNotBypassedByInClusterAllow(t *testing.T) {
 	// block: delete --all in-cluster under in_cluster=allow must still be Blocked.
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"}, // so the in-cluster branch is entered
+		ProtectedContexts: config.Patterns("prod-*"), // so the in-cluster branch is entered
 		InCluster:         config.InClusterAllow,
 		BlastRadius:       config.BlastRadiusBlock,
 	})
@@ -174,7 +174,7 @@ func TestBlastRadiusNotBypassedByInClusterAllow(t *testing.T) {
 
 	// gate: same setup, gate mode -> RequireConfirmation, not Allow.
 	cleanup2 := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		InCluster:         config.InClusterAllow,
 		BlastRadius:       config.BlastRadiusGate,
 	})
@@ -187,7 +187,7 @@ func TestBlastRadiusNotBypassedByInClusterAllow(t *testing.T) {
 
 	// A NON-wide command still gets the in_cluster=allow blanket pass.
 	cleanup3 := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		InCluster:         config.InClusterAllow,
 		BlastRadius:       config.BlastRadiusBlock,
 	})

@@ -95,7 +95,7 @@ func explainBlocked(r *ExplainResult, cfg *config.Config, args []string, ctx str
 		}
 		return
 	}
-	ctxMode, nsMode := effectiveModes(cfg, ctx)
+	ctxMode, nsMode := EffectiveTargetModes(cfg, args, ctx)
 	switch {
 	case cfg != nil && cfg.IsContextProtected(ctx) && ctxMode == config.ContextModeBlock:
 		r.Rule, r.Reason = "protected-context-block-mode", fmt.Sprintf("protected context %q is in block mode", ctx)
@@ -152,16 +152,6 @@ func explainAllow(r *ExplainResult, cfg *config.Config, args []string, ctx strin
 	default:
 		r.Rule, r.Reason = "allow", "no protected context/namespace/resource applies"
 	}
-}
-
-// effectiveModes returns the actor-effective context and namespace modes used by
-// the block decision, defaulting safely when cfg is nil.
-func effectiveModes(cfg *config.Config, ctx string) (contextMode, namespaceMode string) {
-	_ = ctx
-	if cfg == nil {
-		return config.ContextModeConfirm, config.NamespaceModeConfirm
-	}
-	return cfg.EffectiveModesForActor(CurrentActor(cfg))
 }
 
 // JSONResult builds the structured decision object for the explain result,

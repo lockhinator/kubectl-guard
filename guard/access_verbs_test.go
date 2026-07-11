@@ -19,7 +19,7 @@ var accessVerbCommands = map[string][]string{
 func TestAccessVerbsRequireConfirmationOnProtectedContext(t *testing.T) {
 	for name, args := range accessVerbCommands {
 		t.Run(name, func(t *testing.T) {
-			cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+			cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 			defer cleanup()
 			res, _, _, _ := checkWith(args, staticContext("prod-cluster"))
 			if res != RequireConfirmation {
@@ -35,7 +35,7 @@ func TestAccessVerbsBlockedInBlockMode(t *testing.T) {
 	for name, args := range accessVerbCommands {
 		t.Run(name, func(t *testing.T) {
 			cleanup := withTempHome(t, &config.Config{
-				ProtectedContexts: []string{"prod-*"},
+				ProtectedContexts: config.Patterns("prod-*"),
 				ContextMode:       config.ContextModeBlock,
 			})
 			defer cleanup()
@@ -52,7 +52,7 @@ func TestAccessVerbsBlockedInBlockMode(t *testing.T) {
 func TestAccessVerbsGatedOnProtectedNamespace(t *testing.T) {
 	for name, base := range accessVerbCommands {
 		t.Run(name, func(t *testing.T) {
-			cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"prod"}})
+			cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("prod")})
 			defer cleanup()
 			args := append([]string{"-n", "prod"}, base...)
 			res, _, _, _ := checkWith(args, staticContext("dev-cluster"))
@@ -68,7 +68,7 @@ func TestAccessVerbsGatedOnProtectedNamespace(t *testing.T) {
 func TestAccessVerbsPassOnUnprotectedContext(t *testing.T) {
 	for name, args := range accessVerbCommands {
 		t.Run(name, func(t *testing.T) {
-			cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+			cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 			defer cleanup()
 			res, _, _, _ := checkWith(args, staticContext("dev-cluster"))
 			if res != Allow {
@@ -84,7 +84,7 @@ func TestAccessVerbsPassOnUnprotectedContext(t *testing.T) {
 func TestAccessVerbsDryRunCannotSkipGating(t *testing.T) {
 	for name, base := range accessVerbCommands {
 		t.Run(name, func(t *testing.T) {
-			cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+			cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 			defer cleanup()
 			args := append([]string{"--dry-run=client"}, base...)
 			res, _, _, _ := checkWith(args, staticContext("prod-cluster"))
@@ -137,7 +137,7 @@ func TestSupportsDryRun(t *testing.T) {
 // TestEditDryRunCannotSkipGating: `kubectl edit` has no --dry-run, so a
 // --dry-run token must not skip gating on a protected context.
 func TestEditDryRunCannotSkipGating(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"edit", "deployment", "nginx", "--dry-run=client"}, staticContext("prod-cluster"))
 	if res != RequireConfirmation {
@@ -176,7 +176,7 @@ var verbShiftBypasses = map[string][]string{
 func TestVerbShiftCannotBypassGating(t *testing.T) {
 	for name, args := range verbShiftBypasses {
 		t.Run(name, func(t *testing.T) {
-			cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+			cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 			defer cleanup()
 			res, _, _, _ := checkWith(args, staticContext("prod-cluster"))
 			if res != RequireConfirmation {
@@ -268,7 +268,7 @@ func TestReadVerbNotOverGatedAfterShift(t *testing.T) {
 // TestApplyDryRunStillSkipsGating guards against the #71 dry-run exclusion
 // regressing the existing behavior for verbs that genuinely support --dry-run.
 func TestApplyDryRunStillSkipsGating(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"apply", "--dry-run=client", "-f", "deploy.yaml"}, staticContext("prod-cluster"))
 	if res != Allow {
@@ -280,7 +280,7 @@ func TestApplyDryRunStillSkipsGating(t *testing.T) {
 // `certificate approve` (credential issuance) bypassed even a configured guard,
 // because it was classified as a read.
 func TestCertificateApproveGatedOnProtectedContext(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"certificate", "approve", "my-csr"}, staticContext("prod-cluster"))
 	if res != RequireConfirmation {
@@ -291,7 +291,7 @@ func TestCertificateApproveGatedOnProtectedContext(t *testing.T) {
 // TestCertificateDryRunCannotSkipGating: `certificate approve` has no --dry-run
 // flag, so a --dry-run token must not buy the ungated pass a real dry-run would.
 func TestCertificateDryRunCannotSkipGating(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"certificate", "approve", "--dry-run=client", "my-csr"}, staticContext("prod-cluster"))
 	if res != RequireConfirmation {
@@ -302,7 +302,7 @@ func TestCertificateDryRunCannotSkipGating(t *testing.T) {
 // TestCertificateBlockedInBlockMode: block mode hard-refuses it.
 func TestCertificateBlockedInBlockMode(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeBlock,
 	})
 	defer cleanup()

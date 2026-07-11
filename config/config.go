@@ -116,11 +116,90 @@ const (
 // is spelled 0.
 const MaxConfirmTimeoutSeconds = 365 * 24 * 60 * 60
 
+// ProtectedPattern is one entry in protected_contexts / protected_namespaces: a
+// glob pattern plus an optional per-pattern protection mode. Mode "" means the
+// pattern inherits the global context_mode / namespace_mode (the back-compat
+// default); a non-empty Mode ("confirm" | "block") overrides the global mode for
+// the contexts/namespaces this pattern matches.
+//
+// The YAML form is backward compatible: a bare string ("prod-*") decodes to
+// {Pattern: "prod-*", Mode: ""} and re-marshals to the bare string, so an
+// existing string-only config parses and round-trips unchanged. The object form
+// ({pattern: "prod-*", mode: block}) carries an explicit per-pattern mode.
+type ProtectedPattern struct {
+	Pattern string
+	Mode    string // "" = inherit the global mode; otherwise "confirm" | "block"
+}
+
+// UnmarshalYAML accepts EITHER a bare scalar (the back-compat form: the pattern,
+// with an inherited mode) or a mapping {pattern, mode}. Any other node kind is an
+// error, so a malformed entry fails the config closed rather than silently
+// dropping a protected pattern.
+func (pp *ProtectedPattern) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		pp.Mode = ""
+		return node.Decode(&pp.Pattern)
+	case yaml.MappingNode:
+		var raw struct {
+			Pattern string `yaml:"pattern"`
+			Mode    string `yaml:"mode"`
+		}
+		if err := node.Decode(&raw); err != nil {
+			return err
+		}
+		pp.Pattern = raw.Pattern
+		pp.Mode = raw.Mode
+		return nil
+	default:
+		return fmt.Errorf("protected pattern must be a string or a {pattern, mode} mapping")
+	}
+}
+
+// MarshalYAML emits the bare pattern string when no per-pattern mode is set
+// (preserving the back-compat YAML shape so a string-only config round-trips to
+// bare strings), else a {pattern, mode} mapping.
+func (pp ProtectedPattern) MarshalYAML() (any, error) {
+	if pp.Mode == "" {
+		return pp.Pattern, nil
+	}
+	return map[string]string{"pattern": pp.Pattern, "mode": pp.Mode}, nil
+}
+
+// Patterns builds a ProtectedPattern slice from bare pattern strings, each with
+// an inherited (empty) mode — the programmatic equivalent of the bare-string YAML
+// form. Used by env/flag bootstrap, the setup wizard, and tests.
+func Patterns(names ...string) []ProtectedPattern {
+	out := make([]ProtectedPattern, 0, len(names))
+	for _, n := range names {
+		out = append(out, ProtectedPattern{Pattern: n})
+	}
+	return out
+}
+
+// patternStrings returns just the glob patterns from a ProtectedPattern slice,
+// for display, joining, and completion where the per-pattern mode is not needed.
+func patternStrings(pats []ProtectedPattern) []string {
+	out := make([]string, len(pats))
+	for i, p := range pats {
+		out[i] = p.Pattern
+	}
+	return out
+}
+
+// ProtectedContextPatterns / ProtectedNamespacePatterns return the bare glob
+// patterns of the protected lists, for the CLI (`config list`, completion) which
+// does not need the per-pattern mode.
+func (c *Config) ProtectedContextPatterns() []string   { return patternStrings(c.ProtectedContexts) }
+func (c *Config) ProtectedNamespacePatterns() []string { return patternStrings(c.ProtectedNamespaces) }
+
 // Config represents the kubectl-guard configuration.
 type Config struct {
 	// ProtectedContexts are context name patterns (glob) that require
-	// confirmation for state-altering commands.
-	ProtectedContexts []string `yaml:"protected_contexts,omitempty"`
+	// confirmation (or, per-pattern/global mode, a hard block) for state-altering
+	// commands. A bare-string YAML entry inherits the global context_mode; an
+	// object entry ({pattern, mode}) sets a per-pattern mode. See ProtectedPattern.
+	ProtectedContexts []ProtectedPattern `yaml:"protected_contexts,omitempty"`
 
 	// ProtectedResources are resource names (e.g. "secret") whose access is
 	// blocked entirely on every context, regardless of verb. Singular, plural,
@@ -129,8 +208,10 @@ type Config struct {
 
 	// ProtectedNamespaces are namespace name patterns (glob) that gate
 	// state-altering commands when the target namespace matches. Composes with
-	// protected contexts: a command is gated if either matches.
-	ProtectedNamespaces []string `yaml:"protected_namespaces,omitempty"`
+	// protected contexts: a command is gated if either matches. Like
+	// ProtectedContexts, each entry may be a bare string (inherits namespace_mode)
+	// or a {pattern, mode} object.
+	ProtectedNamespaces []ProtectedPattern `yaml:"protected_namespaces,omitempty"`
 
 	// ContextMode controls how protected contexts treat state-altering
 	// commands: "confirm" (default) prompts; "block" hard-refuses.
@@ -819,29 +900,60 @@ func Save(cfg *Config) error {
 // characters (including '/' and ':', so it spans EKS ARNs and path-shaped
 // context names), '?' matches one character, and '[...]' matches a class.
 func (c *Config) IsContextProtected(context string) bool {
-	for _, pattern := range c.ProtectedContexts {
-		if matchGlob(pattern, context) {
+	for _, pp := range c.ProtectedContexts {
+		if matchGlob(pp.Pattern, context) {
 			return true
 		}
 	}
 	return false
 }
 
-// AddContext adds a context to the protected list if not already present.
-func (c *Config) AddContext(context string) bool {
-	for _, ctx := range c.ProtectedContexts {
-		if ctx == context {
+// AddContext adds a context pattern to the protected list (inheriting the global
+// mode) if the exact pattern is not already present. It is a pure no-op on an
+// existing pattern — it never touches an existing pattern's mode, so a plain
+// re-add can never downgrade a block pattern. Use AddContextWithMode to set or
+// change a per-pattern mode.
+func (c *Config) AddContext(pattern string) bool {
+	for i := range c.ProtectedContexts {
+		if c.ProtectedContexts[i].Pattern == pattern {
 			return false
 		}
 	}
-	c.ProtectedContexts = append(c.ProtectedContexts, context)
+	c.ProtectedContexts = append(c.ProtectedContexts, ProtectedPattern{Pattern: pattern})
 	return true
 }
 
-// RemoveContext removes a context from the protected list.
-func (c *Config) RemoveContext(context string) bool {
-	for i, ctx := range c.ProtectedContexts {
-		if ctx == context {
+// AddContextWithMode adds a protected context pattern with an explicit per-pattern
+// mode ("" = inherit, "confirm", or "block"), or UPDATES the mode of an existing
+// pattern. Adding a new pattern, or changing an existing pattern's mode (e.g.
+// `add-context prod-* --mode block` upgrading an inherit/confirm entry to block),
+// returns true; re-adding with the SAME mode is a no-op returning false. An
+// invalid mode is rejected (returns false, no change) so the config fails closed.
+//
+// Downgrading via this method (e.g. block → inherit/confirm) is permitted but is
+// classified as weakening by WeakensProtection and thus audited/gated like any
+// other protection reduction.
+func (c *Config) AddContextWithMode(pattern, mode string) bool {
+	if mode != "" && !validContextMode(mode) {
+		return false
+	}
+	for i := range c.ProtectedContexts {
+		if c.ProtectedContexts[i].Pattern == pattern {
+			if c.ProtectedContexts[i].Mode == mode {
+				return false
+			}
+			c.ProtectedContexts[i].Mode = mode
+			return true
+		}
+	}
+	c.ProtectedContexts = append(c.ProtectedContexts, ProtectedPattern{Pattern: pattern, Mode: mode})
+	return true
+}
+
+// RemoveContext removes a context pattern from the protected list.
+func (c *Config) RemoveContext(pattern string) bool {
+	for i := range c.ProtectedContexts {
+		if c.ProtectedContexts[i].Pattern == pattern {
 			c.ProtectedContexts = append(c.ProtectedContexts[:i], c.ProtectedContexts[i+1:]...)
 			return true
 		}
@@ -858,29 +970,52 @@ func (c *Config) HasProtectedNamespaces() bool {
 // It uses the same matcher as IsContextProtected, so context and namespace
 // patterns can never disagree about what a glob means.
 func (c *Config) IsNamespaceProtected(namespace string) bool {
-	for _, pattern := range c.ProtectedNamespaces {
-		if matchGlob(pattern, namespace) {
+	for _, pp := range c.ProtectedNamespaces {
+		if matchGlob(pp.Pattern, namespace) {
 			return true
 		}
 	}
 	return false
 }
 
-// AddNamespace adds a namespace pattern to the protected list if not present.
-func (c *Config) AddNamespace(namespace string) bool {
-	for _, ns := range c.ProtectedNamespaces {
-		if ns == namespace {
+// AddNamespace adds a namespace pattern (inheriting the global mode) if the exact
+// pattern is not already present. Like AddContext it is a pure no-op on an
+// existing pattern, never touching its mode. Use AddNamespaceWithMode to set one.
+func (c *Config) AddNamespace(pattern string) bool {
+	for i := range c.ProtectedNamespaces {
+		if c.ProtectedNamespaces[i].Pattern == pattern {
 			return false
 		}
 	}
-	c.ProtectedNamespaces = append(c.ProtectedNamespaces, namespace)
+	c.ProtectedNamespaces = append(c.ProtectedNamespaces, ProtectedPattern{Pattern: pattern})
+	return true
+}
+
+// AddNamespaceWithMode adds or UPDATES a protected namespace pattern with an
+// explicit per-pattern mode ("" = inherit, "confirm", or "block"). Semantics
+// mirror AddContextWithMode: a new pattern or a mode change returns true, the
+// same mode is a no-op, and an invalid mode is rejected (fail closed).
+func (c *Config) AddNamespaceWithMode(pattern, mode string) bool {
+	if mode != "" && !validNamespaceMode(mode) {
+		return false
+	}
+	for i := range c.ProtectedNamespaces {
+		if c.ProtectedNamespaces[i].Pattern == pattern {
+			if c.ProtectedNamespaces[i].Mode == mode {
+				return false
+			}
+			c.ProtectedNamespaces[i].Mode = mode
+			return true
+		}
+	}
+	c.ProtectedNamespaces = append(c.ProtectedNamespaces, ProtectedPattern{Pattern: pattern, Mode: mode})
 	return true
 }
 
 // RemoveNamespace removes a namespace pattern from the protected list.
-func (c *Config) RemoveNamespace(namespace string) bool {
-	for i, ns := range c.ProtectedNamespaces {
-		if ns == namespace {
+func (c *Config) RemoveNamespace(pattern string) bool {
+	for i := range c.ProtectedNamespaces {
+		if c.ProtectedNamespaces[i].Pattern == pattern {
 			c.ProtectedNamespaces = append(c.ProtectedNamespaces[:i], c.ProtectedNamespaces[i+1:]...)
 			return true
 		}
@@ -948,16 +1083,103 @@ func (c *Config) effectiveNamespaceMode() string {
 	return NamespaceModeConfirm
 }
 
+// EffectiveContextMode returns the protection mode that applies to a context: the
+// MOST RESTRICTIVE mode among all protected patterns that match it. A matching
+// pattern with an explicit Mode uses that mode; a matching pattern with Mode==""
+// inherits the global context mode. "block" is more restrictive than "confirm",
+// so the result is block if ANY matching pattern resolves to block. When no
+// pattern matches, the global context mode is returned unchanged.
+//
+// The "most restrictive" is taken only AMONG matching patterns: an explicit
+// `mode: confirm` on a matching pattern resolves to confirm even when the global
+// context_mode is block — that is the purpose of a per-pattern override. The
+// global mode is used solely as the inherited value for a no-mode pattern and as
+// the fallback when nothing matches.
+func (c *Config) EffectiveContextMode(context string) string {
+	return mostRestrictiveMode(c.ProtectedContexts, context, c.effectiveContextMode())
+}
+
+// EffectiveNamespaceMode is EffectiveContextMode's namespace equivalent: the most
+// restrictive per-pattern mode among protected namespace patterns matching the
+// namespace, else the global namespace mode.
+func (c *Config) EffectiveNamespaceMode(namespace string) string {
+	return mostRestrictiveMode(c.ProtectedNamespaces, namespace, c.effectiveNamespaceMode())
+}
+
+// MostRestrictiveNamespaceMode returns the most restrictive per-pattern namespace
+// mode across ALL configured namespace patterns. It is used when a command spans
+// every namespace (--all-namespaces) or names a wide namespace target the guard
+// cannot enumerate: such a command touches every protected namespace, so it must
+// inherit the strongest mode any of them carries. block wins; otherwise confirm;
+// the global namespace mode is the floor/fallback when no pattern is configured.
+func (c *Config) MostRestrictiveNamespaceMode() string {
+	global := c.effectiveNamespaceMode()
+	matched := false
+	for _, pp := range c.ProtectedNamespaces {
+		matched = true
+		mode := pp.Mode
+		if mode == "" {
+			mode = global
+		}
+		if mode == NamespaceModeBlock {
+			return NamespaceModeBlock
+		}
+	}
+	if !matched {
+		return global
+	}
+	return NamespaceModeConfirm
+}
+
+// mostRestrictiveMode resolves the effective mode for target against patterns.
+// global is BOTH the mode a matching no-mode pattern inherits AND the fallback
+// when no pattern matches. Among matching patterns block beats confirm (most
+// restrictive); a matching pattern's explicit mode is honored as-is (it may be
+// confirm even when global is block — a per-pattern override). The mode constants
+// share values across the context/namespace axes ("block"/"confirm"), so this one
+// helper serves both.
+func mostRestrictiveMode(patterns []ProtectedPattern, target, global string) string {
+	matched := false
+	for _, pp := range patterns {
+		if !matchGlob(pp.Pattern, target) {
+			continue
+		}
+		matched = true
+		mode := pp.Mode
+		if mode == "" {
+			mode = global
+		}
+		// block is the most restrictive mode; once any matching pattern resolves to
+		// block, the answer cannot get more restrictive, so return immediately.
+		if mode == ContextModeBlock {
+			return ContextModeBlock
+		}
+	}
+	if !matched {
+		return global
+	}
+	// At least one pattern matched and none resolved to block ⇒ confirm.
+	return ContextModeConfirm
+}
+
 // EffectiveModesForActor returns the context_mode and namespace_mode that apply
-// to the given actor: the global modes, made STRICTER by any matching actor
-// policy. Because block is the most restrictive mode and a policy can only
-// upgrade confirm → block (never downgrade), a matching actor policy can tighten
-// protection for a known agent label but never weaken it below the global
-// posture — the correct stance for a self-asserted identity. An unset or
-// unmatched actor yields exactly the global modes (unchanged behavior).
-func (c *Config) EffectiveModesForActor(actor string) (contextMode, namespaceMode string) {
-	contextMode = c.effectiveContextMode()
-	namespaceMode = c.effectiveNamespaceMode()
+// to the given actor for a specific context and namespace: the PER-PATTERN base
+// modes (EffectiveContextMode / EffectiveNamespaceMode for that context/namespace),
+// made STRICTER by any matching actor policy. Because block is the most
+// restrictive mode and a policy can only upgrade confirm → block (never
+// downgrade), a matching actor policy can tighten protection for a known agent
+// label but never weaken it below the per-pattern/global posture — the correct
+// stance for a self-asserted identity. An unset or unmatched actor yields exactly
+// the per-pattern base modes.
+//
+// Note: the namespace argument is the run-in namespace; a command may also target
+// a protected namespace by NAME or via --all-namespaces, whose governing mode the
+// guard folds in separately (see guard.effectiveNamespaceModeForTarget). Actor
+// tightening here is unconditional (block regardless of which namespace), so it
+// composes correctly with that fold-in.
+func (c *Config) EffectiveModesForActor(actor, context, namespace string) (contextMode, namespaceMode string) {
+	contextMode = c.EffectiveContextMode(context)
+	namespaceMode = c.EffectiveNamespaceMode(namespace)
 	for _, ap := range c.ActorPolicies {
 		if !matchGlob(ap.Actor, actor) {
 			continue

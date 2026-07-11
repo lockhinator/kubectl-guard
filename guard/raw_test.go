@@ -105,7 +105,7 @@ func TestRawCheckLevelBlocked(t *testing.T) {
 
 // TestRawCheckLevelHealthzAllowed: /healthz with no resource protection passes.
 func TestRawCheckLevelHealthzAllowed(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"get", "--raw", "/healthz"}, staticContext("prod-cluster"))
 	if res != Allow {

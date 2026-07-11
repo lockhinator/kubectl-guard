@@ -348,16 +348,28 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	}
 
 	if contextProtected || namespaceProtected || sensitiveActive || blastActive || sensitiveKindActive {
-		// Per-actor policy: a matching actor policy can make context/namespace
-		// protection STRICTER for a known actor (e.g. an agent label gets block
-		// where a human gets confirm). It never weakens the global posture.
-		ctxMode, nsMode := cfg.EffectiveModesForActor(resolveActor(cfg, currentUser()))
+		// Per-pattern + per-actor modes. The base modes come from the matched
+		// context/namespace PATTERN (EffectiveContextMode / EffectiveNamespaceMode);
+		// a matching actor policy can then make them STRICTER (confirm → block) for a
+		// known actor, but never weaker than the per-pattern/global posture.
+		actor := resolveActor(cfg, currentUser())
+		runNS := resolveTargetNamespace(cfg, p, ctx, inClusterNamespace, nsFor)
+		// ctxMode: per-pattern mode for the matched context, tightened by the actor
+		// policy. nsActorMode: the run-in namespace's per-pattern mode, tightened by
+		// the actor policy — its ONLY role here is to carry the actor's unconditional
+		// namespace tightening (block regardless of which namespace), because the
+		// authoritative per-pattern namespace mode across ALL target routes (-A, a
+		// namespace named as the object, or the run-in namespace) is computed by
+		// effectiveNamespaceModeForTarget and unioned in below.
+		ctxMode, nsActorMode := cfg.EffectiveModesForActor(actor, ctx, runNS)
+		nsBlock := nsActorMode == config.NamespaceModeBlock ||
+			effectiveNamespaceModeForTarget(cfg, p, runNS) == config.NamespaceModeBlock
 
 		// Block mode: hard-refuse with no prompt. If ANY matching signal is in
 		// block mode, block wins (most restrictive). --yes cannot bypass this: it
 		// only auto-confirms RequireConfirmation, and Blocked is a separate result.
 		if (contextProtected && ctxMode == config.ContextModeBlock) ||
-			(namespaceProtected && nsMode == config.NamespaceModeBlock) ||
+			(namespaceProtected && nsBlock) ||
 			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) ||
 			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) ||
 			(sensitiveKindActive && cfg.SensitiveKindMode() == config.SensitiveKindBlock) {
@@ -410,6 +422,75 @@ func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs, ctx, fallbackN
 		return true
 	}
 	return cfg.IsNamespaceProtected(resolveTargetNamespace(cfg, p, ctx, fallbackNS, nsFor))
+}
+
+// effectiveNamespaceModeForTarget returns the MOST RESTRICTIVE per-pattern
+// namespace mode across every route by which the command targets a PROTECTED
+// namespace — mirroring namespaceTargetProtected's three routes so the mode and
+// the "is it protected?" decision can never disagree:
+//
+//  1. --all-namespaces spans every namespace → most restrictive over ALL patterns
+//     (MostRestrictiveNamespaceMode), because the command touches each of them;
+//  2. a namespace addressed as the command's OBJECT (`delete namespace kube-system`)
+//     → that namespace's EffectiveNamespaceMode (a wide/unenumerable object target
+//     → all patterns, same as route 1);
+//  3. the namespace the command runs IN (runNS) → its EffectiveNamespaceMode.
+//
+// It returns block if ANY protected route resolves to block, else confirm. Only a
+// PROTECTED namespace contributes (guarded by IsNamespaceProtected), so an
+// unprotected run-in namespace does not fold the global mode in. Actor-policy
+// tightening is applied by the caller (it is unconditional, so it composes as a
+// union with this result). runNS is precomputed by the caller to avoid a repeated
+// context-namespace lookup.
+func effectiveNamespaceModeForTarget(cfg *config.Config, p ParsedArgs, runNS string) string {
+	isBlock := func(m string) bool { return m == config.NamespaceModeBlock }
+	if p.AllNamespaces && cfg.HasProtectedNamespaces() && isBlock(cfg.MostRestrictiveNamespaceMode()) {
+		return config.NamespaceModeBlock
+	}
+	if t := namespaceTargetsFrom(p); t.Kind && cfg.HasProtectedNamespaces() {
+		if t.Wide {
+			if isBlock(cfg.MostRestrictiveNamespaceMode()) {
+				return config.NamespaceModeBlock
+			}
+		} else {
+			for _, name := range t.Names {
+				if cfg.IsNamespaceProtected(name) && isBlock(cfg.EffectiveNamespaceMode(name)) {
+					return config.NamespaceModeBlock
+				}
+			}
+		}
+	}
+	if cfg.IsNamespaceProtected(runNS) && isBlock(cfg.EffectiveNamespaceMode(runNS)) {
+		return config.NamespaceModeBlock
+	}
+	return config.NamespaceModeConfirm
+}
+
+// EffectiveTargetModes returns the actor-effective context and namespace
+// protection modes the guard's block decision used for a command: the per-pattern
+// context mode for the resolved context, and the most-restrictive per-pattern
+// namespace mode across every target route, each tightened by the matching actor
+// policy. It is for the message/explain layer (labeling a Blocked or gated
+// decision) and may shell out for namespace resolution, so it is for the gated
+// path only, never the hot read path. cfg==nil yields the safe confirm defaults.
+func EffectiveTargetModes(cfg *config.Config, args []string, ctx string) (ctxMode, nsMode string) {
+	if cfg == nil {
+		return config.ContextModeConfirm, config.NamespaceModeConfirm
+	}
+	p := ParseArgs(args)
+	fallbackNS := ""
+	if saNS, inCl := defaultInCluster(); inCl {
+		fallbackNS = saNS
+	}
+	runNS := resolveTargetNamespace(cfg, p, ctx, fallbackNS, defaultContextNamespace)
+	actor := resolveActor(cfg, currentUser())
+	cm, nsActorMode := cfg.EffectiveModesForActor(actor, ctx, runNS)
+	nsMode = config.NamespaceModeConfirm
+	if nsActorMode == config.NamespaceModeBlock ||
+		effectiveNamespaceModeForTarget(cfg, p, runNS) == config.NamespaceModeBlock {
+		nsMode = config.NamespaceModeBlock
+	}
+	return cm, nsMode
 }
 
 // protectedNamespaceNameTarget reports whether a state-altering command targets

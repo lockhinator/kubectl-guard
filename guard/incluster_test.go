@@ -66,7 +66,7 @@ func TestInClusterSpoofedEnvVarDoesNotDowngrade(t *testing.T) {
 	defer func() { saNamespacePath = orig }()
 
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		InCluster:         config.InClusterAllow, // even the most permissive policy must not apply
 	})
 	defer cleanup()
@@ -106,8 +106,8 @@ func checkInCluster(t *testing.T, args []string, inCluster InClusterFunc) Result
 // unresolvable and protected_contexts is configured.
 func TestInClusterNamespaceGates(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:   []string{"prod-*"}, // configured, but unevaluable in-cluster
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedContexts:   config.Patterns("prod-*"), // configured, but unevaluable in-cluster
+		ProtectedNamespaces: config.Patterns("kube-system"),
 	})
 	defer cleanup()
 
@@ -131,7 +131,7 @@ func TestInClusterNamespaceGates(t *testing.T) {
 // TestInClusterNamespaceNoProtection: in-cluster with no namespace protection
 // configured passes through (criterion: "in-cluster with no protection passes").
 func TestInClusterNamespaceNoProtection(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 
 	if res := checkInCluster(t, []string{"delete", "pod", "nginx"}, inClusterAs("kube-system")); res != Allow {
@@ -142,7 +142,7 @@ func TestInClusterNamespaceNoProtection(t *testing.T) {
 // TestInClusterDeny reproduces the previous fail-closed behavior.
 func TestInClusterDeny(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		InCluster:         config.InClusterDeny,
 	})
 	defer cleanup()
@@ -162,8 +162,8 @@ func TestInClusterDeny(t *testing.T) {
 // "namespace" mode).
 func TestInClusterAllow(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:   []string{"prod-*"},
-		ProtectedNamespaces: []string{"kube-system"}, // protected, yet allow passes it
+		ProtectedContexts:   config.Patterns("prod-*"),
+		ProtectedNamespaces: config.Patterns("kube-system"), // protected, yet allow passes it
 		InCluster:           config.InClusterAllow,
 	})
 	defer cleanup()
@@ -178,7 +178,7 @@ func TestInClusterAllow(t *testing.T) {
 // the guard denies as before, regardless of the in_cluster policy.
 func TestOutOfClusterUnchanged(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		InCluster:         config.InClusterAllow, // must NOT apply out-of-cluster
 	})
 	defer cleanup()
@@ -191,8 +191,8 @@ func TestOutOfClusterUnchanged(t *testing.T) {
 // TestInClusterBlockMode: namespace_mode: block hard-refuses in-cluster too.
 func TestInClusterBlockMode(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:   []string{"prod-*"},
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedContexts:   config.Patterns("prod-*"),
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		NamespaceMode:       config.NamespaceModeBlock,
 	})
 	defer cleanup()
@@ -206,7 +206,7 @@ func TestInClusterBlockMode(t *testing.T) {
 // (e.g. a mounted kubeconfig with a current-context), normal context protection
 // applies and the in-cluster policy is not consulted.
 func TestInClusterResolvableContextUnaffected(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 
 	// staticContext resolves "prod-1" (protected) -> gate, regardless of in-cluster.
@@ -224,8 +224,8 @@ func TestInClusterResolvableContextUnaffected(t *testing.T) {
 // checkWithResolvers against any other InClusterFunc.
 func TestInClusterEmptySANamespaceFailsClosed(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:   []string{"prod-*"},
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedContexts:   config.Patterns("prod-*"),
+		ProtectedNamespaces: config.Patterns("kube-system"),
 	})
 	defer cleanup()
 
@@ -239,7 +239,7 @@ func TestInClusterEmptySANamespaceFailsClosed(t *testing.T) {
 // `--context=dev --cluster=prod` would gate on the unprotected "dev" while hitting
 // prod. It is refused whenever protected contexts are configured, like --server.
 func TestClusterOverrideRefused(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 
 	// Resolvable but unprotected context + --cluster retarget: must Deny.

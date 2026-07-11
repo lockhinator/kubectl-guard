@@ -8,9 +8,9 @@ import (
 func TestWeakensProtection(t *testing.T) {
 	base := func() *Config {
 		c := &Config{
-			ProtectedContexts:   []string{"prod-*"},
+			ProtectedContexts:   Patterns("prod-*"),
 			ProtectedResources:  []string{"secret"},
-			ProtectedNamespaces: []string{"kube-system"},
+			ProtectedNamespaces: Patterns("kube-system"),
 			ContextMode:         ContextModeBlock,
 			SensitiveAccess:     SensitiveAccessBlock,
 			BlastRadius:         BlastRadiusGate,
@@ -41,7 +41,7 @@ func TestWeakensProtection(t *testing.T) {
 
 		// Strengthening / additive → NOT weakening.
 		{"add protected resource", func(c *Config) { c.ProtectedResources = append(c.ProtectedResources, "configmap") }, false, ""},
-		{"add protected context", func(c *Config) { c.ProtectedContexts = append(c.ProtectedContexts, "stg-*") }, false, ""},
+		{"add protected context", func(c *Config) { c.ProtectedContexts = append(c.ProtectedContexts, ProtectedPattern{Pattern: "stg-*"}) }, false, ""},
 		{"upgrade blast_radius", func(c *Config) { c.BlastRadius = BlastRadiusBlock }, false, ""},
 		{"enable something stricter", func(c *Config) { c.UnknownVerb = UnknownVerbDeny }, false, ""}, // no change
 		{"no change", func(c *Config) {}, false, ""},

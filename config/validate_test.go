@@ -13,8 +13,8 @@ func TestValidate(t *testing.T) {
 	}{
 		{"empty config is valid", Config{}, ""},
 		{"fully valid config", Config{
-			ProtectedContexts:   []string{"prod-*", "arn:aws:eks:*:*:cluster/prod-*"},
-			ProtectedNamespaces: []string{"kube-system", "prod-[a-z]"},
+			ProtectedContexts:   Patterns("prod-*", "arn:aws:eks:*:*:cluster/prod-*"),
+			ProtectedNamespaces: Patterns("kube-system", "prod-[a-z]"),
 			ProtectedResources:  []string{"secret", "configmap"},
 			ConfirmMode:         ConfirmModeTypeName,
 			AuditMode:           AuditModeGated,
@@ -51,9 +51,9 @@ func TestValidate(t *testing.T) {
 
 		{"valid agent-relay confirm mode", Config{ConfirmMode: ConfirmModeAgentRelay}, ""},
 
-		{"unterminated glob in contexts", Config{ProtectedContexts: []string{"prod-["}}, "protected_contexts"},
-		{"unterminated glob in namespaces", Config{ProtectedNamespaces: []string{"kube-["}}, "protected_namespaces"},
-		{"dangling escape in context", Config{ProtectedContexts: []string{`prod\`}}, "dangling"},
+		{"unterminated glob in contexts", Config{ProtectedContexts: Patterns("prod-[")}, "protected_contexts"},
+		{"unterminated glob in namespaces", Config{ProtectedNamespaces: Patterns("kube-[")}, "protected_namespaces"},
+		{"dangling escape in context", Config{ProtectedContexts: Patterns(`prod\`)}, "dangling"},
 
 		{"empty resource entry", Config{ProtectedResources: []string{"secret", ""}}, "protected_resources"},
 		{"whitespace resource entry", Config{ProtectedResources: []string{"   "}}, "protected_resources"},
@@ -68,7 +68,7 @@ func TestValidate(t *testing.T) {
 		{"overflow confirm timeout rejected", Config{ConfirmTimeoutSeconds: 9223372037}, "too large"},
 
 		{"valid globs with classes and escapes", Config{
-			ProtectedContexts: []string{"prod-[abc]", "prod-[!x]", "prod-[a-z]", `lit\[eral`, "*prod*"},
+			ProtectedContexts: Patterns("prod-[abc]", "prod-[!x]", "prod-[a-z]", `lit\[eral`, "*prod*"),
 		}, ""},
 	}
 
@@ -100,7 +100,7 @@ func TestValidateReportsAllProblems(t *testing.T) {
 	cfg := Config{
 		ConfirmMode:        "typname",
 		ContextMode:        "blck",
-		ProtectedContexts:  []string{"prod-["},
+		ProtectedContexts:  Patterns("prod-["),
 		ProtectedResources: []string{""},
 	}
 	if got := len(cfg.Validate()); got != 4 {

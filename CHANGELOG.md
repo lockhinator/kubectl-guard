@@ -1,5 +1,62 @@
 # Changelog
 
+## [1.0.0](https://github.com/lockhinator/kubectl-guard/compare/v0.6.0...v1.0.0) (2026-07-11)
+
+
+### Features
+
+* capture a justification on confirmation (compliance) ([e462aba](https://github.com/lockhinator/kubectl-guard/commit/e462abaa94f3b8b26708ef62676d30074ada560f)), closes [#95](https://github.com/lockhinator/kubectl-guard/issues/95)
+* capture justification on confirmation (compliance) ([5d393c8](https://github.com/lockhinator/kubectl-guard/commit/5d393c81e89cfccfc4eebf6618b2362f89c2626f))
+* config file permission check on load (tamper signal) ([b0c6dd9](https://github.com/lockhinator/kubectl-guard/commit/b0c6dd9033c164bc07fbf8b8e178043b0ef3c85e))
+* configurable config and audit-log locations via env vars ([b47a67f](https://github.com/lockhinator/kubectl-guard/commit/b47a67f8d049afda62c7902b3860faf8d8c6c704)), closes [#36](https://github.com/lockhinator/kubectl-guard/issues/36)
+* configurable config location (KUBECTL_GUARD_CONFIG env var) ([3387cc0](https://github.com/lockhinator/kubectl-guard/commit/3387cc0c73dd5ce7ae1504a391631b52ea0b8b75))
+* consistent error reporting (single sink, --json aware) ([ca5e598](https://github.com/lockhinator/kubectl-guard/commit/ca5e598f905e400de250a57cfef02a016a834a34))
+* consistent, --json-aware error reporting ([cbe5a56](https://github.com/lockhinator/kubectl-guard/commit/cbe5a5642016874ddf246fb64eb8bc8fa6365cb8)), closes [#38](https://github.com/lockhinator/kubectl-guard/issues/38)
+* distribution channels — Homebrew cask + deb/rpm/apk ([12bb8a5](https://github.com/lockhinator/kubectl-guard/commit/12bb8a5b2190f39df56e17797dcddf1b2e8bd47e))
+* distribution channels — Homebrew cask + deb/rpm/apk ([f42d487](https://github.com/lockhinator/kubectl-guard/commit/f42d487b9c9f25613143fffce840e962d36439ce)), closes [#96](https://github.com/lockhinator/kubectl-guard/issues/96)
+* doctor command (verify interception, config, audit, posture) ([224ac66](https://github.com/lockhinator/kubectl-guard/commit/224ac665cc361f709db0a57e7678852da7867af6))
+* doctor command (verify interception, config, audit, posture) ([d3a67f4](https://github.com/lockhinator/kubectl-guard/commit/d3a67f414e47b7524aa4df2776dc1c8d9907bc7a)), closes [#37](https://github.com/lockhinator/kubectl-guard/issues/37)
+* document native Windows as a non-goal (WSL2), compile-safe ([10c3c52](https://github.com/lockhinator/kubectl-guard/commit/10c3c52e2423685952fd73b6b1e950558f927d07))
+* document native Windows as a non-goal (WSL2), compile-safe ([2eb7736](https://github.com/lockhinator/kubectl-guard/commit/2eb77363c4cf7f8b4f79adeece05bb7072c0fd43)), closes [#88](https://github.com/lockhinator/kubectl-guard/issues/88)
+* global read-only / freeze mode (incident panic button) ([0287078](https://github.com/lockhinator/kubectl-guard/commit/0287078ab579470339195d0b0391c00aaa9861f9))
+* global read-only / freeze mode (incident panic button) ([248e179](https://github.com/lockhinator/kubectl-guard/commit/248e1791930ef216c5c558c033a2ba7e3607eda6)), closes [#94](https://github.com/lockhinator/kubectl-guard/issues/94)
+* graceful SIGINT/SIGTERM handling during the confirmation prompt ([4969508](https://github.com/lockhinator/kubectl-guard/commit/4969508a4e2759bce64b26f55f3ea44ee343b73f)), closes [#35](https://github.com/lockhinator/kubectl-guard/issues/35)
+* identity-based context protection (match cluster server URL) ([1f45887](https://github.com/lockhinator/kubectl-guard/commit/1f45887e9097dd094587a13b81657bff5688e6f0))
+* identity-based context protection (match cluster server URL) ([b28bb90](https://github.com/lockhinator/kubectl-guard/commit/b28bb900efe7d34fb3b5e67c3865502110945bb8)), closes [#85](https://github.com/lockhinator/kubectl-guard/issues/85)
+* layered/enforced config (system baseline + user, most-restrictive) ([cce750b](https://github.com/lockhinator/kubectl-guard/commit/cce750b626f551c71fa614fe7416aabae0e25297))
+* layered/enforced config (system baseline + user, most-restrictive) ([24c957a](https://github.com/lockhinator/kubectl-guard/commit/24c957a54e0193073e8ffc9fa331cff4280f5763)), closes [#86](https://github.com/lockhinator/kubectl-guard/issues/86)
+* opt-in scoped structured output redaction (redact_output) ([c280765](https://github.com/lockhinator/kubectl-guard/commit/c2807650276c8ea21d2c8c5c489504ece104b2a0))
+* opt-in scoped structured output redaction (redact_output) ([eebe9cb](https://github.com/lockhinator/kubectl-guard/commit/eebe9cb955388bab44cafc1918956af8a7487e7e)), closes [#108](https://github.com/lockhinator/kubectl-guard/issues/108)
+* per-pattern policy overrides (mode per context/namespace pattern) ([eb5996d](https://github.com/lockhinator/kubectl-guard/commit/eb5996d7c48b399fc09429ffd2ba8950febfe52e))
+* per-pattern policy overrides (mode per context/namespace pattern) ([ba18077](https://github.com/lockhinator/kubectl-guard/commit/ba18077709c3cbaf25ac767f76fe03cab74a3166)), closes [#79](https://github.com/lockhinator/kubectl-guard/issues/79)
+* read kubeconfig directly (clientcmd) instead of shelling out ([31b4ac4](https://github.com/lockhinator/kubectl-guard/commit/31b4ac4c8820306f2d0a9203bbf600aa445adf26))
+* resolve context/namespace by parsing kubeconfig (clientcmd) ([f672c60](https://github.com/lockhinator/kubectl-guard/commit/f672c6096cfb79c28ddf3ebb3ddcbf871f068013)), closes [#31](https://github.com/lockhinator/kubectl-guard/issues/31)
+* sensitive-kind mutation gating ([19e3eb6](https://github.com/lockhinator/kubectl-guard/commit/19e3eb633518bfde9db028e225ec477c88b60ed3)), closes [#93](https://github.com/lockhinator/kubectl-guard/issues/93)
+* sensitive-kind mutation gating (gate mutations to a kind anywhere, allow reads) ([9b8d1f3](https://github.com/lockhinator/kubectl-guard/commit/9b8d1f347be02b6747cad9c7640c207b0493da8a))
+* shell completions (bash/zsh/fish) ([add1d58](https://github.com/lockhinator/kubectl-guard/commit/add1d5806280b080d7a432f0b62ca61f17bcf60c))
+* shell completions (bash/zsh/fish/powershell) ([f92f12d](https://github.com/lockhinator/kubectl-guard/commit/f92f12da49c11a41e432758a5a3fe6115321e3aa)), closes [#39](https://github.com/lockhinator/kubectl-guard/issues/39)
+* sign releases with cosign + SLSA provenance + SBOM ([b8c4041](https://github.com/lockhinator/kubectl-guard/commit/b8c4041c3d3c23102d0adef95f7404143af99296))
+* sign releases with cosign + SLSA provenance + SBOM ([a2a5ea3](https://github.com/lockhinator/kubectl-guard/commit/a2a5ea3fd69903c00cd5d856c1e37d146dbc9b97)), closes [#77](https://github.com/lockhinator/kubectl-guard/issues/77)
+* signal handling (graceful SIGINT/SIGTERM with audit) ([4bfbd6b](https://github.com/lockhinator/kubectl-guard/commit/4bfbd6bafa227133b57f078b19c85f27a1f07ffb))
+* tamper-evident audit log (hash-chained + verify) ([658f56a](https://github.com/lockhinator/kubectl-guard/commit/658f56a4ced1097e2357d6b7a1c4499f017cae7c)), closes [#78](https://github.com/lockhinator/kubectl-guard/issues/78)
+* tamper-evident audit log (hash-chained integrity + verify) ([2bb755c](https://github.com/lockhinator/kubectl-guard/commit/2bb755c9c763c6e1cf6e6d2316d071fe41430696))
+* uninstall command (remove shim, guided PATH cleanup, --purge) ([b997f09](https://github.com/lockhinator/kubectl-guard/commit/b997f09f93551dd87f301087843a7e557a92b678))
+* uninstall command (remove shim, guided PATH cleanup, --purge) ([96ee4b1](https://github.com/lockhinator/kubectl-guard/commit/96ee4b1e4449c636e4ccd29fc7aaeab5ed34a3ee)), closes [#87](https://github.com/lockhinator/kubectl-guard/issues/87)
+* warn or fail closed on a tamperable config (permission check) ([f449d99](https://github.com/lockhinator/kubectl-guard/commit/f449d9930f14c48c573a6bda94109bae73c5fa87)), closes [#34](https://github.com/lockhinator/kubectl-guard/issues/34)
+
+
+### Bug Fixes
+
+* close in-cluster namespace fail-open; correct explain/doctor attribution ([40cd32a](https://github.com/lockhinator/kubectl-guard/commit/40cd32aefef52284e0ff24a62d7cb89255e181c3))
+* close in-cluster namespace fail-open; correct explain/doctor attribution ([9112d1b](https://github.com/lockhinator/kubectl-guard/commit/9112d1bbd4c3624a6338b3e774731baa0d909adc))
+* handle kubectl-not-found gracefully with an actionable message ([87f8d79](https://github.com/lockhinator/kubectl-guard/commit/87f8d7953422dcc9f76b35c61fe33072288de853))
+* surface an actionable message when kubectl is missing ([37f693e](https://github.com/lockhinator/kubectl-guard/commit/37f693e22e50201996268f4fc1d6ddb06eebd938)), closes [#33](https://github.com/lockhinator/kubectl-guard/issues/33)
+
+
+### Miscellaneous Chores
+
+* release v1.0.0 ([6fcf7e8](https://github.com/lockhinator/kubectl-guard/commit/6fcf7e832ca47a648de16abfb8169a6d3e10565d))
+
 ## [0.6.0](https://github.com/lockhinator/kubectl-guard/compare/v0.5.0...v0.6.0) (2026-07-10)
 
 

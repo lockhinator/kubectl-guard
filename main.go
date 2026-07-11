@@ -57,6 +57,7 @@ var guardConfigSubcommands = map[string]bool{
 	"audit-syslog":          true,
 	"command-override":      true,
 	"unknown-verb":          true,
+	"redact-output":         true,
 	"confirm-weakening":     true,
 	"require-justification": true,
 	"audit":                 true,
@@ -914,6 +915,134 @@ func execKubectl(args []string) error {
 	return err
 }
 
+// qualifiesForOutputRedaction reports whether an ALLOWED command takes the #108
+// opt-in redaction path instead of syscall.Exec. All four conditions must hold, so
+// the path is UNREACHABLE unless the operator explicitly opted in AND the command
+// is a shape the guard can safely parse document-at-a-time:
+//
+//   - redact_output is explicitly "structured" (default "off" never qualifies —
+//     off is byte-for-byte identical to today);
+//   - the verb is `get` (built-in classification; not consulting command_overrides,
+//     which cannot make a non-get verb emit a parseable get document);
+//   - it is NOT a watch (-w/--watch streams forever and can never be parsed);
+//   - the output format is exactly "json" or "yaml" (a table/wide/name/jsonpath/
+//     custom-columns/go-template read is not a document the guard parses, so it
+//     keeps syscall.Exec).
+//
+// Everything else — every mutation, every interactive verb, and every read that is
+// not a machine-format get — falls through to syscall.Exec unchanged.
+func qualifiesForOutputRedaction(cfg *config.Config, args []string) bool {
+	if cfg.RedactOutputMode() != config.RedactOutputStructured {
+		return false
+	}
+	if verb, _ := guard.ExtractCommand(args); verb != "get" {
+		return false
+	}
+	p := guard.ParseArgs(args)
+	if p.Watch {
+		return false
+	}
+	switch p.OutputFormat {
+	case "json", "yaml":
+		return true
+	default:
+		return false
+	}
+}
+
+// runRedactedGet runs the REAL kubectl as a CHILD process (not syscall.Exec) with
+// a piped stdout, streams its output through guard.RedactStructuredStream to blank
+// KNOWN sensitive fields, and re-emits to os.Stdout. It is reached only from the
+// qualifiesForOutputRedaction gate.
+//
+// Fidelity vs the syscall.Exec passthrough:
+//   - stdin/stderr: passed through directly (cmd.Stdin = os.Stdin, cmd.Stderr =
+//     os.Stderr), so prompts, errors, and progress are unchanged.
+//   - exit code: kubectl's is authoritative — a failed `get` still exits non-zero.
+//     An *exec.ExitError propagates via os.Exit(code); any other start/wait error is
+//     returned to the top-level handler.
+//   - signals: SIGINT/SIGTERM are forwarded to the child so Ctrl-C works; when the
+//     child dies from a signal the guard exits 128+N to match the syscall.Exec
+//     baseline (a parent process must translate the WaitStatus itself — ExitCode()
+//     would otherwise collapse a signal death to 255).
+//   - There is NO PTY on this path (it is a non-interactive machine-format read, so
+//     kubectl needs no terminal); interactive verbs never reach here.
+//
+// Memory: RedactStructuredStream streams from the pipe to os.Stdout decoding
+// document-at-a-time; the whole output is never buffered as one string.
+func runRedactedGet(args []string, format string) error {
+	kubectl, err := guard.RealKubectlPath()
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			ui.PrintWarning("kubectl not found on PATH. Install kubectl (https://kubernetes.io/docs/tasks/tools/) or fix your PATH.")
+			os.Exit(1)
+		}
+		return err
+	}
+
+	cmd := exec.Command(kubectl, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			ui.PrintWarning("kubectl not found on PATH. Install kubectl (https://kubernetes.io/docs/tasks/tools/) or fix your PATH.")
+			os.Exit(1)
+		}
+		return err
+	}
+
+	// Forward SIGINT/SIGTERM to the child so Ctrl-C and a supervisor's TERM reach
+	// kubectl (with syscall.Exec they went straight to kubectl; as a parent process
+	// the guard must relay them). Stopped after Wait so the handler does not outlive
+	// the child.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case s := <-sigCh:
+				if cmd.Process != nil {
+					_ = cmd.Process.Signal(s)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Stream + redact. A redact error is best-effort (RedactStructuredStream already
+	// fails open internally); log to stderr but still Wait so the exit code and any
+	// buffered kubectl error surface.
+	redactErr := guard.RedactStructuredStream(stdout, os.Stdout, format)
+	waitErr := cmd.Wait()
+	close(done)
+
+	if redactErr != nil {
+		fmt.Fprintln(os.Stderr, "kubectl-guard: warning: output redaction error: "+redactErr.Error())
+	}
+
+	// kubectl's exit code is authoritative. A signal-killed child needs the
+	// kernel/shell 128+N convention to match the syscall.Exec passthrough baseline:
+	// ExitError.ExitCode() returns -1 for a signaled process, so os.Exit(-1) would
+	// surface 255 instead of e.g. 143 for SIGTERM. Translate the signal ourselves
+	// (a parent process, unlike syscall.Exec, must).
+	var ee *exec.ExitError
+	if errors.As(waitErr, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			os.Exit(128 + int(ws.Signal()))
+		}
+		os.Exit(ee.ExitCode())
+	}
+	return waitErr
+}
+
 // reportError is the single sink for errors that reach the top level. It writes
 // to stderr in one consistent shape — "kubectl-guard: error: <msg>" for humans,
 // or a structured {"error": "..."} object when --json was requested — instead of
@@ -1515,6 +1644,15 @@ func runGuard(args []string) error {
 			outcome = guard.OutcomeDryRun
 		}
 		audit(outcome, "")
+		// #108 output redaction: the ONLY place the guard leaves the syscall.Exec
+		// passthrough. It engages ONLY when redact_output is explicitly "structured"
+		// AND the command is a non-interactive, non-watch `get -o json|yaml`. In
+		// every other case (redact_output off — the default — or any command that
+		// does not qualify) the guard still syscall.Exec's, byte-for-byte identical
+		// to before this feature (HARD INVARIANT #1/#2).
+		if qualifiesForOutputRedaction(cfg, forwarded) {
+			return runRedactedGet(forwarded, guard.ParseArgs(forwarded).OutputFormat)
+		}
 		return execKubectl(forwarded)
 	}
 
@@ -2267,6 +2405,41 @@ func newConfigCommand() *cobra.Command {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "redact-output [off|structured]",
+		Short: "Show or set opt-in structured redaction of get -o json|yaml output",
+		Long: "Blank KNOWN sensitive fields (Secret data/stringData, a container\n" +
+			"env[].value) in the output of a non-interactive, non-watch `get -o\n" +
+			"json|yaml`, running kubectl as a child and re-emitting the redacted\n" +
+			"document. 'off' (default) is byte-for-byte identical to no guard on the\n" +
+			"output path (syscall.Exec passthrough).\n\n" +
+			"It is best-effort defense-in-depth against ACCIDENTAL disclosure (a secret\n" +
+			"scrolling in an agent-captured terminal), NOT a containment boundary: an\n" +
+			"unparseable document passes through UNREDACTED (fail-open), and only known\n" +
+			"schemas are touched (never a CRD, never free text). Every other command —\n" +
+			"mutations, interactive verbs, table/jsonpath/wide reads, and `get -w` —\n" +
+			"keeps the untouched syscall.Exec passthrough.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Redact output: " + cfg.RedactOutputMode())
+				return nil
+			}
+			if !cfg.SetRedactOutputMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.RedactOutputOff, config.RedactOutputStructured)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Redact output set: " + cfg.RedactOutputMode())
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "command-override [safe <verb> | dangerous <verb> | remove <verb>]",
 		Short: "Override the built-in safe/state-altering classification of a verb",
 		Long: "Tailor command classification without forking. `safe` makes a verb\n" +
@@ -2625,6 +2798,7 @@ func printConfig() error {
 		ui.PrintInfo(fmt.Sprintf("Sensitive kinds (%s): %s", cfg.SensitiveKindMode(), strings.Join(cfg.SensitiveKinds, ", ")))
 	}
 	ui.PrintInfo("Unknown verb: " + cfg.UnknownVerbMode())
+	ui.PrintInfo("Redact output: " + cfg.RedactOutputMode())
 	ui.PrintInfo("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
 
 	printActorPolicies(cfg)
@@ -2946,6 +3120,12 @@ Config subcommands:
                              How to treat a verb the guard cannot classify on a
                              protected target: allow (default), gate (confirm),
                              or deny (refuse). Unprotected targets always pass
+  redact-output [off|structured]
+                             Opt-in structured redaction of get -o json|yaml
+                             output: blank known sensitive fields (Secret
+                             data/stringData, container env values). off
+                             (default) is byte-identical syscall.Exec passthrough;
+                             best-effort defense-in-depth, not a boundary
   confirm-weakening [on|off] Require confirmation for a config change that weakens
                              protection (every config change is audited regardless)
   audit                      Show the audit log path and recent entries

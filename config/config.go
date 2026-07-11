@@ -81,6 +81,21 @@ const (
 	SensitiveKindBlock   = "block"   // refuse on any context
 )
 
+// Output-redaction modes control the OPT-IN structured redaction of read output
+// (#108). "off" (default) keeps the guard's byte-for-byte syscall.Exec passthrough
+// — the guard never sees a byte of kubectl's output. "structured" engages the
+// redaction path ONLY for a non-interactive, non-watch `get` with `-o json|yaml`:
+// the guard runs kubectl as a child with a piped stdout, blanks KNOWN sensitive
+// fields (Secret data/stringData, a container env[].value) in the parsed document,
+// and re-emits. It is best-effort defense-in-depth against ACCIDENTAL disclosure
+// (a secret scrolling in an agent-captured terminal), explicitly NOT a containment
+// boundary — an unparseable document passes through UNREDACTED (fail-open) rather
+// than dropping the user's read. Every other command keeps syscall.Exec untouched.
+const (
+	RedactOutputOff        = "off"        // default: no redaction; syscall.Exec passthrough
+	RedactOutputStructured = "structured" // redact known fields on get -o json|yaml
+)
+
 // In-cluster policies decide what happens when the guard runs with no named
 // context (inside a pod on the serviceaccount config, or CI with an in-cluster
 // kubeconfig) and protected contexts are configured. Without a context name the
@@ -482,6 +497,13 @@ type Config struct {
 	// gated (it changes nothing). See guard.BlastRadius for the classifier.
 	BlastRadius string `yaml:"blast_radius,omitempty"`
 
+	// RedactOutput is the OPT-IN structured-output redaction mode (#108): "off"
+	// (default) or "structured". Off is byte-for-byte identical to no guard on the
+	// output path (syscall.Exec). Structured engages ONLY on a non-interactive,
+	// non-watch `get -o json|yaml`, blanking KNOWN sensitive fields; it is
+	// best-effort defense-in-depth, NOT a containment boundary. See RedactOutputMode.
+	RedactOutput string `yaml:"redact_output,omitempty"`
+
 	// CommandOverrides lets a team tailor the built-in safe/state-altering verb
 	// classification without forking: mark a custom/plugin verb dangerous, or a
 	// default-safe verb (e.g. logs) as requiring confirmation. See ClassifyOverride.
@@ -818,6 +840,30 @@ func (c *Config) BlastRadiusMode() string {
 	default:
 		return BlastRadiusOff
 	}
+}
+
+// RedactOutputMode returns the output-redaction policy, defaulting to off. It
+// returns RedactOutputStructured ONLY when the field is exactly that value;
+// every other value — including the empty default and an invalid string (caught
+// by Validate, which fails the config closed) — is off. Nil-safe: a nil config
+// is off, so the redaction path is unreachable unless "structured" is explicitly
+// configured (HARD INVARIANT #1: off is byte-for-byte identical to today).
+func (c *Config) RedactOutputMode() string {
+	if c != nil && c.RedactOutput == RedactOutputStructured {
+		return RedactOutputStructured
+	}
+	return RedactOutputOff
+}
+
+// SetRedactOutputMode sets the output-redaction policy if valid. The valid-value
+// check is validRedactOutputMode (config/validate.go), shared with Validate, so
+// the setter and validator can never disagree.
+func (c *Config) SetRedactOutputMode(mode string) bool {
+	if !validRedactOutputMode(mode) {
+		return false
+	}
+	c.RedactOutput = mode
+	return true
 }
 
 // InClusterMode returns the configured in-cluster policy, defaulting to

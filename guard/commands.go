@@ -326,6 +326,21 @@ type ParsedArgs struct {
 	// delete, so --raw is a write vector as well as a read one.
 	Raw    string
 	HasRaw bool
+
+	// OutputFormat is the LOWERCASED value of -o / --output (e.g. "json", "yaml",
+	// "wide", "name", or the whole "jsonpath=..." for the templated forms). It is
+	// captured for the #108 output-redaction gate, which engages ONLY when this is
+	// exactly "json" or "yaml" (the machine formats the guard can parse). A
+	// "jsonpath=..."/"custom-columns=..."/"go-template=..." value never equals
+	// "json"/"yaml", so those correctly do not qualify. Additive: no existing gating
+	// decision reads this field.
+	OutputFormat string
+
+	// Watch is set by -w / --watch (a boolean; --watch=false is NOT a watch). A
+	// watch streams forever, so it MUST be excluded from the redaction path (it can
+	// never be piped/parsed document-at-a-time). Additive: read only by the
+	// redaction gate.
+	Watch bool
 }
 
 // HasImpersonation reports whether any --as / --as-group / --as-uid flag is
@@ -512,6 +527,19 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 				return true
 			}
 			return false
+		case c == 'o':
+			// -o / --output: capture the LOWERCASED format for the #108 redaction
+			// gate. It consumes the rest of the token (e.g. "-ojson", "-o=json", with
+			// an optional "="), or the next argument.
+			if len(shorthands) > 1 {
+				p.OutputFormat = strings.ToLower(strings.TrimPrefix(shorthands[1:], "="))
+				return false
+			}
+			if len(rest) > 0 {
+				p.OutputFormat = strings.ToLower(rest[0])
+				return true
+			}
+			return false
 		case shortTakesValue[c]:
 			// consumes the rest of the token, or the next argument.
 			if len(shorthands) > 1 {
@@ -519,9 +547,13 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 			}
 			return len(rest) > 0
 		default:
-			// boolean short flag. -A / --all-namespaces spans every namespace.
-			if c == 'A' {
+			// boolean short flag. -A / --all-namespaces spans every namespace;
+			// -w / --watch marks a streaming read (excluded from redaction).
+			switch c {
+			case 'A':
 				p.AllNamespaces = true
+			case 'w':
+				p.Watch = true
 			}
 			shorthands = shorthands[1:]
 		}
@@ -742,6 +774,29 @@ func ParseArgs(args []string) ParsedArgs {
 					p.FieldSelector = selVal
 				} else {
 					p.Selector = selVal
+				}
+			case "--output":
+				// Capture the LOWERCASED output format for the #108 redaction gate.
+				// (--output is in knownLongFlags so its space-form value was already
+				// consumed; this additionally records the value.)
+				if hasInline {
+					p.OutputFormat = strings.ToLower(val)
+				} else if i+1 < len(args) {
+					p.OutputFormat = strings.ToLower(args[i+1])
+					skipNext = true
+				}
+			case "--watch":
+				// Boolean, like --all-namespaces: honor --watch=false (NOT a watch),
+				// and never consume the next argument (it would swallow a token). A
+				// watch streams forever and must be excluded from the redaction path.
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.Watch = b
+					} else {
+						p.Watch = true
+					}
+				} else {
+					p.Watch = true
 				}
 			case "--raw":
 				p.HasRaw = true

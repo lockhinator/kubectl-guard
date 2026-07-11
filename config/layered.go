@@ -206,6 +206,13 @@ func Merge(system, user *Config) *Config {
 	m.BlastRadius = mergeMode(system.BlastRadius, user.BlastRadius, BlastRadiusOff, orderBlastRadius)
 	m.UnknownVerb = mergeMode(system.UnknownVerb, user.UnknownVerb, UnknownVerbAllow, orderUnknownVerb)
 	m.InCluster = mergeMode(system.InCluster, user.InCluster, InClusterNamespace, orderInCluster)
+	// RedactOutput: "structured" is the more-protective value (it engages
+	// redaction), so it wins the merge. It is deliberately NOT in WeakensProtection
+	// — redaction is best-effort defense-in-depth, NOT a containment boundary, so
+	// toggling it is not a protection change the weakening-confirmation gate cares
+	// about (a user can still turn it on/off freely in their own layer, but a system
+	// baseline that turns it on floors the user at on).
+	m.RedactOutput = mergeMode(system.RedactOutput, user.RedactOutput, RedactOutputOff, orderRedactOutput)
 
 	// --- OR (tightening booleans: either true wins) ---
 	m.BlockImpersonation = system.BlockImpersonation || user.BlockImpersonation
@@ -260,6 +267,7 @@ var (
 	orderBlastRadius     = []string{BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock}
 	orderUnknownVerb     = []string{UnknownVerbAllow, UnknownVerbGate, UnknownVerbDeny}
 	orderInCluster       = []string{InClusterAllow, InClusterNamespace, InClusterDeny}
+	orderRedactOutput    = []string{RedactOutputOff, RedactOutputStructured}
 )
 
 // mergeMode combines a system and user mode value. The floor is the system's

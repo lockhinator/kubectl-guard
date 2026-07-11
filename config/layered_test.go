@@ -252,6 +252,8 @@ func TestMergeModeAxes(t *testing.T) {
 		{"confirmmode type-name>simple", func(c *Config, v string) { c.ConfirmMode = v }, func(c *Config) string { return c.ConfirmMode }, ConfirmModeSimple, ConfirmModeTypeName, ConfirmModeTypeName},
 		{"blast block>gate>off", func(c *Config, v string) { c.BlastRadius = v }, func(c *Config) string { return c.BlastRadius }, BlastRadiusGate, BlastRadiusOff, BlastRadiusGate},
 		{"sensitivekind block>confirm>off", func(c *Config, v string) { c.SensitiveKind = v }, func(c *Config) string { return c.SensitiveKind }, SensitiveKindConfirm, SensitiveKindOff, SensitiveKindConfirm},
+		{"redact structured>off (sys structured, user off)", func(c *Config, v string) { c.RedactOutput = v }, func(c *Config) string { return c.RedactOutput }, RedactOutputStructured, RedactOutputOff, RedactOutputStructured},
+		{"redact user-structured wins", func(c *Config, v string) { c.RedactOutput = v }, func(c *Config) string { return c.RedactOutput }, RedactOutputOff, RedactOutputStructured, RedactOutputStructured},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

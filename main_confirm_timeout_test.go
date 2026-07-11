@@ -1,3 +1,10 @@
+//go:build !windows
+
+// This test uses syscall.Mkfifo (a named pipe) to simulate a slow/blocking stdin
+// for the confirm-timeout path; Mkfifo is unix-only. Native Windows is a non-goal
+// (see the README "Platform support"), so the whole test file is unix-tagged to
+// keep `GOOS=windows go test ./...` compiling.
+
 package main
 
 import (

@@ -83,6 +83,27 @@ When an autonomous agent has cluster access, these are all one command away from
 
 kubectl-guard is the guardrail that catches every one of these — and works just as well for tired, distracted humans.
 
+## Platform support
+
+kubectl-guard runs on **Linux** and **macOS** (amd64 and arm64). Prebuilt
+binaries are published for both.
+
+**Native Windows is an explicit non-goal for v1.0.** The guard's whole model is
+unix-only: it replaces its own process with kubectl via `execve` (Windows has no
+equivalent), serializes its audit log with `flock`, and intercepts kubectl by
+PATH-shadowing a `kubectl` symlink. Porting these to Windows (spawn-and-proxy
+exec, `LockFileEx`, a `.exe`/`Get-Command` shim) is a substantial effort with no
+current demand.
+
+**Windows users: run kubectl-guard under [WSL2](https://learn.microsoft.com/windows/wsl/install).**
+Inside a WSL2 Linux distro the guard installs and works exactly as it does on
+Linux — install kubectl and kubectl-guard in WSL2 and run your `kubectl`
+commands there. Running the binary on native Windows prints this guidance and
+exits without doing anything.
+
+If native Windows support becomes worthwhile, it needs the exec/lock/shim port
+above before the GoReleaser `windows` target is re-enabled.
+
 ## Installation
 
 **mise** (recommended) — installs the prebuilt binary from GitHub Releases:

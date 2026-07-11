@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -63,7 +64,30 @@ var guardConfigSubcommands = map[string]bool{
 	"validate":              true,
 }
 
+// windowsUnsupportedMessage is printed when the guard is run on native Windows,
+// an explicit non-goal for v1.0 (the interception + process-replacement + audit
+// locking model is unix-only). It points at WSL2, where the guard works exactly
+// as on Linux. See the README "Platform support" section.
+const windowsUnsupportedMessage = `kubectl-guard: native Windows is not supported.
+
+The guard's interception model (PATH-shadowing a kubectl shim + process
+replacement) and audit locking are unix-only. Run kubectl-guard inside WSL2
+(Windows Subsystem for Linux), where it works exactly as on Linux:
+
+  1. Install WSL2:  wsl --install
+  2. Inside your WSL2 distro, install kubectl-guard as on Linux (see the README).
+  3. Use kubectl from within WSL2.
+
+See the "Platform support" section of the README for details.`
+
 func main() {
+	// Native Windows is a documented non-goal: fail early with actionable WSL2
+	// guidance rather than a cryptic unix-syscall error deeper in. On non-Windows
+	// builds runtime.GOOS is a compile-time constant, so this branch is eliminated.
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, windowsUnsupportedMessage)
+		os.Exit(1)
+	}
 	if err := run(); err != nil {
 		reportError(err)
 		os.Exit(1)

@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -175,10 +174,13 @@ func appendAuditFile(cfg *config.Config, path string, entry AuditEntry, key []by
 		return err
 	}
 	defer func() { _ = lockFile.Close() }()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	// lockExclusive/unlockFile are platform-specific: a real advisory flock on
+	// unix, no-ops on native Windows (a non-goal — the CLI exits with a WSL2
+	// message before any audit write, so the lock is never exercised there).
+	if err := lockExclusive(lockFile); err != nil {
 		return err
 	}
-	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
+	defer unlockFile(lockFile)
 
 	if cfg.AuditMaxSizeMB > 0 {
 		// Estimate the line size (chaining adds ~160 bytes of prev+hash) so rotation

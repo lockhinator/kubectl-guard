@@ -78,7 +78,17 @@ func run() error {
 	// emergency deploy). It is logged as "bypassed" so the audit trail records
 	// exactly what happened and who (actor) did it.
 	if boolEnv(config.EnvBypass) {
-		return runBypass(os.Args[1:])
+		// An enforced system baseline forbids the bypass escape hatch — otherwise
+		// enforcement would be one env var away from off (issue #86). Audit the
+		// refused attempt and fall through to the normal guarded path so the command
+		// still runs under protection. Without an enforced baseline, bypass behaves
+		// exactly as before.
+		if _, enforced := config.EnforcedSystemConfig(); enforced {
+			ui.PrintWarning("KUBECTL_GUARD_BYPASS is ignored: an enforced system config forbids bypass.")
+			auditRefusedBypass(os.Args[1:])
+		} else {
+			return runBypass(os.Args[1:])
+		}
 	}
 
 	if len(os.Args) > 1 {
@@ -202,6 +212,7 @@ func runDoctor(args []string) error {
 
 // doctorPostureKeys fixes the display order of the posture map.
 var doctorPostureKeys = []string{
+	"enforced_baseline",
 	"protected_contexts", "protected_namespaces", "protected_resources",
 	"sensitive_kinds", "context_mode", "namespace_mode", "confirm_mode",
 	"blast_radius", "sensitive_access", "unknown_verb", "audit_mode", "read_only",
@@ -232,26 +243,40 @@ func buildDoctorReport(requireInterception bool) doctorReport {
 		add("interception active", status, "kubectl does not resolve to the guard; only an alias/shim protects use — run 'make install-shim' to protect non-interactive/agent calls")
 	}
 
-	// Config: exists, loads, valid.
+	// Enforced system baseline (issue #86): report whether an enforced floor is
+	// active, its path, and a LIGHT perms check on the system file (integrity, not
+	// bypass — a hostile system file can only ADD protection). Full uid==0
+	// ancestor-ownership is deferred to #133.
+	if sysCfg, enforced := config.EnforcedSystemConfig(); sysCfg != nil || enforced {
+		if enforced {
+			add("system baseline", "ok", "enforced baseline active: "+config.SystemConfigPath)
+		} else {
+			add("system baseline", "ok", "system baseline present (not enforced): "+config.SystemConfigPath)
+		}
+		if insecure, detail, permErr := config.SystemConfigInsecurePerms(); permErr == nil && insecure {
+			add("system config permissions", "warn", detail)
+		}
+	}
+
+	// Config: exists, loads, valid. The decision path uses the EFFECTIVE (merged)
+	// config, so validate and posture reflect the enforced floor merged under the
+	// user layer.
 	var cfg *config.Config
-	exists, existsErr := config.Exists()
+	exists, existsErr := config.EffectiveExists()
 	switch {
 	case existsErr != nil:
 		add("config readable", "fail", "cannot stat config: "+existsErr.Error())
 	case !exists:
 		add("config readable", "warn", "no config file — the guard is unconfigured (run 'kubectl-guard config init')")
 	default:
-		c, err := config.Load()
+		c, _, err := config.LoadEffective()
 		if err != nil {
 			add("config valid", "fail", err.Error())
+		} else if problems := c.Validate(); len(problems) > 0 {
+			add("config valid", "fail", "invalid: "+strings.Join(problems, "; "))
 		} else {
-			c.ApplyDefaults()
-			if problems := c.Validate(); len(problems) > 0 {
-				add("config valid", "fail", "invalid: "+strings.Join(problems, "; "))
-			} else {
-				cfg = c
-				add("config valid", "ok", "loaded and valid")
-			}
+			cfg = c
+			add("config valid", "ok", "loaded and valid")
 		}
 	}
 
@@ -337,6 +362,9 @@ func doctorPosture(cfg *config.Config) map[string]string {
 	p["audit_mode"] = orDefault(cfg.AuditMode, config.AuditModeAll)
 	if cfg.ReadOnly {
 		p["read_only"] = "ON (freeze)"
+	}
+	if cfg.SystemEnforced() {
+		p["enforced_baseline"] = "ON (" + config.SystemConfigPath + ")"
 	}
 	return p
 }
@@ -818,6 +846,32 @@ func runBypass(args []string) error {
 		}
 	}
 	return execKubectl(args)
+}
+
+// auditRefusedBypass writes a best-effort audit entry recording a
+// KUBECTL_GUARD_BYPASS attempt that was REFUSED because an enforced system
+// baseline forbids bypass (issue #86). It loads the effective (merged) config so
+// the entry is written to the enforced/pinned audit sink and attributes the
+// impersonation/token like the main path. Failures are ignored (auditing is
+// best-effort); the command still runs guarded after this returns.
+func auditRefusedBypass(args []string) {
+	cfg, exists, err := config.LoadEffective()
+	if err != nil || !exists || cfg == nil {
+		return
+	}
+	e := guard.AuditEntry{
+		Command: guard.RedactCommand(args),
+		Outcome: guard.OutcomeDenied,
+		Reason:  "KUBECTL_GUARD_BYPASS refused: enforced system config forbids bypass",
+	}
+	p := guard.ParseArgs(args)
+	if imp := p.ImpersonationString(); imp != "" {
+		e.Impersonate = imp
+	}
+	if p.HasToken {
+		e.Token = true
+	}
+	_ = guard.AppendAudit(cfg, e)
 }
 
 // execKubectl hands off to the real kubectl and only returns if the process
@@ -1589,6 +1643,46 @@ func newConfigCommand() *cobra.Command {
 			},
 		})
 	}
+	// removeCmd is addCmd for a REMOVAL that must warn when the removed rule is
+	// still enforced by the SYSTEM baseline: the removal succeeds on the user file,
+	// but the rule STILL APPLIES via the most-restrictive merge, so a bare "Removed"
+	// would mislead the user into thinking protection dropped (issue #86). The
+	// stillEnforced predicate reports whether the system layer still carries the
+	// target (nil = never a system-backed rule, e.g. n/a).
+	removeCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool, valid func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective), stillEnforced func(*config.Config, string) bool) {
+		rootCmd.AddCommand(&cobra.Command{
+			Use:               use,
+			Short:             short,
+			Args:              cobra.ExactArgs(1),
+			Hidden:            hidden,
+			ValidArgsFunction: valid,
+			RunE: func(_ *cobra.Command, a []string) error {
+				target := a[0]
+				cfg, err := loadOrCreateConfig()
+				if err != nil {
+					return err
+				}
+				if !fn(cfg, target) {
+					ui.PrintInfo(fmt.Sprintf(noopTmpl, target))
+					// The rule may not be in the USER config yet still be enforced by the
+					// system baseline (a system-only rule shown as "[system]" in config
+					// list). Say so, so "not in your list" is not misread as "unprotected".
+					if sys, _ := config.EnforcedSystemConfig(); sys != nil && stillEnforced != nil && stillEnforced(sys, target) {
+						ui.PrintWarning("Note: '" + target + "' is enforced by the system baseline and continues to apply (it is not in your user config to remove).")
+					}
+					return nil
+				}
+				if err := saveConfig(cfg); err != nil {
+					return err
+				}
+				ui.PrintSuccess(fmt.Sprintf(doneTmpl, target))
+				if sys, _ := config.EnforcedSystemConfig(); sys != nil && stillEnforced != nil && stillEnforced(sys, target) {
+					ui.PrintWarning("Note: '" + target + "' was removed from your config, but is still enforced by the system baseline and continues to apply.")
+				}
+				return nil
+			},
+		})
+	}
 	// newAddProtectedCmd builds an add-context / add-namespace command with an
 	// optional --mode flag for a per-pattern protection mode. When --mode is NOT
 	// given, it calls the plain adder, which is a pure no-op on an existing pattern
@@ -1647,12 +1741,19 @@ func newConfigCommand() *cobra.Command {
 
 	rootCmd.AddCommand(newAddProtectedCmd("add-context <pattern>", "Add a context/pattern to the protected list (optional --mode)", "Added context: %s", "Context already protected: %s", false, (*config.Config).AddContext, (*config.Config).AddContextWithMode, completeAddContext))
 	rootCmd.AddCommand(newAddProtectedCmd("add <pattern>", "Alias for add-context", "Added context: %s", "Context already protected: %s", true, (*config.Config).AddContext, (*config.Config).AddContextWithMode, completeAddContext))
-	addCmd("remove-context <pattern>", "Remove a context/pattern from the protected list", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", false, completeRemoveContext)
-	addCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true, completeRemoveContext)
+	sysHasContext := func(sys *config.Config, t string) bool {
+		return stringInList(sys.ProtectedContextPatterns(), t)
+	}
+	sysHasNamespace := func(sys *config.Config, t string) bool {
+		return stringInList(sys.ProtectedNamespacePatterns(), t)
+	}
+	sysHasResource := func(sys *config.Config, t string) bool { return sys.IsResourceProtected(t) }
+	removeCmd("remove-context <pattern>", "Remove a context/pattern from the protected list", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", false, completeRemoveContext, sysHasContext)
+	removeCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true, completeRemoveContext, sysHasContext)
 	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false, completeAddResource)
-	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false, completeRemoveResource)
+	removeCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false, completeRemoveResource, sysHasResource)
 	rootCmd.AddCommand(newAddProtectedCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*; optional --mode)", "Protected namespace: %s", "Namespace already protected: %s", false, (*config.Config).AddNamespace, (*config.Config).AddNamespaceWithMode, nil))
-	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false, completeRemoveNamespace)
+	removeCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false, completeRemoveNamespace, sysHasNamespace)
 
 	// add-cluster protects by CLUSTER identity (the API server URL / a host glob),
 	// not the spoofable context name. It cannot reuse newAddProtectedCmd because
@@ -1697,7 +1798,7 @@ func newConfigCommand() *cobra.Command {
 	}
 	addClusterCmd.Flags().StringVar(&clusterModeRaw, "mode", "", "per-entry protection mode: confirm | block | - (inherit the global context_mode)")
 	rootCmd.AddCommand(addClusterCmd)
-	addCmd("remove-cluster <value>", "Remove a protected cluster (server URL, pattern, or its list key)", (*config.Config).RemoveProtectedCluster, "Removed protected cluster: %s", "Cluster not in protected list: %s", false, completeRemoveCluster)
+	removeCmd("remove-cluster <value>", "Remove a protected cluster (server URL, pattern, or its list key)", (*config.Config).RemoveProtectedCluster, "Removed protected cluster: %s", "Cluster not in protected list: %s", false, completeRemoveCluster, systemHasCluster)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "confirm-mode [simple|type-name|agent-relay]",
@@ -2432,7 +2533,11 @@ func configCommandString() string {
 }
 
 func printConfig() error {
-	exists, err := config.Exists()
+	// Show the EFFECTIVE (merged) config — the enforced SYSTEM baseline (if any)
+	// merged under the USER config — because that is what the guard actually
+	// enforces. Entries that come from the system baseline are tagged "[system]"
+	// so it is clear which rules the user cannot remove (issue #86).
+	cfg, exists, err := config.LoadEffective()
 	if err != nil {
 		return err
 	}
@@ -2441,9 +2546,17 @@ func printConfig() error {
 		return nil
 	}
 
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+	sys := cfg.SystemLayer()
+	if cfg.SystemEnforced() {
+		ui.PrintInfo(fmt.Sprintf("Enforced system baseline active (%s) — the entries tagged [system] below cannot be removed from your config.", config.SystemConfigPath))
+	} else if sys != nil {
+		ui.PrintInfo(fmt.Sprintf("System baseline present (%s, not enforced).", config.SystemConfigPath))
+	}
+	sysHas := func(has func(*config.Config) bool) string {
+		if sys != nil && has(sys) {
+			return "  [system]"
+		}
+		return ""
 	}
 
 	ui.PrintInfo("Protected contexts:")
@@ -2451,7 +2564,7 @@ func printConfig() error {
 		fmt.Println("  (none)")
 	} else {
 		for _, pp := range cfg.ProtectedContexts {
-			fmt.Printf("  - %s\n", formatPattern(pp))
+			fmt.Printf("  - %s%s\n", formatPattern(pp), sysHas(func(c *config.Config) bool { return stringInList(c.ProtectedContextPatterns(), pp.Pattern) }))
 		}
 	}
 
@@ -2460,7 +2573,7 @@ func printConfig() error {
 		fmt.Println("  (none)")
 	} else {
 		for _, r := range cfg.ProtectedResources {
-			fmt.Printf("  - %s\n", r)
+			fmt.Printf("  - %s%s\n", r, sysHas(func(c *config.Config) bool { return c.IsResourceProtected(r) }))
 		}
 	}
 
@@ -2469,7 +2582,7 @@ func printConfig() error {
 		fmt.Println("  (none)")
 	} else {
 		for _, pp := range cfg.ProtectedNamespaces {
-			fmt.Printf("  - %s\n", formatPattern(pp))
+			fmt.Printf("  - %s%s\n", formatPattern(pp), sysHas(func(c *config.Config) bool { return stringInList(c.ProtectedNamespacePatterns(), pp.Pattern) }))
 		}
 	}
 
@@ -2478,7 +2591,7 @@ func printConfig() error {
 		fmt.Println("  (none)")
 	} else {
 		for _, pc := range cfg.ProtectedClusters {
-			fmt.Printf("  - %s\n", formatClusterKey(pc))
+			fmt.Printf("  - %s%s\n", formatClusterKey(pc), sysHas(func(c *config.Config) bool { return stringInList(c.ProtectedClusterKeys(), clusterKey(pc)) }))
 		}
 	}
 
@@ -2494,7 +2607,11 @@ func printConfig() error {
 	printCommandOverrides(cfg)
 
 	auditPath, _ := config.AuditPath(cfg)
-	ui.PrintInfo("Audit log: " + auditPath)
+	if pinned, ok := cfg.PinnedAuditLog(); ok {
+		ui.PrintInfo("Audit log: " + auditPath + "  [system-pinned: " + pinned + "]")
+	} else {
+		ui.PrintInfo("Audit log: " + auditPath)
+	}
 	if cfg.AuditMaxSizeMB > 0 {
 		ui.PrintInfo(fmt.Sprintf("Audit rotation: %d MB, %d archive(s)", cfg.AuditMaxSizeMB, cfg.AuditMaxFilesOrDefault()))
 	}
@@ -2595,6 +2712,42 @@ func formatPattern(pp config.ProtectedPattern) string {
 		mode = "inherit"
 	}
 	return fmt.Sprintf("%s (%s)", pp.Pattern, mode)
+}
+
+// stringInList reports whether s is present in list.
+func stringInList(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// clusterKey renders the mode-less display key of a protected cluster
+// ("server=..." / "server_pattern=..."), matching config.ProtectedClusterKeys,
+// for system-provenance membership checks.
+func clusterKey(pc config.ProtectedCluster) string {
+	if pc.ServerPattern != "" {
+		return "server_pattern=" + pc.ServerPattern
+	}
+	return "server=" + pc.Server
+}
+
+// systemHasCluster reports whether the system baseline protects the cluster
+// identified by value (a raw server/pattern or a "server[_pattern]=" list key),
+// for the remove-cluster still-enforced note.
+func systemHasCluster(sys *config.Config, value string) bool {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "server_pattern=")
+	value = strings.TrimPrefix(value, "server=")
+	for _, k := range sys.ProtectedClusterKeys() {
+		id := strings.TrimPrefix(strings.TrimPrefix(k, "server_pattern="), "server=")
+		if id == value {
+			return true
+		}
+	}
+	return false
 }
 
 // formatClusterKey renders a protected cluster with its mode for `config list` /
@@ -2700,6 +2853,13 @@ Protection model:
     any namespace is protected, since its targets cannot be known in advance.
   - Protected RESOURCES: any command touching the resource is blocked
     everywhere (reads included), e.g. block all secret access.
+  - Layered/ENFORCED config: an admin may place a system baseline at
+    /etc/kubectl-guard/config.yaml. It is merged UNDER your ~/.kubectl-guard.yaml
+    most-restrictive-wins (the user layer can only ADD protection, never weaken
+    it). With 'enforced: true' the baseline also forbids the env escape hatches
+    (KUBECTL_GUARD_BYPASS / KUBECTL_GUARD_AUDIT_LOG / KUBECTL_GUARD_CONFIG), so it
+    cannot be turned off by an environment variable. 'config list' tags the
+    entries that come from the system baseline with [system].
   - Dry-run (--dry-run=client|server) skips the prompt; real-mutation forms
     (--dry-run=none|false, plain apply) still gate. Resource blocks still apply.
   - The --context / --kubeconfig / --namespace flags are honored; --server

@@ -90,7 +90,7 @@ func run() error {
 			}
 			return runGuard(os.Args[1:])
 		case "doctor":
-			return runDoctor()
+			return runDoctor(os.Args[2:])
 		case "freeze":
 			return runFreeze(true)
 		case "unfreeze":
@@ -125,33 +125,240 @@ func run() error {
 // runDoctor reports whether PATH-shadowing interception is active and where
 // the real kubectl lives. Output is human-readable and routed to stderr to
 // keep stdout clean (consistent with the guard's other user-facing messages).
-func runDoctor() error {
-	r := guard.Doctor()
+// doctorCheck is one health check in the doctor report.
+type doctorCheck struct {
+	Name   string `json:"name"`
+	Status string `json:"status"` // ok | warn | fail
+	Detail string `json:"detail,omitempty"`
+}
 
-	ui.PrintInfo("guard binary:  " + orUnknown(r.GuardPath))
+// doctorReport is the full doctor result: the checks, the effective protection
+// posture, and whether every check passed (no fail).
+type doctorReport struct {
+	Checks  []doctorCheck     `json:"checks"`
+	Posture map[string]string `json:"posture"`
+	Healthy bool              `json:"healthy"`
+}
 
-	ui.PrintInfo("kubectl on PATH (in order):")
-	if len(r.KubectlOnPath) == 0 {
-		fmt.Fprintln(os.Stderr, "  (none - kubectl is not on PATH)")
+// runDoctor answers "is the guard actually protecting me?" It runs a battery of
+// checks (kubectl reachable, interception, config valid + permissions, audit log
+// writable, current context resolvable), reports the effective posture, and exits
+// 0 only if no check FAILED. --json emits the structured report.
+func runDoctor(args []string) error {
+	// --require-interception promotes an inactive PATH-shadow from a warning to a
+	// hard failure, so CI/monitoring can gate on it. Off by default because an
+	// alias install is legitimate and invisible to the process (a shell alias is
+	// not a PATH entry) — but an environment with neither a shim NOR an alias
+	// leaves the guard out of an agent's call path, so a strict deployment wants
+	// this to fail closed.
+	requireInterception := hasFlag(args, "--require-interception")
+	report := buildDoctorReport(requireInterception)
+
+	if jsonRequested(args) {
+		b, err := json.Marshal(report)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		if !report.Healthy {
+			os.Exit(1)
+		}
+		return nil
+	}
+
+	for _, c := range report.Checks {
+		line := c.Name
+		if c.Detail != "" {
+			line += ": " + c.Detail
+		}
+		switch c.Status {
+		case "ok":
+			ui.PrintSuccess(line)
+		case "warn":
+			ui.PrintWarning(line)
+		default:
+			fmt.Fprintln(os.Stderr, "✗ "+line)
+		}
+	}
+	if len(report.Posture) > 0 {
+		ui.PrintInfo("")
+		ui.PrintInfo("Effective posture:")
+		for _, k := range doctorPostureKeys {
+			if v, ok := report.Posture[k]; ok {
+				fmt.Fprintf(os.Stderr, "  %-20s %s\n", k+":", v)
+			}
+		}
+	}
+	if !report.Healthy {
+		ui.PrintWarning("doctor found one or more failed checks.")
+		os.Exit(1)
+	}
+	return nil
+}
+
+// doctorPostureKeys fixes the display order of the posture map.
+var doctorPostureKeys = []string{
+	"protected_contexts", "protected_namespaces", "protected_resources",
+	"sensitive_kinds", "context_mode", "namespace_mode", "confirm_mode",
+	"blast_radius", "sensitive_access", "unknown_verb", "audit_mode", "read_only",
+}
+
+// buildDoctorReport runs every doctor check and assembles the posture. When
+// requireInterception is set, an inactive PATH-shadow is a FAIL (not a warn).
+func buildDoctorReport(requireInterception bool) doctorReport {
+	var checks []doctorCheck
+	add := func(name, status, detail string) {
+		checks = append(checks, doctorCheck{Name: name, Status: status, Detail: detail})
+	}
+
+	// kubectl reachability + PATH-shadowing interception.
+	d := guard.Doctor()
+	if d.RealKubectlPath != "" {
+		add("kubectl reachable", "ok", d.RealKubectlPath)
 	} else {
-		for _, p := range r.KubectlOnPath {
-			fmt.Fprintf(os.Stderr, "  - %s\n", p)
+		add("kubectl reachable", "fail", "kubectl not found on PATH — install it or fix PATH")
+	}
+	if d.Intercepted {
+		add("interception active", "ok", "kubectl resolves to the guard (PATH-shadowing)")
+	} else {
+		status := "warn"
+		if requireInterception {
+			status = "fail"
+		}
+		add("interception active", status, "kubectl does not resolve to the guard; only an alias/shim protects use — run 'make install-shim' to protect non-interactive/agent calls")
+	}
+
+	// Config: exists, loads, valid.
+	var cfg *config.Config
+	exists, existsErr := config.Exists()
+	switch {
+	case existsErr != nil:
+		add("config readable", "fail", "cannot stat config: "+existsErr.Error())
+	case !exists:
+		add("config readable", "warn", "no config file — the guard is unconfigured (run 'kubectl-guard config init')")
+	default:
+		c, err := config.Load()
+		if err != nil {
+			add("config valid", "fail", err.Error())
+		} else {
+			c.ApplyDefaults()
+			if problems := c.Validate(); len(problems) > 0 {
+				add("config valid", "fail", "invalid: "+strings.Join(problems, "; "))
+			} else {
+				cfg = c
+				add("config valid", "ok", "loaded and valid")
+			}
 		}
 	}
 
-	if r.Intercepted {
-		ui.PrintSuccess("interception: ACTIVE - kubectl resolves to the guard")
+	// Config permissions (tamper signal, #34).
+	if insecure, detail, err := config.InsecureConfigPerms(); err == nil && insecure {
+		status := "warn"
+		if cfg != nil && cfg.StrictPerms() {
+			status = "fail"
+		}
+		add("config permissions", status, detail)
+	} else if exists {
+		add("config permissions", "ok", "not group/world-writable")
+	}
+
+	// Audit log writability.
+	if auditPath, err := config.AuditPath(cfg); err != nil {
+		add("audit log writable", "fail", err.Error())
+	} else if werr := auditWritable(auditPath); werr != nil {
+		add("audit log writable", "fail", auditPath+": "+werr.Error())
 	} else {
-		ui.PrintWarning("interception: INACTIVE - kubectl does NOT resolve to the guard")
-		ui.PrintInfo("Run 'make install-shim' and prepend the shim directory to PATH to intercept non-interactive/agent calls.")
+		add("audit log writable", "ok", auditPath)
 	}
 
-	if r.RealKubectlPath != "" {
-		ui.PrintInfo("real kubectl:  " + r.RealKubectlPath)
-	} else if r.Err != nil {
-		ui.PrintWarning("could not resolve the real kubectl: " + r.Err.Error())
+	// Current context resolvable (fail closed if protected contexts are set).
+	ctx, ctxErr := guard.GetCurrentContext()
+	switch {
+	case ctxErr == nil && ctx != "":
+		add("current context resolvable", "ok", ctx)
+	case cfg != nil && len(cfg.ProtectedContexts) > 0:
+		add("current context resolvable", "fail", "cannot resolve the current context; with protected contexts configured, every command fails closed until this is fixed")
+	default:
+		add("current context resolvable", "warn", "no current context resolved (no protected contexts, so reads still pass)")
 	}
 
+	healthy := true
+	for _, c := range checks {
+		if c.Status == "fail" {
+			healthy = false
+		}
+	}
+	return doctorReport{Checks: checks, Posture: doctorPosture(cfg), Healthy: healthy}
+}
+
+// doctorPosture summarizes the effective protection posture for the report.
+func doctorPosture(cfg *config.Config) map[string]string {
+	if cfg == nil {
+		return nil
+	}
+	p := map[string]string{}
+	if len(cfg.ProtectedContexts) > 0 {
+		var parts []string
+		for _, pp := range cfg.ProtectedContexts {
+			parts = append(parts, formatPattern(pp))
+		}
+		p["protected_contexts"] = strings.Join(parts, ", ")
+	}
+	if len(cfg.ProtectedNamespaces) > 0 {
+		var parts []string
+		for _, pp := range cfg.ProtectedNamespaces {
+			parts = append(parts, formatPattern(pp))
+		}
+		p["protected_namespaces"] = strings.Join(parts, ", ")
+	}
+	if len(cfg.ProtectedResources) > 0 {
+		p["protected_resources"] = strings.Join(cfg.ProtectedResources, ", ")
+	}
+	if cfg.HasSensitiveKinds() {
+		p["sensitive_kinds"] = strings.Join(cfg.SensitiveKinds, ", ") + " (" + cfg.SensitiveKindMode() + ")"
+	}
+	p["context_mode"] = orDefault(cfg.ContextMode, config.ContextModeConfirm)
+	p["namespace_mode"] = orDefault(cfg.NamespaceMode, config.NamespaceModeConfirm)
+	p["confirm_mode"] = orDefault(cfg.ConfirmMode, config.ConfirmModeSimple)
+	p["blast_radius"] = cfg.BlastRadiusMode()
+	p["sensitive_access"] = cfg.SensitiveAccessMode()
+	p["unknown_verb"] = cfg.UnknownVerbMode()
+	p["audit_mode"] = orDefault(cfg.AuditMode, config.AuditModeAll)
+	if cfg.ReadOnly {
+		p["read_only"] = "ON (freeze)"
+	}
+	return p
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// auditWritable reports whether the audit log path can be written without
+// actually creating the log: it probes an existing file with an append open, or
+// the parent directory with a temp file it removes.
+func auditWritable(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	}
+	// Probe the parent dir with a UNIQUE temp file (os.CreateTemp uses O_EXCL and
+	// won't follow a pre-planted symlink to create a file at an attacker-chosen
+	// path, and its unique name avoids a fixed-name collision between concurrent
+	// doctor runs).
+	f, err := os.CreateTemp(filepath.Dir(path), ".kubectl-guard-doctor-probe-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
 	return nil
 }
 
@@ -201,13 +408,6 @@ func runExplain(args []string) error {
 func nonEmpty(s, fallback string) string {
 	if s == "" {
 		return fallback
-	}
-	return s
-}
-
-func orUnknown(s string) string {
-	if s == "" {
-		return "(unknown)"
 	}
 	return s
 }
@@ -346,6 +546,19 @@ func reportError(err error) {
 func jsonRequested(args []string) bool {
 	_, jsonMode := guard.StripGuardFlags(args)
 	return jsonMode
+}
+
+// hasFlag reports whether flag appears in args before the "--" separator.
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if a == flag {
+			return true
+		}
+	}
+	return false
 }
 
 // guardFlagErrorFunc prints usage for a flag-parse error (the one error class
@@ -1713,7 +1926,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(&cobra.Command{
 		Use:   "doctor",
 		Short: "Check PATH-shadowing interception, config, and posture",
-		RunE:  func(_ *cobra.Command, _ []string) error { return runDoctor() },
+		RunE:  func(_ *cobra.Command, _ []string) error { return runDoctor(nil) },
 	})
 	root.AddCommand(&cobra.Command{
 		Use:   "explain",
@@ -2041,7 +2254,12 @@ Usage:
   kubectl-guard explain [--json] -- <kubectl args...>
                                       Preflight: would this be gated, and why?
                                       (runs the decision without kubectl/prompt/audit)
-  kubectl-guard doctor                Check PATH-shadowing interception
+  kubectl-guard doctor [--json] [--require-interception]
+                                      Health check: interception, config,
+                                      audit, context resolution, and posture
+                                      (exit non-zero if any check fails;
+                                      --require-interception makes an inactive
+                                      PATH-shadow a failure, for CI gating)
   kubectl-guard freeze                Global read-only mode: block ALL
                                       state-altering commands (incident switch)
   kubectl-guard unfreeze              Lift read-only mode

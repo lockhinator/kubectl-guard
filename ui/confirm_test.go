@@ -105,3 +105,18 @@ func TestReadLineNoTimeout(t *testing.T) {
 		t.Errorf("line = %q, want %q", line, "hello\n")
 	}
 }
+
+// TestReadLineDoesNotOverRead: two consecutive readLine calls on one reader must
+// each get their own line — a shared/buffered reader over-read and swallowed the
+// second line (the confirm answer then a required justification). #95.
+func TestReadLineDoesNotOverRead(t *testing.T) {
+	r := strings.NewReader("y\nfixing outage\n")
+	l1, _ := readLine(r, 0)
+	l2, _ := readLine(r, 0)
+	if strings.TrimSpace(l1) != "y" {
+		t.Errorf("first line = %q, want y", l1)
+	}
+	if strings.TrimSpace(l2) != "fixing outage" {
+		t.Errorf("second line = %q, want 'fixing outage' (over-read bug)", l2)
+	}
+}

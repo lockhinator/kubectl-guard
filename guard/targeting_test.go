@@ -103,7 +103,7 @@ func TestParseArgsNoIdentityFlags(t *testing.T) {
 // configured must fail closed (Deny). Reverting the --server check makes this
 // resolve the current context and return RequireConfirmation/Allow.
 func TestCheckServerDeniesWhenContextsProtected(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, err := checkWith([]string{"--server=https://evil:6443", "delete", "pod", "nginx"}, staticContext("dev"))
 	if res != Deny {
@@ -129,7 +129,7 @@ func TestCheckServerAllowedWhenNoContextsProtected(t *testing.T) {
 // denies any --as command (even a read).
 func TestCheckBlockImpersonationPolicy(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:  []string{"prod-*"},
+		ProtectedContexts:  config.Patterns("prod-*"),
 		BlockImpersonation: true,
 	})
 	defer cleanup()
@@ -142,7 +142,7 @@ func TestCheckBlockImpersonationPolicy(t *testing.T) {
 // TestCheckImpersonationAllowedWhenPolicyOff: default (policy off) -> --as on a
 // protected read-only command is allowed (unchanged).
 func TestCheckImpersonationAllowedWhenPolicyOff(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"--context=prod-cluster", "--as=dev", "get", "pods"}, staticContext("prod-cluster"))
 	if res != Allow {
@@ -153,7 +153,7 @@ func TestCheckImpersonationAllowedWhenPolicyOff(t *testing.T) {
 // TestCheckNormalCommandsUnaffected: no targeting/identity flags -> a
 // state-altering command on a protected context still requires confirmation.
 func TestCheckNormalCommandsUnaffected(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"--context=prod-cluster", "delete", "pod", "nginx"}, staticContext("prod-cluster"))
 	if res != RequireConfirmation {

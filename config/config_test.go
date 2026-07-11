@@ -120,7 +120,7 @@ func TestIsContextProtected(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{ProtectedContexts: tt.patterns}
+			cfg := &Config{ProtectedContexts: Patterns(tt.patterns...)}
 			got := cfg.IsContextProtected(tt.context)
 			if got != tt.protected {
 				t.Errorf("IsContextProtected(%q) = %v, want %v", tt.context, got, tt.protected)
@@ -130,7 +130,7 @@ func TestIsContextProtected(t *testing.T) {
 }
 
 func TestAddContext(t *testing.T) {
-	cfg := &Config{ProtectedContexts: []string{"existing"}}
+	cfg := &Config{ProtectedContexts: Patterns("existing")}
 
 	// Add new context
 	if !cfg.AddContext("new-context") {
@@ -150,7 +150,7 @@ func TestAddContext(t *testing.T) {
 }
 
 func TestRemoveContext(t *testing.T) {
-	cfg := &Config{ProtectedContexts: []string{"first", "second", "third"}}
+	cfg := &Config{ProtectedContexts: Patterns("first", "second", "third")}
 
 	// Remove existing
 	if !cfg.RemoveContext("second") {
@@ -190,7 +190,7 @@ func TestSaveAndLoad(t *testing.T) {
 
 	// Test Save
 	cfg := &Config{
-		ProtectedContexts: []string{"prod-cluster", "prod-*"},
+		ProtectedContexts: Patterns("prod-cluster", "prod-*"),
 	}
 	if err := Save(cfg); err != nil {
 		t.Fatal(err)
@@ -213,8 +213,8 @@ func TestSaveAndLoad(t *testing.T) {
 	if len(loaded.ProtectedContexts) != 2 {
 		t.Errorf("Expected 2 contexts, got %d", len(loaded.ProtectedContexts))
 	}
-	if loaded.ProtectedContexts[0] != "prod-cluster" {
-		t.Errorf("Expected first context 'prod-cluster', got %q", loaded.ProtectedContexts[0])
+	if loaded.ProtectedContexts[0].Pattern != "prod-cluster" {
+		t.Errorf("Expected first context 'prod-cluster', got %q", loaded.ProtectedContexts[0].Pattern)
 	}
 
 	// Verify file content has header
@@ -425,7 +425,7 @@ func TestSaveIsAtomic(t *testing.T) {
 
 	// Write initial config
 	cfg := &Config{
-		ProtectedContexts: []string{"prod-cluster"},
+		ProtectedContexts: Patterns("prod-cluster"),
 	}
 	if err := Save(cfg); err != nil {
 		t.Fatal(err)
@@ -445,7 +445,7 @@ func TestSaveIsAtomic(t *testing.T) {
 
 	// Attempt to save a modified config (should fail)
 	cfg2 := &Config{
-		ProtectedContexts: []string{"prod-cluster", "staging-cluster"},
+		ProtectedContexts: Patterns("prod-cluster", "staging-cluster"),
 	}
 	err = Save(cfg2)
 	if err == nil {

@@ -9,7 +9,7 @@ import (
 // TestCommandOverrideStateAltering: a custom verb marked state_altering is gated
 // on a protected context; without the override it passes (unknown verb).
 func TestCommandOverrideStateAltering(t *testing.T) {
-	cleanupOff := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanupOff := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	// Unknown custom verb with no override → not state-altering → passes.
 	if res, _, _, _ := checkWith([]string{"my-plugin", "sync"}, staticContext("prod-1")); res != Allow {
 		t.Errorf("custom verb with no override = %v, want Allow", res)
@@ -17,7 +17,7 @@ func TestCommandOverrideStateAltering(t *testing.T) {
 	cleanupOff()
 
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		CommandOverrides:  config.CommandOverrides{StateAltering: []string{"my-plugin"}},
 	})
 	defer cleanup()
@@ -34,7 +34,7 @@ func TestCommandOverrideStateAltering(t *testing.T) {
 // makes it require confirmation on a protected context.
 func TestCommandOverrideUnsafeSafe(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		CommandOverrides:  config.CommandOverrides{UnsafeSafe: []string{"logs"}},
 	})
 	defer cleanup()
@@ -42,7 +42,7 @@ func TestCommandOverrideUnsafeSafe(t *testing.T) {
 		t.Errorf("logs moved to unsafe_safe on protected context = %v, want RequireConfirmation", res)
 	}
 	// Without the override, logs is a safe read → passes.
-	cleanup2 := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup2 := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup2()
 	if res, _, _, _ := checkWith([]string{"logs", "mypod"}, staticContext("prod-1")); res != Allow {
 		t.Errorf("logs with no override on protected context = %v, want Allow (default safe)", res)
@@ -53,7 +53,7 @@ func TestCommandOverrideUnsafeSafe(t *testing.T) {
 // passes through (a deliberate, documented downgrade).
 func TestCommandOverrideSafeDowngrade(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		CommandOverrides:  config.CommandOverrides{Safe: []string{"scale"}},
 	})
 	defer cleanup()
@@ -70,7 +70,7 @@ func TestCommandOverrideSafeDoesNotBypassOrthogonalBlocks(t *testing.T) {
 	// safe: [delete] + blast_radius: block — a single delete passes (downgrade),
 	// but a wide `delete --all` is still Blocked by blast-radius.
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		BlastRadius:       config.BlastRadiusBlock,
 		CommandOverrides:  config.CommandOverrides{Safe: []string{"delete"}},
 	})
@@ -96,7 +96,7 @@ func TestCommandOverrideSafeDoesNotBypassOrthogonalBlocks(t *testing.T) {
 // TestCommandOverrideBuiltinsUnchanged: with no overrides, built-in classification
 // is unchanged.
 func TestCommandOverrideBuiltinsUnchanged(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	if res, _, _, _ := checkWith([]string{"delete", "pod", "x"}, staticContext("prod-1")); res != RequireConfirmation {
 		t.Errorf("delete with no overrides = %v, want RequireConfirmation", res)

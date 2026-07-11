@@ -31,16 +31,23 @@ func WeakensProtection(old, new *Config) []string {
 	}
 	var w []string
 
-	// Removed protected targets — the headline weakening.
-	w = append(w, removedEach("removed protected context", old.ProtectedContexts, new.ProtectedContexts)...)
+	// Removed protected targets — the headline weakening. Contexts/namespaces are
+	// per-pattern, so a REMOVED pattern OR a DOWNGRADED per-pattern effective mode
+	// both count (see weakenedPatterns).
+	w = append(w, weakenedPatterns("context", old.ProtectedContexts, new.ProtectedContexts, old.effectiveContextMode(), new.effectiveContextMode())...)
+	w = append(w, weakenedPatterns("namespace", old.ProtectedNamespaces, new.ProtectedNamespaces, old.effectiveNamespaceMode(), new.effectiveNamespaceMode())...)
+	// Cluster-identity protection inherits the global CONTEXT mode, so a removed
+	// entry or a per-entry mode downgrade is weakening on the same axis as contexts.
+	w = append(w, weakenedClusters(old.ProtectedClusters, new.ProtectedClusters, old.effectiveContextMode(), new.effectiveContextMode())...)
 	w = append(w, removedEach("removed protected resource", old.ProtectedResources, new.ProtectedResources)...)
-	w = append(w, removedEach("removed protected namespace", old.ProtectedNamespaces, new.ProtectedNamespaces)...)
+	w = append(w, removedEach("removed sensitive kind", old.SensitiveKinds, new.SensitiveKinds)...)
 
 	// Mode downgrades (a lower strength rank is weaker).
 	w = weakerMode(w, "context_mode", contextModeRank, old.effectiveContextMode(), new.effectiveContextMode())
 	w = weakerMode(w, "namespace_mode", namespaceModeRank, old.effectiveNamespaceMode(), new.effectiveNamespaceMode())
 	w = weakerMode(w, "sensitive_access", sensitiveAccessRank, old.SensitiveAccessMode(), new.SensitiveAccessMode())
 	w = weakerMode(w, "blast_radius", blastRadiusRank, old.BlastRadiusMode(), new.BlastRadiusMode())
+	w = weakerMode(w, "sensitive_kind_mode", sensitiveKindRank, old.SensitiveKindMode(), new.SensitiveKindMode())
 	w = weakerMode(w, "unknown_verb", unknownVerbRank, old.UnknownVerbMode(), new.UnknownVerbMode())
 	w = weakerMode(w, "audit_mode", auditModeRank, auditModeOrDefault(old.AuditMode), auditModeOrDefault(new.AuditMode))
 	w = weakerMode(w, "in_cluster", inClusterRank, old.InClusterMode(), new.InClusterMode())
@@ -54,14 +61,23 @@ func WeakensProtection(old, new *Config) []string {
 	}
 
 	// Disabled guards / reduced audit coverage.
+	if old.ReadOnly && !new.ReadOnly {
+		w = append(w, "disabled read_only (unfreeze)")
+	}
 	if old.BlockImpersonation && !new.BlockImpersonation {
 		w = append(w, "disabled block_impersonation")
 	}
 	if old.RequireConfirmWeakening && !new.RequireConfirmWeakening {
 		w = append(w, "disabled require_confirm_weakening")
 	}
+	if old.RequireJustification && !new.RequireJustification {
+		w = append(w, "disabled require_justification")
+	}
 	if old.AuditSyslog && !new.AuditSyslog {
 		w = append(w, "disabled audit_syslog shipping")
+	}
+	if old.AuditHMACKeyFile != "" && new.AuditHMACKeyFile == "" {
+		w = append(w, "removed audit_hmac_key_file (audit chain no longer forgery-resistant)")
 	}
 	// A configured webhook that is CLEARED or REDIRECTED (to a different, possibly
 	// dead/attacker endpoint) defeats audit shipping — a redirect is stealthier
@@ -114,6 +130,7 @@ var (
 	namespaceModeRank   = map[string]int{NamespaceModeConfirm: 1, NamespaceModeBlock: 2}
 	sensitiveAccessRank = map[string]int{SensitiveAccessOff: 1, SensitiveAccessGate: 2, SensitiveAccessBlock: 3}
 	blastRadiusRank     = map[string]int{BlastRadiusOff: 1, BlastRadiusGate: 2, BlastRadiusBlock: 3}
+	sensitiveKindRank   = map[string]int{SensitiveKindOff: 1, SensitiveKindConfirm: 2, SensitiveKindBlock: 3}
 	unknownVerbRank     = map[string]int{UnknownVerbAllow: 1, UnknownVerbGate: 2, UnknownVerbDeny: 3}
 	auditModeRank       = map[string]int{AuditModeOff: 1, AuditModeGated: 2, AuditModeAll: 3}
 	inClusterRank       = map[string]int{InClusterAllow: 1, InClusterNamespace: 2, InClusterDeny: 3}
@@ -154,6 +171,85 @@ func removedEach2(old, new []string) []string {
 // addedEach returns the items present in new but not in old (exact match).
 func addedEach(old, new []string) []string {
 	return removedEach2(new, old)
+}
+
+// weakenedPatterns reports weakening of a per-pattern protected list (contexts or
+// namespaces): a pattern present in old but removed in new, or a pattern whose
+// PER-PATTERN EFFECTIVE mode dropped (block → confirm, or block → inherit when the
+// new global is confirm). Effective mode = the pattern's explicit mode, or the
+// respective global mode when it inherits.
+//
+// A pure inherit→inherit pair (both Mode=="") is skipped: any change there is a
+// change in the GLOBAL mode, already reported by the context_mode/namespace_mode
+// comparison, so counting it here too would double-report. Explicit→inherit and
+// explicit→explicit downgrades are still caught, since those are pattern-specific.
+func weakenedPatterns(kind string, old, new []ProtectedPattern, oldGlobal, newGlobal string) []string {
+	// confirm=1, block=2 for both axes (the ranks share values).
+	rank := contextModeRank
+	newByPattern := make(map[string]ProtectedPattern, len(new))
+	for _, p := range new {
+		newByPattern[p.Pattern] = p
+	}
+	var w []string
+	for _, o := range old {
+		n, ok := newByPattern[o.Pattern]
+		if !ok {
+			w = append(w, fmt.Sprintf("removed protected %s: %s", kind, o.Pattern))
+			continue
+		}
+		if o.Mode == "" && n.Mode == "" {
+			continue // pure inherit both sides — covered by the global comparison.
+		}
+		oldEff := o.Mode
+		if oldEff == "" {
+			oldEff = oldGlobal
+		}
+		newEff := n.Mode
+		if newEff == "" {
+			newEff = newGlobal
+		}
+		if rank[newEff] < rank[oldEff] {
+			w = append(w, fmt.Sprintf("downgraded protected %s %q mode from %q to %q", kind, o.Pattern, oldEff, newEff))
+		}
+	}
+	return w
+}
+
+// weakenedClusters reports weakening of the protected_clusters list: an entry
+// present in old but removed in new, or an entry whose per-entry EFFECTIVE mode
+// dropped (block → confirm, or block → inherit when the new global context mode is
+// confirm). Keyed by the display key so an exact server and a same-string pattern
+// do not collide. A pure inherit→inherit pair is skipped (that change is the
+// GLOBAL context_mode, already reported by the context_mode comparison).
+func weakenedClusters(old, new []ProtectedCluster, oldGlobal, newGlobal string) []string {
+	rank := contextModeRank // confirm=1, block=2
+	newByKey := make(map[string]ProtectedCluster, len(new))
+	for _, p := range new {
+		newByKey[p.key()] = p
+	}
+	var w []string
+	for _, o := range old {
+		n, ok := newByKey[o.key()]
+		if !ok {
+			w = append(w, "removed protected cluster: "+o.key())
+			continue
+		}
+		if o.Mode == "" && n.Mode == "" {
+			continue // pure inherit both sides — covered by the global comparison.
+		}
+		oldEff := o.Mode
+		if oldEff == "" {
+			oldEff = oldGlobal
+		}
+		newEff := n.Mode
+		if newEff == "" {
+			newEff = newGlobal
+		}
+		if rank[newEff] < rank[oldEff] {
+			w = append(w, fmt.Sprintf("downgraded protected cluster %q mode from %q to %q", o.key(), oldEff, newEff))
+		}
+	}
+	return w
 }
 
 // weakenedActorPolicies reports removed policies and per-actor mode downgrades.

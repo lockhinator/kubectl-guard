@@ -20,7 +20,21 @@ const (
 	EnvBypass             = "KUBECTL_GUARD_BYPASS"      // audited full bypass (discouraged)
 	EnvBootstrap          = "KUBECTL_GUARD_BOOTSTRAP"   // headless first-run posture
 	EnvAgentRelay         = "KUBECTL_GUARD_AGENT_RELAY" // emit needs-confirmation JSON instead of prompting
+	EnvStrict             = "KUBECTL_GUARD_STRICT"      // fail closed on a group/world-writable config
+	EnvConfig             = "KUBECTL_GUARD_CONFIG"      // override the config file location
+	EnvAuditLog           = "KUBECTL_GUARD_AUDIT_LOG"   // override the audit log location
+	EnvReadOnly           = "KUBECTL_GUARD_READONLY"    // global freeze: block all state-altering commands
 )
+
+// boolEnv reports whether an env var is set to a truthy value (1, t, true, yes,
+// y, case-insensitive). Empty/unset is false.
+func boolEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "t", "true", "yes", "y":
+		return true
+	}
+	return false
+}
 
 // Headless bootstrap modes. They decide what happens on the first run when
 // there is no config file, no KUBECTL_GUARD_* env config, and prompting is
@@ -69,7 +83,7 @@ func BootstrapMode() (mode string, valid bool) {
 // meaningless without something to protect). Empty tokens are skipped.
 func InitFromEnv() (cfg *Config, ok bool) {
 	cfg = &Config{}
-	cfg.ProtectedContexts = append(cfg.ProtectedContexts, splitCSV(os.Getenv(EnvProtectedContexts))...)
+	cfg.ProtectedContexts = append(cfg.ProtectedContexts, Patterns(splitCSV(os.Getenv(EnvProtectedContexts))...)...)
 	cfg.ProtectedResources = append(cfg.ProtectedResources, splitCSV(os.Getenv(EnvProtectedResources))...)
 	if m := strings.TrimSpace(os.Getenv(EnvConfirmMode)); isValidConfirmMode(m) {
 		cfg.ConfirmMode = m
@@ -82,7 +96,7 @@ func InitFromEnv() (cfg *Config, ok bool) {
 // like the env vars). It powers `config init`. Empty strings are ignored.
 func InitFromFlags(protectedContexts, protectedResources, confirmMode string) *Config {
 	cfg := &Config{}
-	cfg.ProtectedContexts = append(cfg.ProtectedContexts, splitCSV(protectedContexts)...)
+	cfg.ProtectedContexts = append(cfg.ProtectedContexts, Patterns(splitCSV(protectedContexts)...)...)
 	cfg.ProtectedResources = append(cfg.ProtectedResources, splitCSV(protectedResources)...)
 	if m := strings.TrimSpace(confirmMode); isValidConfirmMode(m) {
 		cfg.ConfirmMode = m
@@ -149,11 +163,11 @@ func RunSetup(contextNames []string, save func(*Config) error) bool {
 
 	// Build config from selections
 	cfg := &Config{
-		ProtectedContexts: make([]string, 0),
+		ProtectedContexts: make([]ProtectedPattern, 0),
 	}
 	for _, item := range selected {
 		if item.Selected {
-			cfg.ProtectedContexts = append(cfg.ProtectedContexts, item.Name)
+			cfg.ProtectedContexts = append(cfg.ProtectedContexts, ProtectedPattern{Pattern: item.Name})
 		}
 	}
 
@@ -168,7 +182,7 @@ func RunSetup(contextNames []string, save func(*Config) error) bool {
 	ui.PrintSuccess("Saved to " + path)
 
 	if len(cfg.ProtectedContexts) > 0 {
-		ui.PrintInfo("Protected: " + strings.Join(cfg.ProtectedContexts, ", "))
+		ui.PrintInfo("Protected: " + strings.Join(patternStrings(cfg.ProtectedContexts), ", "))
 	} else {
 		ui.PrintInfo("No contexts protected.")
 	}

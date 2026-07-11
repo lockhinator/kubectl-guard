@@ -20,6 +20,7 @@ var safeCommands = map[string]bool{
 	"get":           true,
 	"describe":      true,
 	"logs":          true,
+	"events":        true, // native read since k8s 1.23 (like `get events`)
 	"top":           true,
 	"explain":       true,
 	"api-resources": true,
@@ -325,6 +326,21 @@ type ParsedArgs struct {
 	// delete, so --raw is a write vector as well as a read one.
 	Raw    string
 	HasRaw bool
+
+	// OutputFormat is the LOWERCASED value of -o / --output (e.g. "json", "yaml",
+	// "wide", "name", or the whole "jsonpath=..." for the templated forms). It is
+	// captured for the #108 output-redaction gate, which engages ONLY when this is
+	// exactly "json" or "yaml" (the machine formats the guard can parse). A
+	// "jsonpath=..."/"custom-columns=..."/"go-template=..." value never equals
+	// "json"/"yaml", so those correctly do not qualify. Additive: no existing gating
+	// decision reads this field.
+	OutputFormat string
+
+	// Watch is set by -w / --watch (a boolean; --watch=false is NOT a watch). A
+	// watch streams forever, so it MUST be excluded from the redaction path (it can
+	// never be piped/parsed document-at-a-time). Additive: read only by the
+	// redaction gate.
+	Watch bool
 }
 
 // HasImpersonation reports whether any --as / --as-group / --as-uid flag is
@@ -511,6 +527,19 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 				return true
 			}
 			return false
+		case c == 'o':
+			// -o / --output: capture the LOWERCASED format for the #108 redaction
+			// gate. It consumes the rest of the token (e.g. "-ojson", "-o=json", with
+			// an optional "="), or the next argument.
+			if len(shorthands) > 1 {
+				p.OutputFormat = strings.ToLower(strings.TrimPrefix(shorthands[1:], "="))
+				return false
+			}
+			if len(rest) > 0 {
+				p.OutputFormat = strings.ToLower(rest[0])
+				return true
+			}
+			return false
 		case shortTakesValue[c]:
 			// consumes the rest of the token, or the next argument.
 			if len(shorthands) > 1 {
@@ -518,9 +547,13 @@ func (p *ParsedArgs) parseShortCluster(arg string, rest []string) (consumeNext b
 			}
 			return len(rest) > 0
 		default:
-			// boolean short flag. -A / --all-namespaces spans every namespace.
-			if c == 'A' {
+			// boolean short flag. -A / --all-namespaces spans every namespace;
+			// -w / --watch marks a streaming read (excluded from redaction).
+			switch c {
+			case 'A':
 				p.AllNamespaces = true
+			case 'w':
+				p.Watch = true
 			}
 			shorthands = shorthands[1:]
 		}
@@ -742,6 +775,29 @@ func ParseArgs(args []string) ParsedArgs {
 				} else {
 					p.Selector = selVal
 				}
+			case "--output":
+				// Capture the LOWERCASED output format for the #108 redaction gate.
+				// (--output is in knownLongFlags so its space-form value was already
+				// consumed; this additionally records the value.)
+				if hasInline {
+					p.OutputFormat = strings.ToLower(val)
+				} else if i+1 < len(args) {
+					p.OutputFormat = strings.ToLower(args[i+1])
+					skipNext = true
+				}
+			case "--watch":
+				// Boolean, like --all-namespaces: honor --watch=false (NOT a watch),
+				// and never consume the next argument (it would swallow a token). A
+				// watch streams forever and must be excluded from the redaction path.
+				if hasInline {
+					if b, err := strconv.ParseBool(val); err == nil {
+						p.Watch = b
+					} else {
+						p.Watch = true
+					}
+				} else {
+					p.Watch = true
+				}
 			case "--raw":
 				p.HasRaw = true
 				if hasInline {
@@ -841,6 +897,46 @@ func StripNoPrompt(args []string) (filtered []string, noPrompt bool) {
 // audited auto-confirm was requested. Like --json/--no-prompt, it belongs to
 // the guard and must never be forwarded to kubectl. Recognized as "--yes",
 // "--yes=true", or "--yes=false", and only before the "--" separator.
+// StripReason removes the guard-only --reason flag (a free-text justification for
+// a gated command) and returns the value. It accepts "--reason=<text>" and
+// "--reason <text>" (two tokens), honored only before the "--" separator so a
+// reason after "--" stays a kubectl arg. has is true whenever --reason appeared,
+// even with an empty value, so the caller can distinguish "no --reason" from
+// "--reason with empty text".
+func StripReason(args []string) (filtered []string, reason string, has bool) {
+	seenSep := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			seenSep = true
+			filtered = append(filtered, a)
+			continue
+		}
+		if !seenSep {
+			if a == "--reason" {
+				has = true
+				// Consume the next token as the value only if it looks like one — not
+				// the "--" separator and not another flag. This avoids eating a
+				// command verb or the separator when the value was forgotten
+				// (`--reason delete ...`, `--reason -- ...`); use --reason=<why> for a
+				// value that must start with "-".
+				if i+1 < len(args) && args[i+1] != "--" && !strings.HasPrefix(args[i+1], "-") {
+					reason = args[i+1]
+					i++ // consume the value token
+				}
+				continue
+			}
+			if strings.HasPrefix(a, "--reason=") {
+				reason = strings.TrimPrefix(a, "--reason=")
+				has = true
+				continue
+			}
+		}
+		filtered = append(filtered, a)
+	}
+	return filtered, reason, has
+}
+
 func StripYes(args []string) (filtered []string, yes bool) {
 	seenSep := false
 	for _, a := range args {

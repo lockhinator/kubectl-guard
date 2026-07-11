@@ -2,7 +2,6 @@
 package ui
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -100,11 +99,25 @@ func promptConfirm(out io.Writer, in io.Reader, timeout time.Duration, message, 
 // leaked goroutine never outlives it.
 func readLine(r io.Reader, timeout time.Duration) (line string, timedOut bool) {
 	read := func() string {
-		s, err := bufio.NewReader(r).ReadString('\n')
-		if err != nil {
-			return ""
+		// Read one byte at a time and stop right after the newline, so a second
+		// readLine on the same reader (e.g. the confirm answer then a required
+		// justification) sees the following line — a shared bufio.Reader would
+		// over-read and swallow it. An EOF/error before any newline returns ""
+		// (fail-safe: no input is a decline). The returned line includes the "\n".
+		var sb strings.Builder
+		buf := make([]byte, 1)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				sb.WriteByte(buf[0])
+				if buf[0] == '\n' {
+					return sb.String()
+				}
+			}
+			if err != nil {
+				return ""
+			}
 		}
-		return s
 	}
 
 	if timeout <= 0 {
@@ -119,6 +132,18 @@ func readLine(r io.Reader, timeout time.Duration) (line string, timedOut bool) {
 	case <-time.After(timeout):
 		return "", true
 	}
+}
+
+// PromptReason asks for a free-text justification (require_justification) and
+// returns the trimmed reason. An empty line, EOF, or timeout returns "" so the
+// caller can fail closed. It honors timeout like Confirm.
+func PromptReason(timeout time.Duration) string {
+	_, _ = fmt.Fprint(os.Stderr, "Reason (required): ")
+	line, timedOut := readLine(os.Stdin, timeout)
+	if timedOut {
+		return ""
+	}
+	return strings.TrimSpace(line)
 }
 
 // PrintSuccess prints a success message.

@@ -18,6 +18,12 @@ builds:
       - -s -w -X main.version={{.Version}}
     env:
       - CGO_ENABLED=0
+    # No windows target: native Windows is an explicit non-goal for v1.0 (issue
+    # #88). The interception/exec/lock model is unix-only; Windows users run the
+    # guard under WSL2 (a Linux distro), so the linux archives cover them. The
+    # binary still compiles for GOOS=windows and prints a WSL2 message, but we do
+    # not ship a Windows artifact. Re-adding a windows target needs the exec/lock/
+    # shim port first (see the README "Platform support" section).
     targets:
       - linux_amd64
       - linux_arm64
@@ -34,6 +40,92 @@ archives:
 
 checksum:
   name_template: 'checksums.txt'
+
+# Keyless cosign signing (#77). Sign the checksums file (which itself covers
+# every archive's SHA-256), so a verifier checks ONE signature, then validates
+# each archive against the signed checksums. Keyless = no private key to manage:
+# in CI, cosign uses the workflow's ambient OIDC token (the release job grants
+# id-token: write), and the signer identity is the GitHub Actions workflow.
+#
+# cosign v3 (the cosign-installer@v3 default) removed --output-signature/
+# --output-certificate in favor of a single Sigstore BUNDLE, so we emit
+# checksums.txt.sigstore.json (signature + signing certificate + Rekor entry in
+# one file) and publish it as a release asset. `--yes` skips the CI confirmation.
+# Verify with: cosign verify-blob --bundle checksums.txt.sigstore.json ...
+# (see the README "Verifying a release" section).
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: '${artifact}.sigstore.json'
+    args:
+      - sign-blob
+      - '--bundle=${signature}'
+      - '${artifact}'
+      - '--yes'
+    output: true
+
+# SBOM (#77): an SPDX-JSON SBOM per archive via syft (GoReleaser's default
+# format), attached to the release so consumers can audit the build's dependency
+# tree. Requires syft on PATH (the release job installs it).
+sboms:
+  - id: archive-sbom
+    artifacts: archive
+
+# Homebrew tap (#96, macOS): `brew install lockhinator/tap/kubectl-guard`.
+# GoReleaser generates a Homebrew CASK (the formula-based `brews:` is deprecated)
+# and pushes it to lockhinator/homebrew-tap. Casks are macOS-only; Linux users
+# install the .deb/.rpm/.apk packages below. The tap repo AND a
+# HOMEBREW_TAP_GITHUB_TOKEN secret (a token with contents:write on the tap repo —
+# the default GITHUB_TOKEN cannot push to a DIFFERENT repo) must exist before the
+# first release. Until then the push is skipped (skip_upload gates on the token
+# being present), so a release is never blocked just because the tap is not set up
+# yet. The release job always exports HOMEBREW_TAP_GITHUB_TOKEN (empty when the
+# secret is unset), so the token template resolves without error.
+homebrew_casks:
+  - name: kubectl-guard
+    binaries:
+      - kubectl-guard
+    repository:
+      owner: lockhinator
+      name: homebrew-tap
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+    directory: Casks
+    homepage: 'https://github.com/lockhinator/kubectl-guard'
+    description: 'Protect production clusters and sensitive resources from accidental kubectl commands'
+    skip_upload: '{{ if .Env.HOMEBREW_TAP_GITHUB_TOKEN }}false{{ else }}true{{ end }}'
+    # The macOS binaries are cosign-signed for supply-chain provenance, but NOT
+    # Apple-notarized, so Homebrew's default com.apple.quarantine attribute would
+    # make Gatekeeper kill the binary on first run (`kubectl-guard doctor` in the
+    # caveats would fail). Strip the quarantine xattr post-install so a brew-cask
+    # install is usable — GoReleaser's documented workaround for unsigned casks.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kubectl-guard"]
+          end
+    caveats: |
+      kubectl-guard protects by intercepting kubectl. After install, enable
+      interception (see the README "Installation" section): alias kubectl to
+      kubectl-guard, or install the PATH-shadowing shim, then verify with
+      `kubectl-guard doctor`.
+
+# Linux packages (#96): .deb / .rpm / .apk, built in-process by GoReleaser's
+# bundled nfpm (no external tooling). Installs the binary to /usr/bin.
+nfpms:
+  - id: linux-packages
+    package_name: kubectl-guard
+    homepage: 'https://github.com/lockhinator/kubectl-guard'
+    description: 'Protect production clusters and sensitive resources from accidental kubectl commands'
+    maintainer: 'Cameron Lockhart <cameronl.lockhart@gmail.com>'
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+
+# No `scoops:` (Windows/Scoop) channel: native Windows is a non-goal (#88); WSL2
+# users install the linux packages inside their distro.
 
 # release-please already generates the changelog; don't duplicate it.
 changelog:

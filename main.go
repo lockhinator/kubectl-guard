@@ -2,11 +2,18 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lockhinator/kubectl-guard/config"
@@ -23,37 +30,67 @@ var version = "dev"
 // "config <subcommand>" (e.g. "config use-context", "config view") is a kubectl
 // command and must be forwarded through the guard rather than intercepted.
 var guardConfigSubcommands = map[string]bool{
-	"setup":             true,
-	"init":              true,
-	"list":              true,
-	"add":               true,
-	"remove":            true,
-	"add-context":       true,
-	"remove-context":    true,
-	"add-resource":      true,
-	"remove-resource":   true,
-	"add-namespace":     true,
-	"remove-namespace":  true,
-	"confirm-mode":      true,
-	"context-mode":      true,
-	"namespace-mode":    true,
-	"blast-radius":      true,
-	"actor-policy":      true,
-	"audit-mode":        true,
-	"audit-rotation":    true,
-	"audit-webhook":     true,
-	"audit-syslog":      true,
-	"command-override":  true,
-	"unknown-verb":      true,
-	"confirm-weakening": true,
-	"audit":             true,
-	"path":              true,
-	"validate":          true,
+	"setup":                 true,
+	"init":                  true,
+	"list":                  true,
+	"add":                   true,
+	"remove":                true,
+	"add-context":           true,
+	"remove-context":        true,
+	"add-cluster":           true,
+	"remove-cluster":        true,
+	"add-resource":          true,
+	"remove-resource":       true,
+	"add-namespace":         true,
+	"remove-namespace":      true,
+	"confirm-mode":          true,
+	"context-mode":          true,
+	"namespace-mode":        true,
+	"blast-radius":          true,
+	"sensitive-kind":        true,
+	"add-sensitive-kind":    true,
+	"remove-sensitive-kind": true,
+	"actor-policy":          true,
+	"audit-mode":            true,
+	"audit-rotation":        true,
+	"audit-webhook":         true,
+	"audit-syslog":          true,
+	"command-override":      true,
+	"unknown-verb":          true,
+	"redact-output":         true,
+	"confirm-weakening":     true,
+	"require-justification": true,
+	"audit":                 true,
+	"path":                  true,
+	"validate":              true,
 }
 
+// windowsUnsupportedMessage is printed when the guard is run on native Windows,
+// an explicit non-goal for v1.0 (the interception + process-replacement + audit
+// locking model is unix-only). It points at WSL2, where the guard works exactly
+// as on Linux. See the README "Platform support" section.
+const windowsUnsupportedMessage = `kubectl-guard: native Windows is not supported.
+
+The guard's interception model (PATH-shadowing a kubectl shim + process
+replacement) and audit locking are unix-only. Run kubectl-guard inside WSL2
+(Windows Subsystem for Linux), where it works exactly as on Linux:
+
+  1. Install WSL2:  wsl --install
+  2. Inside your WSL2 distro, install kubectl-guard as on Linux (see the README).
+  3. Use kubectl from within WSL2.
+
+See the "Platform support" section of the README for details.`
+
 func main() {
+	// Native Windows is a documented non-goal: fail early with actionable WSL2
+	// guidance rather than a cryptic unix-syscall error deeper in. On non-Windows
+	// builds runtime.GOOS is a compile-time constant, so this branch is eliminated.
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, windowsUnsupportedMessage)
+		os.Exit(1)
+	}
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		reportError(err)
 		os.Exit(1)
 	}
 }
@@ -66,7 +103,17 @@ func run() error {
 	// emergency deploy). It is logged as "bypassed" so the audit trail records
 	// exactly what happened and who (actor) did it.
 	if boolEnv(config.EnvBypass) {
-		return runBypass(os.Args[1:])
+		// An enforced system baseline forbids the bypass escape hatch — otherwise
+		// enforcement would be one env var away from off (issue #86). Audit the
+		// refused attempt and fall through to the normal guarded path so the command
+		// still runs under protection. Without an enforced baseline, bypass behaves
+		// exactly as before.
+		if _, enforced := config.EnforcedSystemConfig(); enforced {
+			ui.PrintWarning("KUBECTL_GUARD_BYPASS is ignored: an enforced system config forbids bypass.")
+			auditRefusedBypass(os.Args[1:])
+		} else {
+			return runBypass(os.Args[1:])
+		}
 	}
 
 	if len(os.Args) > 1 {
@@ -80,9 +127,27 @@ func run() error {
 			}
 			return runGuard(os.Args[1:])
 		case "doctor":
-			return runDoctor()
+			return runDoctor(os.Args[2:])
+		case "uninstall":
+			return runUninstall(os.Args[2:])
+		case "freeze":
+			return runFreeze(true)
+		case "unfreeze":
+			return runFreeze(false)
 		case "explain":
 			return runExplain(os.Args[2:])
+		case "completion", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
+			// `completion <shell>` generates the guard's own completion script;
+			// `__complete`/`__completeNoDesc` are cobra's hidden runtime requests the
+			// sourced script issues. Only handle these when invoked by our own name.
+			// When invoked as the `kubectl` shim, these belong to KUBECTL's native
+			// (also cobra-based) completion — hijacking `kubectl __complete ...` would
+			// break the user's real kubectl tab-completion — so fall through to the
+			// normal guard path exactly as before this feature existed.
+			if invokedAsGuard() {
+				return runRootCompletion()
+			}
+			return runGuard(os.Args[1:])
 		case "--version", "-V":
 			fmt.Printf("kubectl-guard %s\n", version)
 			return nil
@@ -99,33 +164,265 @@ func run() error {
 // runDoctor reports whether PATH-shadowing interception is active and where
 // the real kubectl lives. Output is human-readable and routed to stderr to
 // keep stdout clean (consistent with the guard's other user-facing messages).
-func runDoctor() error {
-	r := guard.Doctor()
+// doctorCheck is one health check in the doctor report.
+type doctorCheck struct {
+	Name   string `json:"name"`
+	Status string `json:"status"` // ok | warn | fail
+	Detail string `json:"detail,omitempty"`
+}
 
-	ui.PrintInfo("guard binary:  " + orUnknown(r.GuardPath))
+// doctorReport is the full doctor result: the checks, the effective protection
+// posture, and whether every check passed (no fail).
+type doctorReport struct {
+	Checks  []doctorCheck     `json:"checks"`
+	Posture map[string]string `json:"posture"`
+	Healthy bool              `json:"healthy"`
+}
 
-	ui.PrintInfo("kubectl on PATH (in order):")
-	if len(r.KubectlOnPath) == 0 {
-		fmt.Fprintln(os.Stderr, "  (none - kubectl is not on PATH)")
+// runDoctor answers "is the guard actually protecting me?" It runs a battery of
+// checks (kubectl reachable, interception, config valid + permissions, audit log
+// writable, current context resolvable), reports the effective posture, and exits
+// 0 only if no check FAILED. --json emits the structured report.
+func runDoctor(args []string) error {
+	// --require-interception promotes an inactive PATH-shadow from a warning to a
+	// hard failure, so CI/monitoring can gate on it. Off by default because an
+	// alias install is legitimate and invisible to the process (a shell alias is
+	// not a PATH entry) — but an environment with neither a shim NOR an alias
+	// leaves the guard out of an agent's call path, so a strict deployment wants
+	// this to fail closed.
+	requireInterception := hasFlag(args, "--require-interception")
+	report := buildDoctorReport(requireInterception)
+
+	if jsonRequested(args) {
+		b, err := json.Marshal(report)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		if !report.Healthy {
+			os.Exit(1)
+		}
+		return nil
+	}
+
+	for _, c := range report.Checks {
+		line := c.Name
+		if c.Detail != "" {
+			line += ": " + c.Detail
+		}
+		switch c.Status {
+		case "ok":
+			ui.PrintSuccess(line)
+		case "warn":
+			ui.PrintWarning(line)
+		default:
+			fmt.Fprintln(os.Stderr, "✗ "+line)
+		}
+	}
+	if len(report.Posture) > 0 {
+		ui.PrintInfo("")
+		ui.PrintInfo("Effective posture:")
+		for _, k := range doctorPostureKeys {
+			if v, ok := report.Posture[k]; ok {
+				fmt.Fprintf(os.Stderr, "  %-20s %s\n", k+":", v)
+			}
+		}
+	}
+	if !report.Healthy {
+		ui.PrintWarning("doctor found one or more failed checks.")
+		os.Exit(1)
+	}
+	return nil
+}
+
+// doctorPostureKeys fixes the display order of the posture map.
+var doctorPostureKeys = []string{
+	"enforced_baseline",
+	"protected_contexts", "protected_namespaces", "protected_clusters", "protected_resources",
+	"sensitive_kinds", "context_mode", "namespace_mode", "confirm_mode",
+	"blast_radius", "sensitive_access", "unknown_verb", "audit_mode", "read_only",
+}
+
+// buildDoctorReport runs every doctor check and assembles the posture. When
+// requireInterception is set, an inactive PATH-shadow is a FAIL (not a warn).
+func buildDoctorReport(requireInterception bool) doctorReport {
+	var checks []doctorCheck
+	add := func(name, status, detail string) {
+		checks = append(checks, doctorCheck{Name: name, Status: status, Detail: detail})
+	}
+
+	// kubectl reachability + PATH-shadowing interception.
+	d := guard.Doctor()
+	if d.RealKubectlPath != "" {
+		add("kubectl reachable", "ok", d.RealKubectlPath)
 	} else {
-		for _, p := range r.KubectlOnPath {
-			fmt.Fprintf(os.Stderr, "  - %s\n", p)
+		add("kubectl reachable", "fail", "kubectl not found on PATH — install it or fix PATH")
+	}
+	if d.Intercepted {
+		add("interception active", "ok", "kubectl resolves to the guard (PATH-shadowing)")
+	} else {
+		status := "warn"
+		if requireInterception {
+			status = "fail"
+		}
+		add("interception active", status, "kubectl does not resolve to the guard; only an alias/shim protects use — run 'make install-shim' to protect non-interactive/agent calls")
+	}
+
+	// Enforced system baseline (issue #86): report whether an enforced floor is
+	// active, its path, and a LIGHT perms check on the system file (integrity, not
+	// bypass — a hostile system file can only ADD protection). Full uid==0
+	// ancestor-ownership is deferred to #133.
+	if sysCfg, enforced := config.EnforcedSystemConfig(); sysCfg != nil || enforced {
+		if enforced {
+			add("system baseline", "ok", "enforced baseline active: "+config.SystemConfigPath)
+		} else {
+			add("system baseline", "ok", "system baseline present (not enforced): "+config.SystemConfigPath)
+		}
+		if insecure, detail, permErr := config.SystemConfigInsecurePerms(); permErr == nil && insecure {
+			add("system config permissions", "warn", detail)
 		}
 	}
 
-	if r.Intercepted {
-		ui.PrintSuccess("interception: ACTIVE - kubectl resolves to the guard")
+	// Config: exists, loads, valid. The decision path uses the EFFECTIVE (merged)
+	// config, so validate and posture reflect the enforced floor merged under the
+	// user layer.
+	var cfg *config.Config
+	exists, existsErr := config.EffectiveExists()
+	switch {
+	case existsErr != nil:
+		add("config readable", "fail", "cannot stat config: "+existsErr.Error())
+	case !exists:
+		add("config readable", "warn", "no config file — the guard is unconfigured (run 'kubectl-guard config init')")
+	default:
+		c, _, err := config.LoadEffective()
+		if err != nil {
+			add("config valid", "fail", err.Error())
+		} else if problems := c.Validate(); len(problems) > 0 {
+			add("config valid", "fail", "invalid: "+strings.Join(problems, "; "))
+		} else {
+			cfg = c
+			add("config valid", "ok", "loaded and valid")
+		}
+	}
+
+	// Config permissions (tamper signal, #34).
+	if insecure, detail, err := config.InsecureConfigPerms(); err == nil && insecure {
+		status := "warn"
+		if cfg != nil && cfg.StrictPerms() {
+			status = "fail"
+		}
+		add("config permissions", status, detail)
+	} else if exists {
+		add("config permissions", "ok", "not group/world-writable")
+	}
+
+	// Audit log writability.
+	if auditPath, err := config.AuditPath(cfg); err != nil {
+		add("audit log writable", "fail", err.Error())
+	} else if werr := auditWritable(auditPath); werr != nil {
+		add("audit log writable", "fail", auditPath+": "+werr.Error())
 	} else {
-		ui.PrintWarning("interception: INACTIVE - kubectl does NOT resolve to the guard")
-		ui.PrintInfo("Run 'make install-shim' and prepend the shim directory to PATH to intercept non-interactive/agent calls.")
+		add("audit log writable", "ok", auditPath)
 	}
 
-	if r.RealKubectlPath != "" {
-		ui.PrintInfo("real kubectl:  " + r.RealKubectlPath)
-	} else if r.Err != nil {
-		ui.PrintWarning("could not resolve the real kubectl: " + r.Err.Error())
+	// Current context resolvable (fail closed if protected contexts are set).
+	ctx, ctxErr := guard.GetCurrentContext()
+	switch {
+	case ctxErr == nil && ctx != "":
+		add("current context resolvable", "ok", ctx)
+	case cfg != nil && len(cfg.ProtectedContexts) > 0:
+		add("current context resolvable", "fail", "cannot resolve the current context; with protected contexts configured, every command fails closed until this is fixed")
+	default:
+		add("current context resolvable", "warn", "no current context resolved (no protected contexts, so reads still pass)")
 	}
 
+	healthy := true
+	for _, c := range checks {
+		if c.Status == "fail" {
+			healthy = false
+		}
+	}
+	return doctorReport{Checks: checks, Posture: doctorPosture(cfg), Healthy: healthy}
+}
+
+// doctorPosture summarizes the effective protection posture for the report.
+func doctorPosture(cfg *config.Config) map[string]string {
+	if cfg == nil {
+		return nil
+	}
+	p := map[string]string{}
+	if len(cfg.ProtectedContexts) > 0 {
+		var parts []string
+		for _, pp := range cfg.ProtectedContexts {
+			parts = append(parts, formatPattern(pp))
+		}
+		p["protected_contexts"] = strings.Join(parts, ", ")
+	}
+	if len(cfg.ProtectedNamespaces) > 0 {
+		var parts []string
+		for _, pp := range cfg.ProtectedNamespaces {
+			parts = append(parts, formatPattern(pp))
+		}
+		p["protected_namespaces"] = strings.Join(parts, ", ")
+	}
+	if len(cfg.ProtectedClusters) > 0 {
+		var parts []string
+		for _, pc := range cfg.ProtectedClusters {
+			parts = append(parts, formatClusterKey(pc))
+		}
+		p["protected_clusters"] = strings.Join(parts, ", ")
+	}
+	if len(cfg.ProtectedResources) > 0 {
+		p["protected_resources"] = strings.Join(cfg.ProtectedResources, ", ")
+	}
+	if cfg.HasSensitiveKinds() {
+		p["sensitive_kinds"] = strings.Join(cfg.SensitiveKinds, ", ") + " (" + cfg.SensitiveKindMode() + ")"
+	}
+	p["context_mode"] = orDefault(cfg.ContextMode, config.ContextModeConfirm)
+	p["namespace_mode"] = orDefault(cfg.NamespaceMode, config.NamespaceModeConfirm)
+	p["confirm_mode"] = orDefault(cfg.ConfirmMode, config.ConfirmModeSimple)
+	p["blast_radius"] = cfg.BlastRadiusMode()
+	p["sensitive_access"] = cfg.SensitiveAccessMode()
+	p["unknown_verb"] = cfg.UnknownVerbMode()
+	p["audit_mode"] = orDefault(cfg.AuditMode, config.AuditModeAll)
+	if cfg.ReadOnly {
+		p["read_only"] = "ON (freeze)"
+	}
+	if cfg.SystemEnforced() {
+		p["enforced_baseline"] = "ON (" + config.SystemConfigPath + ")"
+	}
+	return p
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// auditWritable reports whether the audit log path can be written without
+// actually creating the log: it probes an existing file with an append open, or
+// the parent directory with a temp file it removes.
+func auditWritable(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	}
+	// Probe the parent dir with a UNIQUE temp file (os.CreateTemp uses O_EXCL and
+	// won't follow a pre-planted symlink to create a file at an attacker-chosen
+	// path, and its unique name avoids a fixed-name collision between concurrent
+	// doctor runs).
+	f, err := os.CreateTemp(filepath.Dir(path), ".kubectl-guard-doctor-probe-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
 	return nil
 }
 
@@ -179,11 +476,373 @@ func nonEmpty(s, fallback string) string {
 	return s
 }
 
-func orUnknown(s string) string {
-	if s == "" {
-		return "(unknown)"
+// runAuditVerify checks the tamper-evident audit chain and reports whether it is
+// intact or names the first broken line. Exits non-zero on a broken chain so CI /
+// monitoring can gate on it.
+func runAuditVerify(cfg *config.Config, path string) error {
+	// The HMAC key file is the root of trust for tamper-evidence: if any other
+	// user can read it they can forge valid entries. Warn on loose permissions.
+	if cfg != nil && cfg.AuditHMACKeyFile != "" {
+		if info, err := os.Stat(cfg.AuditHMACKeyFile); err == nil && info.Mode().Perm()&0o077 != 0 {
+			ui.PrintWarning(fmt.Sprintf("HMAC key file %s is group/world-accessible (mode %#o); the tamper-evidence guarantee depends on it being secret — chmod 600 it.", cfg.AuditHMACKeyFile, uint32(info.Mode().Perm())))
+		}
 	}
-	return s
+	res, err := guard.VerifyAuditLog(path, guard.AuditKey(cfg))
+	if err != nil {
+		if os.IsNotExist(err) {
+			ui.PrintInfo("No audit log to verify.")
+			return nil
+		}
+		return err
+	}
+	ui.PrintInfo("Audit log: " + path)
+	ui.PrintInfo(fmt.Sprintf("Entries: %d (%d chained, %d legacy/unchained)", res.Total, res.Chained, res.Legacy))
+	if !res.Intact {
+		ui.PrintWarning(fmt.Sprintf("Audit chain BROKEN at line %d: %s", res.BreakLine, res.BreakReason))
+		os.Exit(1)
+	}
+	if res.Chained == 0 {
+		if res.Legacy > 0 {
+			// Every append since v1.0 writes a hash, so a log with only unchained
+			// lines is either genuinely pre-v1.0 OR had every hash stripped to erase
+			// history — indistinguishable from the file alone. Fail closed: integrity
+			// cannot be confirmed. (Tail truncation of a chained log is separately
+			// undetectable without an off-box tip anchor — see the shipping sinks.)
+			ui.PrintWarning("Log has only UNCHAINED entries and no tamper-evident ones: either it predates v1.0 or every hash was stripped to erase history — integrity CANNOT be confirmed. Run any kubectl-guard command to start the chain, then re-verify.")
+			os.Exit(1)
+		}
+		ui.PrintInfo("Audit log is empty; nothing to verify.")
+		return nil
+	}
+	ui.PrintSuccess("Audit chain is INTACT.")
+	return nil
+}
+
+// runFreeze toggles global read-only / freeze mode (the incident panic button).
+// Enabling it strengthens protection; disabling it (unfreeze) weakens protection,
+// so the change routes through saveConfig — audited, and gated by
+// require_confirm_weakening on unfreeze.
+func runFreeze(on bool) error {
+	cfg, err := loadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	cfg.ReadOnly = on
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
+	if on {
+		ui.PrintSuccess("Read-only mode ENABLED (freeze): everything except known-safe reads is now blocked, everywhere (including unclassified plugin verbs). Reads still pass. Run 'kubectl-guard unfreeze' to lift.")
+	} else {
+		ui.PrintSuccess("Read-only mode DISABLED (unfreeze): state-altering commands are gated normally again.")
+	}
+	return nil
+}
+
+// runUninstall reverses the PATH-shadowing install: it removes the `kubectl`
+// shim symlink and the `kubectl-guard` binary copy from the shim directory,
+// prints the exact PATH line to strip from the user's shell rc (pointing at the
+// rc file that contains it, read-only), and verifies interception is now
+// inactive by reusing the doctor's PATH inspection. It is idempotent — a missing
+// shim is reported, not an error. --purge additionally removes the config file
+// and audit log after a confirmation (skipped with --yes). --shim-dir overrides
+// the default shim location for non-standard installs.
+func runUninstall(args []string) error {
+	purge := hasFlag(args, "--purge")
+	assumeYes := hasFlag(args, "--yes") || hasFlag(args, "-y")
+
+	defaultShimDir, err := guard.DefaultShimDir()
+	if err != nil {
+		return fmt.Errorf("cannot determine the shim directory: %w", err)
+	}
+	shimDir, custom, err := flagValue(args, "--shim-dir")
+	if err != nil {
+		return err
+	}
+	if !custom {
+		shimDir = defaultShimDir
+	}
+	// trusted marks the dir as unambiguously the guard's own shim location (the
+	// default), which lets removeShim delete a kubectl-guard binary COPY there. A
+	// custom --shim-dir is not trusted, so the binary is only removed when a
+	// kubectl shim symlink is found beside it — a mistargeted path at a real bin
+	// dir cannot silently delete the primary kubectl-guard binary. Compare cleaned
+	// paths so a non-canonical default (trailing slash, /./) still reads as trusted.
+	trusted := filepath.Clean(shimDir) == filepath.Clean(defaultShimDir)
+
+	res, err := removeShim(shimDir, trusted)
+	if err != nil {
+		return err
+	}
+	if res.removedKubectl || res.removedGuard {
+		ui.PrintSuccess("Removed the kubectl-guard shim from " + shimDir)
+	} else {
+		ui.PrintInfo("No kubectl-guard shim found in " + shimDir + " (nothing to remove).")
+	}
+	if res.skippedKubectl != "" {
+		ui.PrintWarning(res.skippedKubectl)
+	}
+	if res.skippedGuard != "" {
+		ui.PrintWarning(res.skippedGuard)
+	}
+
+	// The installer prepends the shim dir to PATH; tell the user the exact line
+	// to remove and — read-only — point at the rc file(s) that reference it.
+	pathLine := fmt.Sprintf("export PATH=%q", shimDir+":$PATH")
+	ui.PrintInfo("")
+	ui.PrintInfo("Remove this line from your shell config (~/.zshrc, ~/.bashrc) if present, then reload your shell:")
+	fmt.Fprintln(os.Stderr, "  "+pathLine)
+	if hits := shellConfigsContaining(shimDir); len(hits) > 0 {
+		ui.PrintInfo("The shim directory is referenced in:")
+		for _, h := range hits {
+			fmt.Fprintln(os.Stderr, "  "+h)
+		}
+	}
+
+	if purge {
+		if err := purgeGuardFiles(assumeYes); err != nil {
+			return err
+		}
+	}
+
+	// Verify interception is now inactive. PATH is unchanged in this process, but
+	// the shim files are gone, so the first kubectl on PATH now resolves to the
+	// real binary (or none). A still-active result means another shim precedes it
+	// on PATH or the current shell has not been reloaded.
+	d := guard.Doctor()
+	ui.PrintInfo("")
+	switch {
+	case d.Intercepted:
+		ui.PrintWarning("Interception still ACTIVE — another kubectl shim is earlier on PATH, or this shell has not reloaded its PATH. Run 'kubectl-guard doctor' after reloading your shell.")
+	case d.RealKubectlPath != "" && looksLikeGuardShim(d.RealKubectlPath):
+		// Doctor only recognizes THIS binary's inode as "the guard"; a SEPARATE
+		// kubectl-guard install earlier on PATH would otherwise be mislabeled as
+		// the real kubectl. Catch that so we don't falsely claim protection is off.
+		ui.PrintWarning("This shim is removed, but another kubectl-guard shim is still earlier on PATH (" + d.RealKubectlPath + "). Interception is STILL ACTIVE via that install — remove it too, then run 'kubectl-guard doctor' to confirm.")
+	default:
+		suffix := "."
+		if d.RealKubectlPath != "" {
+			suffix = " (" + d.RealKubectlPath + ")."
+		}
+		ui.PrintSuccess("Interception is now INACTIVE; kubectl resolves to the real binary" + suffix)
+	}
+	return nil
+}
+
+// looksLikeGuardShim reports whether the kubectl at path is itself a
+// kubectl-guard shim (a symlink whose resolved target is a kubectl-guard
+// binary). It catches a SECOND guard install left earlier on PATH, which
+// guard.Doctor — comparing only against the running binary's inode — would
+// otherwise mistake for the real kubectl.
+func looksLikeGuardShim(path string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(filepath.Base(resolved), "kubectl-guard")
+}
+
+// shimRemoval records what removeShim actually deleted, so runUninstall can
+// report accurately and stay idempotent.
+type shimRemoval struct {
+	removedKubectl bool
+	removedGuard   bool
+	removedDir     bool
+	skippedKubectl string // non-empty when a kubectl was intentionally left in place
+	skippedGuard   string // non-empty when a kubectl-guard binary was intentionally left in place
+}
+
+// removeShim deletes the guard's PATH-shadowing shim from dir: the `kubectl`
+// symlink (ONLY when it is a symlink — a real kubectl regular file is never
+// deleted, so a mistargeted --shim-dir cannot wipe the user's kubectl) and the
+// `kubectl-guard` binary, then the dir itself if it is left empty (via
+// os.Remove, which refuses a non-empty directory — the shim is never removed
+// recursively). Missing files are not an error.
+//
+// The kubectl-guard binary is removed only when the dir is trusted (the default
+// shim dir), the binary is a symlink, or a kubectl shim symlink was just removed
+// beside it. This mirrors the kubectl guarantee: a mistargeted custom --shim-dir
+// at a real bin dir (e.g. /usr/local/bin, $HOME/go/bin) will NOT silently delete
+// the primary kubectl-guard binary that lives there.
+func removeShim(dir string, trusted bool) (shimRemoval, error) {
+	var res shimRemoval
+
+	kubectlPath := filepath.Join(dir, "kubectl")
+	if info, err := os.Lstat(kubectlPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			if err := os.Remove(kubectlPath); err != nil {
+				return res, fmt.Errorf("removing shim symlink %s: %w", kubectlPath, err)
+			}
+			res.removedKubectl = true
+		} else {
+			res.skippedKubectl = fmt.Sprintf("%s is a regular file, not the guard's symlink — left untouched (delete it yourself if it is a stale shim).", kubectlPath)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return res, fmt.Errorf("inspecting %s: %w", kubectlPath, err)
+	}
+
+	guardPath := filepath.Join(dir, "kubectl-guard")
+	if info, err := os.Lstat(guardPath); err == nil {
+		isSymlink := info.Mode()&os.ModeSymlink != 0
+		if trusted || isSymlink || res.removedKubectl {
+			if err := os.Remove(guardPath); err != nil {
+				return res, fmt.Errorf("removing shim binary %s: %w", guardPath, err)
+			}
+			res.removedGuard = true
+		} else {
+			res.skippedGuard = fmt.Sprintf("%s left untouched: --shim-dir is not the default shim dir and no kubectl shim was found beside it, so this may be a real kubectl-guard binary (delete it yourself if it is a stale shim).", guardPath)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return res, fmt.Errorf("inspecting %s: %w", guardPath, err)
+	}
+
+	if res.removedKubectl || res.removedGuard {
+		if err := os.Remove(dir); err == nil {
+			res.removedDir = true
+		}
+	}
+	return res, nil
+}
+
+// purgeGuardFiles removes the config file, the audit log, its rotated archives
+// (<log>.N) and lock file after a confirmation (skipped when assumeYes). Missing
+// files are not an error. Powers `uninstall --purge`. Before deleting, it writes
+// a final audit record so a configured off-box sink (audit webhook) still
+// captures that the trail was destroyed.
+func purgeGuardFiles(assumeYes bool) error {
+	cfgPath, err := config.Path()
+	if err != nil {
+		return err
+	}
+	var cfg *config.Config
+	if exists, _ := config.Exists(); exists {
+		cfg, _ = config.Load()
+	}
+	auditPath, _ := config.AuditPath(cfg)
+
+	// auditFiles enumerates the audit log plus its rotated archives and lock file,
+	// so --purge does not claim to have wiped the trail while leaving <log>.1..N
+	// (or a stale <log>.lock) behind.
+	auditFiles := func() []string {
+		if auditPath == "" {
+			return nil
+		}
+		out := []string{auditPath, auditPath + ".lock"}
+		return append(out, auditArchives(auditPath)...)
+	}
+
+	// Existing files, for the confirmation preview.
+	var existing []string
+	for _, p := range append([]string{cfgPath}, auditFiles()...) {
+		if _, err := os.Lstat(p); err == nil {
+			existing = append(existing, p)
+		}
+	}
+	if len(existing) == 0 {
+		ui.PrintInfo("--purge: no config or audit files to remove.")
+		return nil
+	}
+
+	ui.PrintWarning("--purge will permanently delete:")
+	for _, p := range existing {
+		fmt.Fprintln(os.Stderr, "  - "+p)
+	}
+	if !assumeYes {
+		if ui.Confirm("Delete these files?", 0) != ui.ConfirmApproved {
+			ui.PrintInfo("Purge aborted; config and audit files left in place.")
+			return nil
+		}
+	}
+
+	// Record the purge in the audit chain BEFORE deleting it. If auditing is off
+	// this is a no-op (no local write, no recreation); if a webhook sink is
+	// configured, the destruction is captured off-box. Deletion below re-globs the
+	// audit files so an entry that (re)created or rotated the log is still removed.
+	if cfg != nil {
+		_ = guard.AppendAudit(cfg, guard.AuditEntry{
+			Command: "uninstall --purge",
+			Outcome: guard.OutcomeConfigChange,
+			Reason:  "removing config and audit log (uninstall --purge)",
+		})
+	}
+
+	for _, p := range append([]string{cfgPath}, auditFiles()...) {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("removing %s: %w", p, err)
+		}
+	}
+	ui.PrintSuccess("Removed the files listed above.")
+	return nil
+}
+
+// auditArchives returns the rotated audit archives (<path>.N, numeric suffix)
+// for the audit log at path, mirroring the guard's own rotation naming so
+// --purge removes the whole chain, not just the live log. The <path>.lock file
+// (non-numeric suffix) is intentionally not matched here — it is handled
+// separately.
+func auditArchives(path string) []string {
+	matches, _ := filepath.Glob(path + ".*")
+	var out []string
+	for _, m := range matches {
+		suffix := strings.TrimPrefix(m, path+".")
+		if _, err := strconv.Atoi(suffix); err == nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// shellConfigsContaining returns the shell rc files under $HOME that reference
+// needle (the shim directory), so uninstall can point the user at the exact file
+// whose PATH line to strip. It is strictly read-only — it never edits them.
+func shellConfigsContaining(needle string) []string {
+	home, err := os.UserHomeDir()
+	if err != nil || needle == "" {
+		return nil
+	}
+	var hits []string
+	for _, name := range []string{".zshrc", ".bashrc", ".bash_profile", ".profile"} {
+		data, err := os.ReadFile(filepath.Join(home, name))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), needle) {
+			hits = append(hits, filepath.Join(home, name))
+		}
+	}
+	return hits
+}
+
+// flagValue returns the value of a `--name value` or `--name=value` flag in
+// args, stopping at the "--" separator. found reports whether the flag was
+// present at all; err is non-nil when the flag was given without a usable value
+// (trailing, empty, or immediately followed by another flag) so a forgotten
+// value errors loudly instead of silently falling back to a default or eating
+// the next flag as a path.
+func flagValue(args []string, name string) (value string, found bool, err error) {
+	for i, a := range args {
+		if a == "--" {
+			return "", false, nil
+		}
+		if a == name {
+			if i+1 >= len(args) {
+				return "", true, fmt.Errorf("%s requires a directory argument", name)
+			}
+			v := args[i+1]
+			if v == "--" || strings.HasPrefix(v, "-") {
+				return "", true, fmt.Errorf("%s requires a directory argument (got %q)", name, v)
+			}
+			return v, true, nil
+		}
+		if strings.HasPrefix(a, name+"=") {
+			v := strings.TrimPrefix(a, name+"=")
+			if v == "" {
+				return "", true, fmt.Errorf("%s requires a non-empty directory argument", name)
+			}
+			return v, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // runBypass executes the command against the real kubectl with the guard fully
@@ -211,7 +870,231 @@ func runBypass(args []string) error {
 			_ = guard.AppendAudit(cfg, e)
 		}
 	}
-	return guard.ExecKubectl(args)
+	return execKubectl(args)
+}
+
+// auditRefusedBypass writes a best-effort audit entry recording a
+// KUBECTL_GUARD_BYPASS attempt that was REFUSED because an enforced system
+// baseline forbids bypass (issue #86). It loads the effective (merged) config so
+// the entry is written to the enforced/pinned audit sink and attributes the
+// impersonation/token like the main path. Failures are ignored (auditing is
+// best-effort); the command still runs guarded after this returns.
+func auditRefusedBypass(args []string) {
+	cfg, exists, err := config.LoadEffective()
+	if err != nil || !exists || cfg == nil {
+		return
+	}
+	e := guard.AuditEntry{
+		Command: guard.RedactCommand(args),
+		Outcome: guard.OutcomeDenied,
+		Reason:  "KUBECTL_GUARD_BYPASS refused: enforced system config forbids bypass",
+	}
+	p := guard.ParseArgs(args)
+	if imp := p.ImpersonationString(); imp != "" {
+		e.Impersonate = imp
+	}
+	if p.HasToken {
+		e.Token = true
+	}
+	_ = guard.AppendAudit(cfg, e)
+}
+
+// execKubectl hands off to the real kubectl and only returns if the process
+// replacement never happened. The one failure worth translating is "kubectl is
+// not on PATH": ExecKubectl surfaces a raw Go lookup error (exec.ErrNotFound
+// from RealKubectlPath, or ENOENT if the binary vanished between resolution and
+// syscall.Exec), which is opaque noise for a tool whose whole job is wrapping
+// kubectl. Turn it into an actionable message and exit non-zero; any other exec
+// error propagates unchanged to the top-level handler.
+func execKubectl(args []string) error {
+	err := guard.ExecKubectl(args)
+	if err != nil && (errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist)) {
+		ui.PrintWarning("kubectl not found on PATH. Install kubectl (https://kubernetes.io/docs/tasks/tools/) or fix your PATH.")
+		os.Exit(1)
+	}
+	return err
+}
+
+// qualifiesForOutputRedaction reports whether an ALLOWED command takes the #108
+// opt-in redaction path instead of syscall.Exec. All four conditions must hold, so
+// the path is UNREACHABLE unless the operator explicitly opted in AND the command
+// is a shape the guard can safely parse document-at-a-time:
+//
+//   - redact_output is explicitly "structured" (default "off" never qualifies —
+//     off is byte-for-byte identical to today);
+//   - the verb is `get` (built-in classification; not consulting command_overrides,
+//     which cannot make a non-get verb emit a parseable get document);
+//   - it is NOT a watch (-w/--watch streams forever and can never be parsed);
+//   - the output format is exactly "json" or "yaml" (a table/wide/name/jsonpath/
+//     custom-columns/go-template read is not a document the guard parses, so it
+//     keeps syscall.Exec).
+//
+// Everything else — every mutation, every interactive verb, and every read that is
+// not a machine-format get — falls through to syscall.Exec unchanged.
+func qualifiesForOutputRedaction(cfg *config.Config, args []string) bool {
+	if cfg.RedactOutputMode() != config.RedactOutputStructured {
+		return false
+	}
+	if verb, _ := guard.ExtractCommand(args); verb != "get" {
+		return false
+	}
+	p := guard.ParseArgs(args)
+	if p.Watch {
+		return false
+	}
+	switch p.OutputFormat {
+	case "json", "yaml":
+		return true
+	default:
+		return false
+	}
+}
+
+// runRedactedGet runs the REAL kubectl as a CHILD process (not syscall.Exec) with
+// a piped stdout, streams its output through guard.RedactStructuredStream to blank
+// KNOWN sensitive fields, and re-emits to os.Stdout. It is reached only from the
+// qualifiesForOutputRedaction gate.
+//
+// Fidelity vs the syscall.Exec passthrough:
+//   - stdin/stderr: passed through directly (cmd.Stdin = os.Stdin, cmd.Stderr =
+//     os.Stderr), so prompts, errors, and progress are unchanged.
+//   - exit code: kubectl's is authoritative — a failed `get` still exits non-zero.
+//     An *exec.ExitError propagates via os.Exit(code); any other start/wait error is
+//     returned to the top-level handler.
+//   - signals: SIGINT/SIGTERM are forwarded to the child so Ctrl-C works; when the
+//     child dies from a signal the guard exits 128+N to match the syscall.Exec
+//     baseline (a parent process must translate the WaitStatus itself — ExitCode()
+//     would otherwise collapse a signal death to 255).
+//   - There is NO PTY on this path (it is a non-interactive machine-format read, so
+//     kubectl needs no terminal); interactive verbs never reach here.
+//
+// Memory: RedactStructuredStream streams from the pipe to os.Stdout decoding
+// document-at-a-time; the whole output is never buffered as one string.
+func runRedactedGet(args []string, format string) error {
+	kubectl, err := guard.RealKubectlPath()
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			ui.PrintWarning("kubectl not found on PATH. Install kubectl (https://kubernetes.io/docs/tasks/tools/) or fix your PATH.")
+			os.Exit(1)
+		}
+		return err
+	}
+
+	cmd := exec.Command(kubectl, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			ui.PrintWarning("kubectl not found on PATH. Install kubectl (https://kubernetes.io/docs/tasks/tools/) or fix your PATH.")
+			os.Exit(1)
+		}
+		return err
+	}
+
+	// Forward SIGINT/SIGTERM to the child so Ctrl-C and a supervisor's TERM reach
+	// kubectl (with syscall.Exec they went straight to kubectl; as a parent process
+	// the guard must relay them). Stopped after Wait so the handler does not outlive
+	// the child.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case s := <-sigCh:
+				if cmd.Process != nil {
+					_ = cmd.Process.Signal(s)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Stream + redact. A redact error is best-effort (RedactStructuredStream already
+	// fails open internally); log to stderr but still Wait so the exit code and any
+	// buffered kubectl error surface.
+	redactErr := guard.RedactStructuredStream(stdout, os.Stdout, format)
+	waitErr := cmd.Wait()
+	close(done)
+
+	if redactErr != nil {
+		fmt.Fprintln(os.Stderr, "kubectl-guard: warning: output redaction error: "+redactErr.Error())
+	}
+
+	// kubectl's exit code is authoritative. A signal-killed child needs the
+	// kernel/shell 128+N convention to match the syscall.Exec passthrough baseline:
+	// ExitError.ExitCode() returns -1 for a signaled process, so os.Exit(-1) would
+	// surface 255 instead of e.g. 143 for SIGTERM. Translate the signal ourselves
+	// (a parent process, unlike syscall.Exec, must).
+	var ee *exec.ExitError
+	if errors.As(waitErr, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			os.Exit(128 + int(ws.Signal()))
+		}
+		os.Exit(ee.ExitCode())
+	}
+	return waitErr
+}
+
+// reportError is the single sink for errors that reach the top level. It writes
+// to stderr in one consistent shape — "kubectl-guard: error: <msg>" for humans,
+// or a structured {"error": "..."} object when --json was requested — instead of
+// cobra's usage dump, a raw Go error, or the old bare "Error: ..." prefix. It
+// never prints usage; flag-parse errors surface usage via the cobra
+// FlagErrorFunc (guardFlagErrorFunc) before the error reaches here.
+func reportError(err error) {
+	if err == nil {
+		return
+	}
+	msg := strings.TrimSpace(err.Error())
+	if jsonRequested(os.Args[1:]) {
+		if b, mErr := json.Marshal(map[string]string{"error": msg}); mErr == nil {
+			fmt.Fprintln(os.Stderr, string(b))
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, "kubectl-guard: error: "+msg)
+}
+
+// jsonRequested reports whether JSON mode was requested at the top level. It
+// delegates to guard.StripGuardFlags so it honors every accepted form
+// (--json, --json=true, --json=false) and the "--" separator EXACTLY as the
+// decision path does — a hand-rolled scan drifted from it (missed --json=true).
+func jsonRequested(args []string) bool {
+	_, jsonMode := guard.StripGuardFlags(args)
+	return jsonMode
+}
+
+// hasFlag reports whether flag appears in args before the "--" separator.
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// guardFlagErrorFunc prints usage for a flag-parse error (the one error class
+// where usage is genuinely helpful) and returns the error so reportError still
+// emits the consistent message. RunE errors get no usage dump. In --json mode the
+// human usage text is suppressed so it cannot pollute the structured error line
+// an agent parses from stderr.
+func guardFlagErrorFunc(c *cobra.Command, err error) error {
+	if !jsonRequested(os.Args[1:]) {
+		fmt.Fprintln(os.Stderr, strings.TrimRight(c.UsageString(), "\n"))
+	}
+	return err
 }
 
 // boolEnv reports whether the env var is set to a truthy value (1, t, true,
@@ -235,8 +1118,23 @@ func runGuard(args []string) error {
 	}
 	// --yes is a guard-only audited auto-confirm of RequireConfirmation.
 	forwarded, yesFlag := guard.StripYes(forwarded)
+	// --reason is a guard-only free-text justification for a gated command
+	// (require_justification). Parsed/stripped here so it never reaches kubectl.
+	forwarded, reasonFlag, hasReason := guard.StripReason(forwarded)
 
 	result, ctx, cfg, err := guard.Check(forwarded)
+
+	// Tamper signal: a group/world-writable config can be rewritten by another
+	// user to disable protection. Strict mode already fails closed inside Check
+	// (Deny); here we surface the non-strict WARNING once, before any hand-off to
+	// kubectl (syscall.Exec leaves no chance to print afterward). Suppressed in
+	// --json mode so the machine-readable stderr contract for agents stays clean.
+	if !jsonMode {
+		if insecure, detail, permErr := config.InsecureConfigPerms(); permErr == nil && insecure && (cfg == nil || !cfg.StrictPerms()) {
+			ui.PrintWarning(detail + "; protection may have been tampered with. Secure it (chmod 600 the file, 700 its directory), or set strict_config_perms / KUBECTL_GUARD_STRICT to fail closed.")
+		}
+	}
+
 	// Secret-bearing values (--token, --from-literal=k=v, --patch bodies, key
 	// material, ...) are redacted once, here. Every surface that DISPLAYS the
 	// command — the audit log, --json output, and user-facing messages — derives
@@ -254,6 +1152,11 @@ func runGuard(args []string) error {
 	// not just who invoked the guard.
 	parsed := guard.ParseArgs(forwarded)
 
+	// justification holds the free-text reason a human/agent supplied to approve a
+	// gated command (require_justification, or a provided --reason). Set at
+	// confirm/auto-confirm time and recorded on the audit entry via the closure.
+	var justification string
+
 	// audit writes an attributed audit entry for this invocation. It is a
 	// thin wrapper so every decision path records impersonation/token the same
 	// way. cfg may be nil (Deny before config load); in that case it is a no-op.
@@ -262,10 +1165,11 @@ func runGuard(args []string) error {
 			return
 		}
 		e := guard.AuditEntry{
-			Context: ctx,
-			Command: cmdStr,
-			Outcome: outcome,
-			Reason:  reason,
+			Context:       ctx,
+			Command:       cmdStr,
+			Outcome:       outcome,
+			Reason:        reason,
+			Justification: justification,
 		}
 		if imp := parsed.ImpersonationString(); imp != "" {
 			e.Impersonate = imp
@@ -377,7 +1281,7 @@ func runGuard(args []string) error {
 				os.Exit(guard.ExitDenied)
 			}
 			ui.PrintWarning("No guard configuration found; this read-only command runs unprotected. Run 'kubectl-guard config init' to configure.")
-			return guard.ExecKubectl(forwarded)
+			return execKubectl(forwarded)
 		}
 		if noPrompt {
 			// bootstrapMode == prompt: an explicit opt-in to the wizard. Say so,
@@ -405,21 +1309,38 @@ func runGuard(args []string) error {
 		// refusal (context_mode/namespace_mode: block). Determine which so the
 		// message and audit reason are accurate.
 		blockReason := "protected-resource"
+		clusterServer := "" // set below when a protected-cluster match drove the block
 		if !guard.MatchesProtectedResource(cfg, forwarded) {
 			// Use the actor-effective modes, so an actor-policy upgrade (confirm →
 			// block for a known agent) is labeled as a context/namespace block, the
 			// same decision the guard made.
 			ctxMode := config.ContextModeConfirm
 			if cfg != nil {
-				ctxMode, _ = cfg.EffectiveModesForActor(guard.CurrentActor(cfg))
+				ctxMode, _ = guard.EffectiveTargetModes(cfg, forwarded, ctx)
 			}
+			// Resolve cluster-identity protection once for labeling (best-effort; no
+			// kubeconfig read unless protected_clusters is configured).
+			srv, clusterHit := guard.ClusterProtected(cfg, forwarded, ctx)
+			clusterServer = srv
 			switch {
+			case cfg != nil && cfg.ReadOnlyActive() && !guard.IsSafeCommandWith(cfg, forwarded):
+				// Global read-only/freeze is checked before context gating in the
+				// core and blocks anything that is not a known-safe read, so a
+				// non-safe block under read-only is that, not a context/namespace
+				// block. (A genuine dry-run would not reach Blocked.)
+				blockReason = "read-only-mode"
 			case cfg != nil && cfg.IsContextProtected(ctx) && ctxMode == config.ContextModeBlock:
 				blockReason = "protected-context-block-mode"
 			case guard.IsSensitiveAccess(cfg, forwarded) && cfg != nil && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock:
 				blockReason = "sensitive-access-block"
 			case guard.IsBlastRadiusActive(cfg, forwarded) && cfg != nil && cfg.BlastRadiusMode() == config.BlastRadiusBlock:
 				blockReason = "blast-radius-block"
+			case guard.IsSensitiveKindActive(cfg, forwarded) && cfg != nil && cfg.SensitiveKindMode() == config.SensitiveKindBlock:
+				blockReason = "sensitive-kind-block"
+			case clusterHit && cfg != nil && cfg.EffectiveClusterMode(clusterServer) == config.ContextModeBlock:
+				// The context NAME is unprotected but the resolved API server matches
+				// protected_clusters in block mode (#85).
+				blockReason = "protected-cluster-block-mode"
 			default:
 				blockReason = "protected-namespace-block-mode"
 			}
@@ -445,6 +1366,8 @@ func runGuard(args []string) error {
 				}
 			case "protected-context-block-mode":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected context %q (block mode: no confirmation offered)", cmdDesc, ctx))
+			case "read-only-mode":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s — global read-only mode is active (freeze); everything except known-safe reads is refused, everywhere. Reads still pass. Run 'kubectl-guard unfreeze' or clear KUBECTL_GUARD_READONLY to lift.", cmdDesc))
 			case "sensitive-access-block":
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s is a sensitive-access verb (sensitive_access: block; refused on every context)", cmdDesc))
 			case "blast-radius-block":
@@ -453,6 +1376,10 @@ func runGuard(args []string) error {
 					scope = why
 				}
 				ui.PrintWarning(fmt.Sprintf("Blocked: %s — %s (blast_radius: block; refused on every context)", cmdDesc, scope))
+			case "sensitive-kind-block":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s mutates a sensitive kind (sensitive_kind_mode: block; refused on every context). Reads of the kind still pass.", cmdDesc))
+			case "protected-cluster-block-mode":
+				ui.PrintWarning(fmt.Sprintf("Blocked: %s on protected cluster %q (block mode: no confirmation offered)", cmdDesc, clusterServer))
 			default: // protected-namespace-block-mode
 				// Prefer the namespace OBJECT the command targets by name
 				// (`delete namespace kube-system`) over the namespace it would
@@ -479,11 +1406,32 @@ func runGuard(args []string) error {
 		// affected by this (they stay a hard block in their own branch).
 		autoConfirm := yesFlag || boolEnv(config.EnvConfirm)
 		if autoConfirm {
+			// Justification: a non-interactive approval must carry --reason when
+			// require_justification is on, else fail closed (the command must not run
+			// without a recorded reason). A provided reason is recorded either way.
+			if cfg != nil && cfg.RequireJustification {
+				r := strings.TrimSpace(reasonFlag)
+				if !hasReason || r == "" {
+					audit(guard.OutcomeAborted, "justification-required")
+					if jsonMode {
+						jr := guard.JSONResult{Decision: "needs-confirmation", Reason: "justification-required", Context: ctx, Command: cmdStr, Prompt: "Re-run with --yes --reason \"<why>\" to supply the required justification."}
+						if b, mErr := json.Marshal(jr); mErr == nil {
+							fmt.Fprintln(os.Stderr, string(b))
+						}
+					} else {
+						fmt.Fprintln(os.Stderr, "Aborted: this command requires a justification. Re-run with --reason \"<why>\".")
+					}
+					os.Exit(guard.ExitNeedsConfirm)
+				}
+				justification = r
+			} else if hasReason {
+				justification = strings.TrimSpace(reasonFlag)
+			}
 			if !jsonMode {
 				ui.PrintWarning("Auto-confirming gated command (--yes / KUBECTL_GUARD_CONFIRM=yes); logged as auto-confirmed.")
 			}
 			audit(guard.OutcomeAutoConfirmed, "yes-flag")
-			return guard.ExecKubectl(forwarded)
+			return execKubectl(forwarded)
 		}
 
 		cmdDesc := guard.GetCommandDescription(redacted)
@@ -494,11 +1442,16 @@ func runGuard(args []string) error {
 		reason := "protected context"
 		target := ctx
 		wide, blastReason := guard.BlastRadius(forwarded)
+		clusterServer, clusterHit := guard.ClusterProtected(cfg, forwarded, ctx)
 		switch nameTarget, byName := guard.ProtectedNamespaceNameTarget(cfg, forwarded); {
 		case guard.IsSensitiveAccess(cfg, forwarded) && !cfg.IsContextProtected(ctx) && !byName:
 			// Gated purely because it is a sensitive-access verb on an otherwise
 			// unprotected target — name that, not a "protected context".
 			reason, target = "sensitive access", "any context"
+		case guard.IsSensitiveKindActive(cfg, forwarded) && !cfg.IsContextProtected(ctx) && !byName:
+			// Gated as a mutation to a sensitive kind on an otherwise unprotected
+			// target — name that.
+			reason, target = "sensitive kind", "any context"
 		case byName:
 			// The command's OBJECT is a protected namespace (e.g.
 			// `delete namespace kube-system`). Name that, rather than the
@@ -511,6 +1464,10 @@ func runGuard(args []string) error {
 			reason, target = "protected namespace", parsed.Namespace
 		case cfg != nil && cfg.IsContextProtected(ctx):
 			reason, target = "protected context", ctx
+		case clusterHit:
+			// The context NAME is unprotected but the resolved API server matches
+			// protected_clusters (#85) — name the cluster, not a "protected context".
+			reason, target = "protected cluster", clusterServer
 		case wide && cfg != nil && cfg.BlastRadiusMode() != config.BlastRadiusOff:
 			// Gated as a wide-scope / bulk mutation with no protected context or
 			// namespace in play — name the scope so the human sees WHY.
@@ -529,12 +1486,18 @@ func runGuard(args []string) error {
 		// mode is agent-relay or KUBECTL_GUARD_AGENT_RELAY is set.
 		agentRelay := (cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay) || boolEnv(config.EnvAgentRelay)
 		if agentRelay {
+			rerun := "Re-run with --yes to proceed."
+			if cfg != nil && cfg.RequireJustification {
+				// The relayed request notes a reason is required so the agent can
+				// collect it from its human before re-running.
+				rerun = "Re-run with --yes --reason \"<why>\" to proceed (a justification is required)."
+			}
 			jr := guard.JSONResult{
 				Decision: "needs-confirmation",
 				Reason:   "agent-relay",
 				Context:  ctx,
 				Command:  cmdStr,
-				Prompt:   fmt.Sprintf("Approve %q on %s %q? Re-run with --yes to proceed.", cmdDesc, reason, target),
+				Prompt:   fmt.Sprintf("Approve %q on %s %q? %s", cmdDesc, reason, target, rerun),
 			}
 			if b, mErr := json.Marshal(jr); mErr == nil {
 				fmt.Fprintln(os.Stderr, string(b))
@@ -550,6 +1513,39 @@ func runGuard(args []string) error {
 			audit(guard.OutcomeAborted, "")
 			os.Exit(guard.ExitNeedsConfirm)
 		}
+
+		// Install a signal handler for the duration of the preview + interactive
+		// prompt — the one place the guard blocks (on a slow diff/get, or on stdin).
+		// A Ctrl-C / SIGTERM here otherwise hits Go's default handler and kills the
+		// process with no audit entry, so a gated command the operator abandoned
+		// leaves no record. Record it as aborted ("interrupted") and exit non-zero.
+		// Best-effort: AppendAudit is flock-serialized and fast, so it will not hang
+		// shutdown. Torn down once we have an answer, so a signal arriving after
+		// approval cannot spuriously abort an already-confirmed command.
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sigDone := make(chan struct{})
+		// decided makes the abort-vs-answer outcome mutually exclusive: whichever
+		// of {a signal, the operator's answer} claims it FIRST acts, and the other
+		// becomes a no-op. Without this, a signal that races the answer (arriving
+		// after the prompt returns but before teardown) would still fire and write a
+		// contradictory "interrupted" audit entry for a command that actually ran —
+		// signal.Stop does not drain an already-buffered signal, and a bare select
+		// gives the done channel no priority.
+		var decided int32
+		go func() {
+			select {
+			case <-sigCh:
+				if atomic.CompareAndSwapInt32(&decided, 0, 1) {
+					audit(guard.OutcomeAborted, "interrupted")
+					fmt.Fprintln(os.Stderr, "\nInterrupted.")
+					os.Exit(guard.ExitNeedsConfirm)
+				}
+				// The answer already committed and the command is proceeding; the
+				// interrupt lost the race, so record nothing.
+			case <-sigDone:
+			}
+		}()
 
 		// Optional: preview what the command will affect before prompting.
 		// A diffable apply (apply/create/replace -f) is previewed with
@@ -594,10 +1590,40 @@ func runGuard(args []string) error {
 			outcome = ui.Confirm(message, timeout)
 		}
 
+		// Claim the decision for the answer. If a signal won the race, the watcher
+		// is committing an abort+exit; block until that os.Exit terminates us, so we
+		// never run a command the operator interrupted. If the answer won, the
+		// watcher's signal case becomes a no-op.
+		if !atomic.CompareAndSwapInt32(&decided, 0, 1) {
+			<-make(chan struct{})
+		}
+		// Stop handling signals and release the watcher goroutine so a late Ctrl-C
+		// cannot abort an already-approved command and the goroutine does not leak.
+		signal.Stop(sigCh)
+		close(sigDone)
+
 		switch outcome {
 		case ui.ConfirmApproved:
+			// Compliance justification: when require_justification is on, use a
+			// reason supplied on the command line (--reason), otherwise prompt for
+			// one after approval. An empty reason (neither given nor typed) aborts
+			// (fail closed).
+			if cfg != nil && cfg.RequireJustification {
+				r := strings.TrimSpace(reasonFlag)
+				if !hasReason || r == "" {
+					r = ui.PromptReason(timeout)
+				}
+				if r == "" {
+					audit(guard.OutcomeAborted, "justification-required")
+					fmt.Fprintln(os.Stderr, "Aborted: a justification is required (empty reason).")
+					os.Exit(guard.ExitNeedsConfirm)
+				}
+				justification = r
+			} else if hasReason {
+				justification = strings.TrimSpace(reasonFlag)
+			}
 			audit(guard.OutcomeConfirmed, "")
-			return guard.ExecKubectl(forwarded)
+			return execKubectl(forwarded)
 		case ui.ConfirmTimedOut:
 			// Fail-safe: an unanswered prompt is a decline, recorded distinctly so
 			// the audit trail shows the command was abandoned, not refused.
@@ -618,17 +1644,86 @@ func runGuard(args []string) error {
 			outcome = guard.OutcomeDryRun
 		}
 		audit(outcome, "")
-		return guard.ExecKubectl(forwarded)
+		// #108 output redaction: the ONLY place the guard leaves the syscall.Exec
+		// passthrough. It engages ONLY when redact_output is explicitly "structured"
+		// AND the command is a non-interactive, non-watch `get -o json|yaml`. In
+		// every other case (redact_output off — the default — or any command that
+		// does not qualify) the guard still syscall.Exec's, byte-for-byte identical
+		// to before this feature (HARD INVARIANT #1/#2).
+		if qualifiesForOutputRedaction(cfg, forwarded) {
+			return runRedactedGet(forwarded, guard.ParseArgs(forwarded).OutputFormat)
+		}
+		return execKubectl(forwarded)
 	}
 
 	return nil
 }
 
-func runConfigCommand() error {
+// firstArgComplete returns a ValidArgsFunction that dynamically completes only
+// the FIRST positional argument from get(), with no fallback file completion.
+func firstArgComplete(get func() []string) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+		if len(args) != 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		return get(), cobra.ShellCompDirectiveNoFileComp
+	}
+}
+
+// loadProtectedList returns a slice from the on-disk config for completion
+// (protected contexts/namespaces/resources), best-effort — nil on any error so
+// completion never fails the shell.
+func loadProtectedList(get func(*config.Config) []string) []string {
+	exists, err := config.Exists()
+	if err != nil || !exists {
+		return nil
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return nil
+	}
+	return get(cfg)
+}
+
+// availableContexts lists kubectl contexts for completing add-context,
+// best-effort (nil if kubectl/kubeconfig is unavailable).
+func availableContexts() []string {
+	contexts, err := guard.GetAllContexts()
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(contexts))
+	for _, c := range contexts {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
+// commonResourceKinds is a static completion list for add-resource — common
+// kinds users protect; not exhaustive (any kind is still accepted).
+func commonResourceKinds() []string {
+	return []string{
+		"secret", "configmap", "pod", "deployment", "statefulset", "daemonset",
+		"node", "namespace", "persistentvolume", "persistentvolumeclaim",
+		"serviceaccount", "role", "rolebinding", "clusterrole", "clusterrolebinding",
+		"ingress", "service", "job", "cronjob",
+	}
+}
+
+// newConfigCommand builds the `config` cobra command tree (setup, init, list,
+// the add/remove families, the mode setters, audit, validate, path). It is used
+// both to execute a `config` invocation (runConfigCommand) and to model the CLI
+// surface for shell-completion generation (newRootCommand).
+func newConfigCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "config",
 		Short: "Manage kubectl-guard configuration",
+		// Errors and usage are routed through the top-level reportError sink for a
+		// consistent shape; usage is restored only for flag-parse errors.
+		SilenceErrors: true,
+		SilenceUsage:  true,
 	}
+	rootCmd.SetFlagErrorFunc(guardFlagErrorFunc)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "setup",
@@ -667,13 +1762,16 @@ func runConfigCommand() error {
 			}
 			ui.PrintSuccess("Wrote config: " + path)
 			if len(cfg.ProtectedContexts) > 0 {
-				ui.PrintInfo("Protected contexts: " + strings.Join(cfg.ProtectedContexts, ", "))
+				ui.PrintInfo("Protected contexts: " + strings.Join(cfg.ProtectedContextPatterns(), ", "))
 			}
 			if len(cfg.ProtectedResources) > 0 {
 				ui.PrintInfo("Protected resources: " + strings.Join(cfg.ProtectedResources, ", "))
 			}
 			if len(cfg.ProtectedNamespaces) > 0 {
-				ui.PrintInfo("Protected namespaces: " + strings.Join(cfg.ProtectedNamespaces, ", "))
+				ui.PrintInfo("Protected namespaces: " + strings.Join(cfg.ProtectedNamespacePatterns(), ", "))
+			}
+			if len(cfg.ProtectedClusters) > 0 {
+				ui.PrintInfo("Protected clusters: " + strings.Join(cfg.ProtectedClusterKeys(), ", "))
 			}
 			ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 			return nil
@@ -693,26 +1791,176 @@ func runConfigCommand() error {
 	})
 
 	// add-context / add (alias) / remove-context / remove (alias) /
-	// add-resource / remove-resource all share one shape.
-	addCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool) {
+	// add-resource / remove-resource all share one shape. valid is an optional
+	// dynamic ValidArgsFunction (nil for none).
+	addCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool, valid func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective)) {
 		rootCmd.AddCommand(&cobra.Command{
-			Use:    use,
-			Short:  short,
-			Args:   cobra.ExactArgs(1),
-			Hidden: hidden,
+			Use:               use,
+			Short:             short,
+			Args:              cobra.ExactArgs(1),
+			Hidden:            hidden,
+			ValidArgsFunction: valid,
 			RunE: func(_ *cobra.Command, a []string) error {
 				return mutateConfig(func(c *config.Config) bool { return fn(c, a[0]) }, fmt.Sprintf(doneTmpl, a[0]), fmt.Sprintf(noopTmpl, a[0]))
 			},
 		})
 	}
-	addCmd("add-context <pattern>", "Add a context/pattern to the protected list", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", false)
-	addCmd("add <pattern>", "Alias for add-context", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", true)
-	addCmd("remove-context <pattern>", "Remove a context/pattern from the protected list", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", false)
-	addCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true)
-	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false)
-	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false)
-	addCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*)", (*config.Config).AddNamespace, "Protected namespace: %s", "Namespace already protected: %s", false)
-	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false)
+	// removeCmd is addCmd for a REMOVAL that must warn when the removed rule is
+	// still enforced by the SYSTEM baseline: the removal succeeds on the user file,
+	// but the rule STILL APPLIES via the most-restrictive merge, so a bare "Removed"
+	// would mislead the user into thinking protection dropped (issue #86). The
+	// stillEnforced predicate reports whether the system layer still carries the
+	// target (nil = never a system-backed rule, e.g. n/a).
+	removeCmd := func(use, short string, fn func(*config.Config, string) bool, doneTmpl, noopTmpl string, hidden bool, valid func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective), stillEnforced func(*config.Config, string) bool) {
+		rootCmd.AddCommand(&cobra.Command{
+			Use:               use,
+			Short:             short,
+			Args:              cobra.ExactArgs(1),
+			Hidden:            hidden,
+			ValidArgsFunction: valid,
+			RunE: func(_ *cobra.Command, a []string) error {
+				target := a[0]
+				cfg, err := loadOrCreateConfig()
+				if err != nil {
+					return err
+				}
+				if !fn(cfg, target) {
+					ui.PrintInfo(fmt.Sprintf(noopTmpl, target))
+					// The rule may not be in the USER config yet still be enforced by the
+					// system baseline (a system-only rule shown as "[system]" in config
+					// list). Say so, so "not in your list" is not misread as "unprotected".
+					if sys, _ := config.EnforcedSystemConfig(); sys != nil && stillEnforced != nil && stillEnforced(sys, target) {
+						ui.PrintWarning("Note: '" + target + "' is enforced by the system baseline and continues to apply (it is not in your user config to remove).")
+					}
+					return nil
+				}
+				if err := saveConfig(cfg); err != nil {
+					return err
+				}
+				ui.PrintSuccess(fmt.Sprintf(doneTmpl, target))
+				if sys, _ := config.EnforcedSystemConfig(); sys != nil && stillEnforced != nil && stillEnforced(sys, target) {
+					ui.PrintWarning("Note: '" + target + "' was removed from your config, but is still enforced by the system baseline and continues to apply.")
+				}
+				return nil
+			},
+		})
+	}
+	// newAddProtectedCmd builds an add-context / add-namespace command with an
+	// optional --mode flag for a per-pattern protection mode. When --mode is NOT
+	// given, it calls the plain adder, which is a pure no-op on an existing pattern
+	// (never touching its mode — so a bare re-add can never downgrade a block
+	// pattern). When --mode IS given (confirm | block | - for inherit), it calls the
+	// mode-aware adder, which adds or UPDATES the pattern's mode. The mode is
+	// pre-validated here for a clear error, because the adder's false return also
+	// means "no change", which must not be conflated with an invalid mode.
+	newAddProtectedCmd := func(use, short, doneTmpl, noopTmpl string, hidden bool,
+		plain func(*config.Config, string) bool,
+		withMode func(*config.Config, string, string) bool,
+		valid func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective)) *cobra.Command {
+		var modeRaw string
+		cmd := &cobra.Command{
+			Use:               use,
+			Short:             short,
+			Args:              cobra.ExactArgs(1),
+			Hidden:            hidden,
+			ValidArgsFunction: valid,
+			RunE: func(c *cobra.Command, a []string) error {
+				pattern := a[0]
+				modeChanged := c.Flags().Changed("mode")
+				mode := normalizeInheritMode(modeRaw)
+				if modeChanged && mode != "" && !isValidProtectionMode(mode) {
+					return fmt.Errorf("invalid --mode %q (want %q, %q, or %q to inherit the global mode)",
+						modeRaw, config.ContextModeConfirm, config.ContextModeBlock, "-")
+				}
+				return mutateConfig(func(cfg *config.Config) bool {
+					if modeChanged {
+						return withMode(cfg, pattern, mode)
+					}
+					return plain(cfg, pattern)
+				}, fmt.Sprintf(doneTmpl, pattern), fmt.Sprintf(noopTmpl, pattern))
+			},
+		}
+		cmd.Flags().StringVar(&modeRaw, "mode", "", "per-pattern protection mode: confirm | block | - (inherit the global mode)")
+		return cmd
+	}
+
+	// Dynamic completions: add-* offers candidates to add (available contexts,
+	// common resource kinds), remove-* offers what is currently protected.
+	completeAddContext := firstArgComplete(availableContexts)
+	completeRemoveContext := firstArgComplete(func() []string {
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedContextPatterns() })
+	})
+	completeAddResource := firstArgComplete(commonResourceKinds)
+	completeRemoveResource := firstArgComplete(func() []string {
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedResources })
+	})
+	completeRemoveNamespace := firstArgComplete(func() []string {
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedNamespacePatterns() })
+	})
+	completeRemoveCluster := firstArgComplete(func() []string {
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedClusterKeys() })
+	})
+
+	rootCmd.AddCommand(newAddProtectedCmd("add-context <pattern>", "Add a context/pattern to the protected list (optional --mode)", "Added context: %s", "Context already protected: %s", false, (*config.Config).AddContext, (*config.Config).AddContextWithMode, completeAddContext))
+	rootCmd.AddCommand(newAddProtectedCmd("add <pattern>", "Alias for add-context", "Added context: %s", "Context already protected: %s", true, (*config.Config).AddContext, (*config.Config).AddContextWithMode, completeAddContext))
+	sysHasContext := func(sys *config.Config, t string) bool {
+		return stringInList(sys.ProtectedContextPatterns(), t)
+	}
+	sysHasNamespace := func(sys *config.Config, t string) bool {
+		return stringInList(sys.ProtectedNamespacePatterns(), t)
+	}
+	sysHasResource := func(sys *config.Config, t string) bool { return sys.IsResourceProtected(t) }
+	removeCmd("remove-context <pattern>", "Remove a context/pattern from the protected list", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", false, completeRemoveContext, sysHasContext)
+	removeCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true, completeRemoveContext, sysHasContext)
+	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false, completeAddResource)
+	removeCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false, completeRemoveResource, sysHasResource)
+	rootCmd.AddCommand(newAddProtectedCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*; optional --mode)", "Protected namespace: %s", "Namespace already protected: %s", false, (*config.Config).AddNamespace, (*config.Config).AddNamespaceWithMode, nil))
+	removeCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false, completeRemoveNamespace, sysHasNamespace)
+
+	// add-cluster protects by CLUSTER identity (the API server URL / a host glob),
+	// not the spoofable context name. It cannot reuse newAddProtectedCmd because
+	// AddProtectedCluster returns (changed, error): an invalid mode or empty value
+	// must surface to the user rather than be conflated with a no-op. The value is
+	// auto-detected as an exact server or a pattern (a glob metachar makes it a
+	// pattern), and a --mode confirm|block (- to inherit) sets the per-entry mode.
+	var clusterModeRaw string
+	addClusterCmd := &cobra.Command{
+		Use:   "add-cluster <server-or-pattern>",
+		Short: "Protect by cluster identity: an API server URL or host glob (optional --mode)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, a []string) error {
+			value := a[0]
+			mode := normalizeInheritMode(clusterModeRaw)
+			if c.Flags().Changed("mode") && mode != "" && !isValidProtectionMode(mode) {
+				return fmt.Errorf("invalid --mode %q (want %q, %q, or %q to inherit the global mode)",
+					clusterModeRaw, config.ContextModeConfirm, config.ContextModeBlock, "-")
+			}
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			// AddProtectedCluster returns (changed, error): an invalid mode or empty
+			// value surfaces to the user rather than being conflated with a no-op.
+			changed, err := cfg.AddProtectedCluster(value, mode)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				ui.PrintInfo("Cluster already protected: " + value)
+				return nil
+			}
+			// Route through saveConfig so a mode downgrade (block → confirm/inherit)
+			// on an existing entry is gated/audited as the weakening it is.
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Protected cluster: " + value)
+			return nil
+		},
+	}
+	addClusterCmd.Flags().StringVar(&clusterModeRaw, "mode", "", "per-entry protection mode: confirm | block | - (inherit the global context_mode)")
+	rootCmd.AddCommand(addClusterCmd)
+	removeCmd("remove-cluster <value>", "Remove a protected cluster (server URL, pattern, or its list key)", (*config.Config).RemoveProtectedCluster, "Removed protected cluster: %s", "Cluster not in protected list: %s", false, completeRemoveCluster, systemHasCluster)
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "confirm-mode [simple|type-name|agent-relay]",
@@ -831,6 +2079,86 @@ func runConfigCommand() error {
 			}
 			ui.PrintSuccess("Blast radius set: " + cfg.BlastRadius)
 			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "sensitive-kind [off|confirm|block]",
+		Short: "Show or set gating of state-altering commands on sensitive kinds",
+		Long: "Gate mutations to a configured kind (node, namespace, persistentvolume,\n" +
+			"a critical CRD) on every context, while leaving reads alone. Manage the\n" +
+			"kind list with add-sensitive-kind / remove-sensitive-kind.\n\n" +
+			"Matches a resource token, an inspectable -f manifest kind, and the\n" +
+			"implicit node target of cordon/uncordon/drain. It does NOT gate\n" +
+			"un-inspectable sources (-f -, a URL, -k kustomize, or --raw); use\n" +
+			"protected_resources for a fail-closed block that also covers those.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Sensitive-kind mode: " + cfg.SensitiveKindMode())
+				if len(cfg.SensitiveKinds) > 0 {
+					ui.PrintInfo("Sensitive kinds: " + strings.Join(cfg.SensitiveKinds, ", "))
+				}
+				return nil
+			}
+			if !cfg.SetSensitiveKindMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.SensitiveKindOff, config.SensitiveKindConfirm, config.SensitiveKindBlock)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Sensitive-kind mode set: " + cfg.SensitiveKindMode())
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:               "add-sensitive-kind <kind>",
+		Short:             "Gate state-altering commands on this kind on every context (e.g. node)",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeAddResource,
+		RunE: func(_ *cobra.Command, a []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if !cfg.AddSensitiveKind(a[0]) {
+				ui.PrintInfo("Kind already sensitive: " + a[0])
+				return nil
+			}
+			// Adding a kind with the policy off would be a no-op; default it to
+			// confirm so the kind actually takes effect (the user can tighten to
+			// block or set it off explicitly).
+			activated := false
+			if cfg.SensitiveKindMode() == config.SensitiveKindOff {
+				cfg.SetSensitiveKindMode(config.SensitiveKindConfirm)
+				activated = true
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Sensitive kind added: " + a[0])
+			if activated {
+				ui.PrintInfo("Sensitive-kind mode was off; set to 'confirm'. Use 'config sensitive-kind block' to hard-refuse.")
+			}
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "remove-sensitive-kind <kind>",
+		Short: "Stop gating state-altering commands on this kind",
+		Args:  cobra.ExactArgs(1),
+		ValidArgsFunction: firstArgComplete(func() []string {
+			return loadProtectedList(func(c *config.Config) []string { return c.SensitiveKinds })
+		}),
+		RunE: func(_ *cobra.Command, a []string) error {
+			return mutateConfig(func(c *config.Config) bool { return c.RemoveSensitiveKind(a[0]) },
+				"Sensitive kind removed: "+a[0], "Kind not in sensitive list: "+a[0])
 		},
 	})
 
@@ -1024,6 +2352,35 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "require-justification [on|off]",
+		Short: "Show or toggle requiring a free-text reason to approve a gated command",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Require justification: " + onOff(cfg.RequireJustification))
+				return nil
+			}
+			switch args[0] {
+			case "on":
+				cfg.RequireJustification = true
+			case "off":
+				cfg.RequireJustification = false
+			default:
+				return fmt.Errorf("expected 'on' or 'off'")
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Require justification: " + onOff(cfg.RequireJustification))
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "unknown-verb [allow|gate|deny]",
 		Short: "Show or set how unrecognized verbs are treated on protected targets",
 		Args:  cobra.MaximumNArgs(1),
@@ -1043,6 +2400,41 @@ func runConfigCommand() error {
 				return err
 			}
 			ui.PrintSuccess("Unknown verb policy set: " + cfg.UnknownVerb)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "redact-output [off|structured]",
+		Short: "Show or set opt-in structured redaction of get -o json|yaml output",
+		Long: "Blank KNOWN sensitive fields (Secret data/stringData, a container\n" +
+			"env[].value) in the output of a non-interactive, non-watch `get -o\n" +
+			"json|yaml`, running kubectl as a child and re-emitting the redacted\n" +
+			"document. 'off' (default) is byte-for-byte identical to no guard on the\n" +
+			"output path (syscall.Exec passthrough).\n\n" +
+			"It is best-effort defense-in-depth against ACCIDENTAL disclosure (a secret\n" +
+			"scrolling in an agent-captured terminal), NOT a containment boundary: an\n" +
+			"unparseable document passes through UNREDACTED (fail-open), and only known\n" +
+			"schemas are touched (never a CRD, never free text). Every other command —\n" +
+			"mutations, interactive verbs, table/jsonpath/wide reads, and `get -w` —\n" +
+			"keeps the untouched syscall.Exec passthrough.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Redact output: " + cfg.RedactOutputMode())
+				return nil
+			}
+			if !cfg.SetRedactOutputMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q or %q)", args[0], config.RedactOutputOff, config.RedactOutputStructured)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Redact output set: " + cfg.RedactOutputMode())
 			return nil
 		},
 	})
@@ -1096,8 +2488,9 @@ func runConfigCommand() error {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
-		Use:   "audit",
-		Short: "Show the audit log path and recent entries",
+		Use:   "audit [verify]",
+		Short: "Show the audit log, or verify its tamper-evident chain",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadOrCreateConfig()
 			if err != nil {
@@ -1106,6 +2499,12 @@ func runConfigCommand() error {
 			path, err := config.AuditPath(cfg)
 			if err != nil {
 				return err
+			}
+			if len(args) == 1 && args[0] == "verify" {
+				return runAuditVerify(cfg, path)
+			}
+			if len(args) == 1 {
+				return fmt.Errorf("unknown audit subcommand %q (want 'verify')", args[0])
 			}
 			ui.PrintInfo("Audit log: " + path)
 			data, err := os.ReadFile(path)
@@ -1144,10 +2543,11 @@ func runConfigCommand() error {
 			cfg, err := config.Load()
 			if err != nil {
 				// An unparseable config file is itself a fatal validation
-				// failure. Print it and exit non-zero directly, so the output is
-				// the single clean line below rather than cobra's usage dump plus
-				// a doubled "Error:" from the top-level handler.
-				ui.PrintWarning("Config is not valid YAML: " + err.Error())
+				// failure. config.Load already wraps it as "config file <path> is
+				// not valid YAML: ..."; print that verbatim (don't re-prefix, which
+				// doubled the phrase) and exit non-zero directly, so the output is a
+				// single clean line rather than cobra's usage dump.
+				ui.PrintWarning(err.Error())
 				os.Exit(1)
 			}
 			cfg.ApplyDefaults()
@@ -1179,9 +2579,67 @@ func runConfigCommand() error {
 		},
 	})
 
-	// Parse args starting from "config"
-	rootCmd.SetArgs(os.Args[2:])
-	return rootCmd.Execute()
+	return rootCmd
+}
+
+// runConfigCommand executes a `kubectl-guard config ...` invocation. It parses
+// args starting after "config" (os.Args[2:]), matching the top-level dispatch.
+func runConfigCommand() error {
+	cmd := newConfigCommand()
+	cmd.SetArgs(os.Args[2:])
+	return cmd.Execute()
+}
+
+// newRootCommand builds a cobra command tree that models kubectl-guard's OWN
+// subcommands (config + its subtree, doctor, explain). Its only job is to back
+// shell-completion generation and dynamic completion — the actual top-level
+// dispatch stays the manual switch in run(), because a cobra root would try to
+// parse kubectl passthrough (`kubectl-guard get pods`) as its own command. Cobra
+// auto-attaches the `completion` subcommand to a root that has children.
+func newRootCommand() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "kubectl-guard",
+		Short:         "Protect production clusters and sensitive resources from accidental kubectl commands",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+	}
+	root.SetFlagErrorFunc(guardFlagErrorFunc)
+	root.AddCommand(newConfigCommand())
+	root.AddCommand(&cobra.Command{
+		Use:   "doctor",
+		Short: "Check PATH-shadowing interception, config, and posture",
+		RunE:  func(_ *cobra.Command, _ []string) error { return runDoctor(nil) },
+	})
+	root.AddCommand(&cobra.Command{
+		Use:   "explain",
+		Short: "Preflight: would a kubectl command be gated, and why?",
+		RunE:  func(_ *cobra.Command, args []string) error { return runExplain(args) },
+	})
+	root.AddCommand(&cobra.Command{
+		Use:   "uninstall",
+		Short: "Remove the PATH-shadowing shim (and, with --purge, config + audit log)",
+		RunE:  func(_ *cobra.Command, args []string) error { return runUninstall(args) },
+	})
+	return root
+}
+
+// invokedAsGuard reports whether the binary was invoked by its own name
+// (kubectl-guard, or a dev/test build thereof) rather than as the `kubectl`
+// shim. It disambiguates `completion`/`__complete`, which BOTH kubectl-guard and
+// kubectl (both cobra-based) define: invoked as ourselves they mean the guard's
+// completion; invoked as the kubectl shim they are kubectl's own and must pass
+// through untouched.
+func invokedAsGuard() bool {
+	return strings.Contains(filepath.Base(os.Args[0]), "kubectl-guard")
+}
+
+// runRootCompletion drives the modeled root command for both `completion <shell>`
+// (script generation) and cobra's hidden `__complete`/`__completeNoDesc` runtime
+// requests (dynamic completion), which the sourced script issues.
+func runRootCompletion() error {
+	root := newRootCommand()
+	root.SetArgs(os.Args[1:])
+	return root.Execute()
 }
 
 // mutateConfig loads (or creates) the config, applies fn, saves on change, and
@@ -1272,7 +2730,11 @@ func configCommandString() string {
 }
 
 func printConfig() error {
-	exists, err := config.Exists()
+	// Show the EFFECTIVE (merged) config — the enforced SYSTEM baseline (if any)
+	// merged under the USER config — because that is what the guard actually
+	// enforces. Entries that come from the system baseline are tagged "[system]"
+	// so it is clear which rules the user cannot remove (issue #86).
+	cfg, exists, err := config.LoadEffective()
 	if err != nil {
 		return err
 	}
@@ -1281,17 +2743,25 @@ func printConfig() error {
 		return nil
 	}
 
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+	sys := cfg.SystemLayer()
+	if cfg.SystemEnforced() {
+		ui.PrintInfo(fmt.Sprintf("Enforced system baseline active (%s) — the entries tagged [system] below cannot be removed from your config.", config.SystemConfigPath))
+	} else if sys != nil {
+		ui.PrintInfo(fmt.Sprintf("System baseline present (%s, not enforced).", config.SystemConfigPath))
+	}
+	sysHas := func(has func(*config.Config) bool) string {
+		if sys != nil && has(sys) {
+			return "  [system]"
+		}
+		return ""
 	}
 
 	ui.PrintInfo("Protected contexts:")
 	if len(cfg.ProtectedContexts) == 0 {
 		fmt.Println("  (none)")
 	} else {
-		for _, ctx := range cfg.ProtectedContexts {
-			fmt.Printf("  - %s\n", ctx)
+		for _, pp := range cfg.ProtectedContexts {
+			fmt.Printf("  - %s%s\n", formatPattern(pp), sysHas(func(c *config.Config) bool { return stringInList(c.ProtectedContextPatterns(), pp.Pattern) }))
 		}
 	}
 
@@ -1300,7 +2770,7 @@ func printConfig() error {
 		fmt.Println("  (none)")
 	} else {
 		for _, r := range cfg.ProtectedResources {
-			fmt.Printf("  - %s\n", r)
+			fmt.Printf("  - %s%s\n", r, sysHas(func(c *config.Config) bool { return c.IsResourceProtected(r) }))
 		}
 	}
 
@@ -1308,21 +2778,38 @@ func printConfig() error {
 	if len(cfg.ProtectedNamespaces) == 0 {
 		fmt.Println("  (none)")
 	} else {
-		for _, ns := range cfg.ProtectedNamespaces {
-			fmt.Printf("  - %s\n", ns)
+		for _, pp := range cfg.ProtectedNamespaces {
+			fmt.Printf("  - %s%s\n", formatPattern(pp), sysHas(func(c *config.Config) bool { return stringInList(c.ProtectedNamespacePatterns(), pp.Pattern) }))
+		}
+	}
+
+	ui.PrintInfo("Protected clusters (by API server identity):")
+	if len(cfg.ProtectedClusters) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		for _, pc := range cfg.ProtectedClusters {
+			fmt.Printf("  - %s%s\n", formatClusterKey(pc), sysHas(func(c *config.Config) bool { return stringInList(c.ProtectedClusterKeys(), clusterKey(pc)) }))
 		}
 	}
 
 	ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 	ui.PrintInfo("Blast radius: " + cfg.BlastRadiusMode())
+	if cfg.HasSensitiveKinds() {
+		ui.PrintInfo(fmt.Sprintf("Sensitive kinds (%s): %s", cfg.SensitiveKindMode(), strings.Join(cfg.SensitiveKinds, ", ")))
+	}
 	ui.PrintInfo("Unknown verb: " + cfg.UnknownVerbMode())
+	ui.PrintInfo("Redact output: " + cfg.RedactOutputMode())
 	ui.PrintInfo("Require confirm on weakening: " + onOff(cfg.RequireConfirmWeakening))
 
 	printActorPolicies(cfg)
 	printCommandOverrides(cfg)
 
 	auditPath, _ := config.AuditPath(cfg)
-	ui.PrintInfo("Audit log: " + auditPath)
+	if pinned, ok := cfg.PinnedAuditLog(); ok {
+		ui.PrintInfo("Audit log: " + auditPath + "  [system-pinned: " + pinned + "]")
+	} else {
+		ui.PrintInfo("Audit log: " + auditPath)
+	}
 	if cfg.AuditMaxSizeMB > 0 {
 		ui.PrintInfo(fmt.Sprintf("Audit rotation: %d MB, %d archive(s)", cfg.AuditMaxSizeMB, cfg.AuditMaxFilesOrDefault()))
 	}
@@ -1408,6 +2895,74 @@ func displayMode(m string) string {
 	return m
 }
 
+// isValidProtectionMode reports whether m is a valid per-pattern protection mode
+// (confirm or block). The two axes (context/namespace) share the same values.
+func isValidProtectionMode(m string) bool {
+	return m == config.ContextModeConfirm || m == config.ContextModeBlock
+}
+
+// formatPattern renders a protected pattern with its mode for `config list`:
+// "prod-* (block)" for an explicit per-pattern mode, "staging-* (inherit)" when
+// it inherits the global context_mode / namespace_mode.
+func formatPattern(pp config.ProtectedPattern) string {
+	mode := pp.Mode
+	if mode == "" {
+		mode = "inherit"
+	}
+	return fmt.Sprintf("%s (%s)", pp.Pattern, mode)
+}
+
+// stringInList reports whether s is present in list.
+func stringInList(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// clusterKey renders the mode-less display key of a protected cluster
+// ("server=..." / "server_pattern=..."), matching config.ProtectedClusterKeys,
+// for system-provenance membership checks.
+func clusterKey(pc config.ProtectedCluster) string {
+	if pc.ServerPattern != "" {
+		return "server_pattern=" + pc.ServerPattern
+	}
+	return "server=" + pc.Server
+}
+
+// systemHasCluster reports whether the system baseline protects the cluster
+// identified by value (a raw server/pattern or a "server[_pattern]=" list key),
+// for the remove-cluster still-enforced note.
+func systemHasCluster(sys *config.Config, value string) bool {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "server_pattern=")
+	value = strings.TrimPrefix(value, "server=")
+	for _, k := range sys.ProtectedClusterKeys() {
+		id := strings.TrimPrefix(strings.TrimPrefix(k, "server_pattern="), "server=")
+		if id == value {
+			return true
+		}
+	}
+	return false
+}
+
+// formatClusterKey renders a protected cluster with its mode for `config list` /
+// doctor, mirroring formatPattern: "server=https://prod (block)" or
+// "server_pattern=*.prod.example.com (inherit)".
+func formatClusterKey(pc config.ProtectedCluster) string {
+	key := "server=" + pc.Server
+	if pc.ServerPattern != "" {
+		key = "server_pattern=" + pc.ServerPattern
+	}
+	mode := pc.Mode
+	if mode == "" {
+		mode = "inherit"
+	}
+	return fmt.Sprintf("%s (%s)", key, mode)
+}
+
 // printCommandOverrides lists the configured command classification overrides.
 func printCommandOverrides(cfg *config.Config) {
 	ui.PrintInfo("Command overrides:")
@@ -1449,7 +3004,7 @@ func loadOrCreateConfig() (*config.Config, error) {
 		cfg.ApplyDefaults()
 		return cfg, nil
 	}
-	cfg := &config.Config{ProtectedContexts: []string{}}
+	cfg := &config.Config{ProtectedContexts: []config.ProtectedPattern{}}
 	cfg.ApplyDefaults()
 	return cfg, nil
 }
@@ -1463,13 +3018,29 @@ Usage:
   kubectl-guard explain [--json] -- <kubectl args...>
                                       Preflight: would this be gated, and why?
                                       (runs the decision without kubectl/prompt/audit)
-  kubectl-guard doctor                Check PATH-shadowing interception
+  kubectl-guard doctor [--json] [--require-interception]
+                                      Health check: interception, config,
+                                      audit, context resolution, and posture
+                                      (exit non-zero if any check fails;
+                                      --require-interception makes an inactive
+                                      PATH-shadow a failure, for CI gating)
+  kubectl-guard freeze                Global read-only mode: block ALL
+                                      state-altering commands (incident switch)
+  kubectl-guard unfreeze              Lift read-only mode
+  kubectl-guard uninstall [--purge] [--shim-dir <dir>]
+                                      Remove the PATH-shadowing shim and report
+                                      the PATH line to strip; --purge also
+                                      deletes the config + audit log (confirmed)
   kubectl-guard --version             Print version (or -V)
   kubectl-guard --help                Print this help
 
 Protection model:
   - Protected CONTEXTS: state-altering commands require confirmation (or are
     hard-blocked in context_mode: block).
+  - Protected CLUSTERS: same gating, but keyed on the API server URL (cluster
+    identity) rather than the spoofable context name, so an aliased/renamed
+    context or a crafted --kubeconfig still gates. Strictly additive to context
+    protection.
   - Protected NAMESPACES: state-altering commands are gated when the target
     namespace (--namespace/-n, the context's namespace, or "default", and any
     namespace under --all-namespaces/-A) matches (or blocked in
@@ -1480,6 +3051,13 @@ Protection model:
     any namespace is protected, since its targets cannot be known in advance.
   - Protected RESOURCES: any command touching the resource is blocked
     everywhere (reads included), e.g. block all secret access.
+  - Layered/ENFORCED config: an admin may place a system baseline at
+    /etc/kubectl-guard/config.yaml. It is merged UNDER your ~/.kubectl-guard.yaml
+    most-restrictive-wins (the user layer can only ADD protection, never weaken
+    it). With 'enforced: true' the baseline also forbids the env escape hatches
+    (KUBECTL_GUARD_BYPASS / KUBECTL_GUARD_AUDIT_LOG / KUBECTL_GUARD_CONFIG), so it
+    cannot be turned off by an environment variable. 'config list' tags the
+    entries that come from the system baseline with [system].
   - Dry-run (--dry-run=client|server) skips the prompt; real-mutation forms
     (--dry-run=none|false, plain apply) still gate. Resource blocks still apply.
   - The --context / --kubeconfig / --namespace flags are honored; --server
@@ -1489,6 +3067,8 @@ Protection model:
 Guard-only flags (stripped before forwarding to kubectl):
   --json         Emit a structured decision object on stderr for non-allow
   --yes          Auto-confirm a gated command (audited; block mode not bypassed)
+  --reason <why> Free-text justification recorded on the audit entry for a gated
+                 command; required with --yes when require_justification is on
   --no-prompt    Headless: no interactive setup wizard. With no config, the
                  posture comes from KUBECTL_GUARD_BOOTSTRAP (deny by default:
                  state-altering commands are refused, reads pass, nothing is
@@ -1505,6 +3085,11 @@ Config subcommands:
   remove-resource <name>     Stop blocking a resource
   add-namespace <pattern>    Gate state changes in matching namespaces (glob)
   remove-namespace <pattern> Stop protecting matching namespaces
+  add-cluster <server|glob>  Protect by CLUSTER identity (the API server URL, or
+                             a host glob like '*.prod.example.com'), so an aliased
+                             or renamed context cannot dodge protection (optional
+                             --mode confirm|block)
+  remove-cluster <value>     Stop protecting a cluster (server URL, pattern, or key)
   confirm-mode [simple|type-name|agent-relay]
                              Show or set the confirmation prompt style
                              (type-name requires typing the context/namespace name;
@@ -1535,6 +3120,12 @@ Config subcommands:
                              How to treat a verb the guard cannot classify on a
                              protected target: allow (default), gate (confirm),
                              or deny (refuse). Unprotected targets always pass
+  redact-output [off|structured]
+                             Opt-in structured redaction of get -o json|yaml
+                             output: blank known sensitive fields (Secret
+                             data/stringData, container env values). off
+                             (default) is byte-identical syscall.Exec passthrough;
+                             best-effort defense-in-depth, not a boundary
   confirm-weakening [on|off] Require confirmation for a config change that weakens
                              protection (every config change is audited regardless)
   audit                      Show the audit log path and recent entries
@@ -1561,13 +3152,13 @@ Examples:
   kubectl delete pod nginx    # Prompts on protected contexts
 
 Environment:
-  Config file: ~/.kubectl-guard.yaml
-  Audit log:   ~/.kubectl-guard-audit.log
+  Config file: ~/.kubectl-guard.yaml   (override: KUBECTL_GUARD_CONFIG=/path)
+  Audit log:   ~/.kubectl-guard-audit.log  (override: KUBECTL_GUARD_AUDIT_LOG=/path)
   KUBECTL_GUARD_BOOTSTRAP=deny|empty|prompt  Headless first-run posture when no
                  config exists (default deny: refuse state-altering commands,
                  allow reads, write nothing).
   See the README for the other KUBECTL_GUARD_* variables (actor, headless
-  bootstrap, CONFIRM, BYPASS).
+  bootstrap, CONFIRM, BYPASS, STRICT).
 `
 	fmt.Print(strings.TrimSpace(help) + "\n")
 }

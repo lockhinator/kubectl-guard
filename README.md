@@ -22,6 +22,50 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
 
 ## What's New
 
+### v1.0.0 — Team baselines, supply-chain trust & defense-in-depth
+
+- **Enforced system baseline** — an admin drops a config at
+  `/etc/kubectl-guard/config.yaml` and it is merged **under** each user's
+  `~/.kubectl-guard.yaml`, **most-restrictive-wins** (the user layer can only
+  *add* protection, never weaken it). With `enforced: true` the baseline also
+  **forbids the env escape hatches** (`KUBECTL_GUARD_BYPASS` /
+  `KUBECTL_GUARD_AUDIT_LOG` / `KUBECTL_GUARD_CONFIG`), so it can't be turned off
+  by an environment variable. `config list` tags system entries `[system]`.
+- **Cluster-identity protection** — `protected_clusters` gates by the resolved
+  **API server URL** (exact `server` or a `server_pattern` glob) rather than the
+  spoofable context name, so an aliased/renamed context or a crafted
+  `--kubeconfig` still gates. Strictly additive to `protected_contexts`.
+- **Per-pattern protection modes** — `protected_contexts` / `protected_namespaces`
+  entries may now be `{pattern: prod-*, mode: block}`, overriding the global mode
+  per pattern (set with `add-context --mode`/`add-namespace --mode`).
+- **Sensitive-kind gating** — `sensitive_kinds` + `sensitive_kind_mode`
+  (`off`|`confirm`|`block`) gate **state-altering** commands whose target kind
+  matches (e.g. `node`, `namespace`), on every context, while leaving reads alone.
+- **Global read-only / freeze** — `read_only` (or `freeze`/`unfreeze`, or
+  `KUBECTL_GUARD_READONLY`) blocks every non-safe command everywhere — the
+  incident panic button; `--yes` does not override it.
+- **Captured justifications** — `require_justification` requires a free-text
+  `--reason` to approve a gated command, recorded on the audit entry.
+- **Structured output redaction (opt-in)** — `redact_output: structured` blanks
+  known secret fields (Secret `data`/`stringData`, container `env[].value`, the
+  last-applied-configuration annotation) in a non-interactive `get -o json|yaml`.
+  Defense-in-depth against *accidental* disclosure, **not** a containment
+  boundary; fails open; `off` (default) is byte-for-byte the old passthrough.
+- **Config hardening** — `strict_config_perms` (or `KUBECTL_GUARD_STRICT`) fails
+  **closed** when the config file/dir is group/world-writable.
+- **Tamper-evident audit** — `audit_hmac_key_file` (or `KUBECTL_GUARD_AUDIT_KEY`)
+  turns the audit log into an HMAC hash chain; `config audit verify` checks it.
+- **`doctor` health battery** — `doctor [--json] [--require-interception]` now
+  checks kubectl reachability, interception, config validity + permissions, audit
+  writability, and context resolution, and prints the effective posture (exit
+  non-zero on any failure).
+- **`uninstall`** — `uninstall [--purge] [--shim-dir <dir>]` removes the
+  PATH-shadow shim; `--purge` also deletes config + audit (+ rotated archives).
+- **Signed, verifiable releases** — every release is **cosign-signed** with
+  **SLSA build provenance** and an **SBOM**, distributed via Homebrew cask and
+  `.deb`/`.rpm`/`.apk` packages. Native Windows is a documented non-goal — run
+  under WSL2.
+
 ### v0.6.0 — Access-aware policy, self-defense & agent preflight
 
 - **Sensitive-access gating** — `sensitive_access: gate|block` gates the verbs that *read/reach* into a workload — `exec`, `cp`, `attach`, `debug`, `port-forward`, `proxy` — on **every** context, not just protected ones, because their risk is what they can reach (a Secret via `exec … cat` or a `debug` ephemeral container, a node root shell via `debug node/…`, a tunnel to a workload), independent of where they run. Verb set configurable via `sensitive_verbs`.
@@ -83,6 +127,27 @@ When an autonomous agent has cluster access, these are all one command away from
 
 kubectl-guard is the guardrail that catches every one of these — and works just as well for tired, distracted humans.
 
+## Platform support
+
+kubectl-guard runs on **Linux** and **macOS** (amd64 and arm64). Prebuilt
+binaries are published for both.
+
+**Native Windows is an explicit non-goal for v1.0.** The guard's whole model is
+unix-only: it replaces its own process with kubectl via `execve` (Windows has no
+equivalent), serializes its audit log with `flock`, and intercepts kubectl by
+PATH-shadowing a `kubectl` symlink. Porting these to Windows (spawn-and-proxy
+exec, `LockFileEx`, a `.exe`/`Get-Command` shim) is a substantial effort with no
+current demand.
+
+**Windows users: run kubectl-guard under [WSL2](https://learn.microsoft.com/windows/wsl/install).**
+Inside a WSL2 Linux distro the guard installs and works exactly as it does on
+Linux — install kubectl and kubectl-guard in WSL2 and run your `kubectl`
+commands there. Running the binary on native Windows prints this guidance and
+exits without doing anything.
+
+If native Windows support becomes worthwhile, it needs the exec/lock/shim port
+above before the GoReleaser `windows` target is re-enabled.
+
 ## Installation
 
 **mise** (recommended) — installs the prebuilt binary from GitHub Releases:
@@ -91,6 +156,24 @@ kubectl-guard is the guardrail that catches every one of these — and works jus
 mise use -g github:lockhinator/kubectl-guard
 ```
 
+**Homebrew** (macOS and Linuxbrew):
+
+```bash
+brew install lockhinator/tap/kubectl-guard
+```
+
+**Linux packages** — `.deb`, `.rpm`, and `.apk` are attached to each
+[release](https://github.com/lockhinator/kubectl-guard/releases); download the
+one for your distro and arch, then:
+
+```bash
+sudo dpkg -i kubectl-guard_*_linux_amd64.deb     # Debian/Ubuntu
+sudo rpm -i  kubectl-guard_*_linux_amd64.rpm     # Fedora/RHEL/openSUSE
+sudo apk add --allow-untrusted kubectl-guard_*_linux_amd64.apk  # Alpine
+```
+
+Verify any downloaded artifact first — see [Verifying a release](#verifying-a-release).
+
 **From source:**
 
 ```bash
@@ -98,6 +181,12 @@ git clone https://github.com/lockhinator/kubectl-guard
 cd kubectl-guard
 make install
 ```
+
+> **Not a krew plugin, by design.** krew installs `kubectl` *subcommand* plugins
+> (`kubectl foo`), but kubectl-guard is a **shim** that wraps `kubectl` itself to
+> gate every command — the opposite of a subcommand. A krew plugin could not
+> intercept `kubectl delete`; it would only add `kubectl guard`. So kubectl-guard
+> is distributed as a standalone binary (above), not via krew.
 
 Then add the alias to your shell config (`~/.zshrc` or `~/.bashrc`):
 
@@ -231,6 +320,48 @@ without hanging, while refusing to mutate a cluster it cannot vouch for.
 export KUBECTL_GUARD_BOOTSTRAP=empty
 ```
 
+## Verifying a release
+
+kubectl-guard installs as a PATH-shadowing `kubectl` shim that intercepts *every*
+kubectl call, so a tampered release would be a total, silent bypass. Every
+release is therefore **cosign-signed** and carries **SLSA build provenance** and
+an **SBOM**. Verify a download before installing it — checksums alone prove
+integrity against the release page, not authenticity.
+
+Each GitHub Release includes the archives, `checksums.txt`, its cosign Sigstore
+bundle (`checksums.txt.sigstore.json` — signature + signing certificate + Rekor
+transparency-log entry), and an SPDX-JSON SBOM per archive (`*.sbom.json`).
+
+**1. Verify the cosign signature** of the checksums file (keyless — the signer is
+this repo's release workflow, no key to trust). Needs cosign v2.6+ or v3:
+
+```bash
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/lockhinator/kubectl-guard/\.github/workflows/release\.yml@.+$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  checksums.txt
+# → Verified OK
+```
+
+**2. Verify the archive against the (now-trusted) checksums:**
+
+```bash
+sha256sum --ignore-missing -c checksums.txt
+# → kubectl-guard_<version>_linux_amd64.tar.gz: OK
+```
+
+**3. Verify SLSA build provenance** — proves the artifact was built by this repo's
+workflow (needs the [GitHub CLI](https://cli.github.com/)):
+
+```bash
+gh attestation verify kubectl-guard_<version>_linux_amd64.tar.gz \
+  --repo lockhinator/kubectl-guard
+# → Verification succeeded!
+```
+
+Only install an artifact once all three checks pass.
+
 ## Using kubectl-guard with AI agents
 
 The agent-safe setup is two commands:
@@ -292,6 +423,12 @@ agent-relay can never downgrade a block into an approvable request.
 By default the audit log captures **every** command the agent runs — including the ones it was allowed to run — not just the ones that were gated. So when Claude shells into your cluster, you get a complete, timestamped record of everything it executed, which is invaluable for post-incident review. Tune this with `config audit-mode` (`all` | `gated` | `off`).
 
 ### Secret redaction
+
+This section is about redacting secrets the guard writes to **its own surfaces**
+(the audit log, `--json`, prompts). Redacting the **output kubectl prints** is a
+separate, opt-in feature — see `redact_output: structured` in
+[Configuration](#configuration); by default the guard blocks commands rather than
+filtering their output.
 
 Secret-bearing flag **values** are redacted from every surface the guard
 produces — the audit log, `--json` output, and user-facing messages — while the
@@ -526,11 +663,43 @@ diff_before_confirm: true # optional: show `kubectl diff` before the confirm pro
 Fields:
 - **`protected_contexts`** — glob patterns of contexts that gate
   state-altering commands (require confirmation). See
-  [Glob pattern semantics](#glob-pattern-semantics).
+  [Glob pattern semantics](#glob-pattern-semantics). Each entry is either a bare
+  string (inherits the global `context_mode`) **or** a `{pattern, mode}` mapping
+  that sets a per-pattern mode:
+
+  ```yaml
+  protected_contexts:
+    - prod-*                            # inherits context_mode
+    - {pattern: 'prod-us-east-1', mode: block}   # hard-block just this one
+  ```
+
+  Set a per-pattern mode from the CLI with `config add-context <pattern> --mode
+  confirm|block` (use `--mode -` to revert to inheriting the global mode).
+- **`protected_clusters`** — protect by **cluster identity** (the resolved API
+  server URL) instead of the spoofable context name, so an aliased/renamed
+  context or a crafted `--kubeconfig` still gates. Each entry is a mapping with
+  an exact `server:` **or** a `server_pattern:` glob, plus an optional per-entry
+  `mode:`. Strictly additive: a command is gated if the context name matches
+  `protected_contexts` **or** the resolved server matches here.
+
+  ```yaml
+  protected_clusters:
+    - {server: 'https://api.prod.example.com:6443'}   # exact URL
+    - {server_pattern: '*.prod.example.com', mode: block}   # host glob
+  ```
+
+  Caveats: a `server_pattern` like `*.prod.example.com` matches subdomains but
+  **not** the apex `prod.example.com` — list the apex separately. A cluster
+  reachable via several distinct URLs/IPs must have each form listed to be fully
+  covered. For an exact match use the full `https://` URL. Manage with
+  `config add-cluster <server-or-glob> [--mode ...]` /
+  `config remove-cluster <value>` (a value containing a glob metacharacter is
+  stored as a `server_pattern`, otherwise as an exact `server`).
 - **`protected_namespaces`** — glob patterns of namespaces that gate
   state-altering commands (resolved from `--namespace`/`-n`, the context's
   baked-in namespace, or `default`). Same glob semantics as
-  `protected_contexts`.
+  `protected_contexts`, and the same per-pattern `{pattern, mode}` form
+  (`config add-namespace <pattern> --mode confirm|block`).
 - **`protected_resources`** — resources blocked everywhere, reads included
 - **`context_mode`** — `confirm` (default, prompts) or `block` (hard-refuse)
 - **`namespace_mode`** — `confirm` (default) or `block`, for protected namespaces
@@ -698,6 +867,64 @@ Fields:
   only ever add short names, never weaken protection, and if `api-resources` fails
   (offline, RBAC) the built-in short names still work. Set to `false` for
   air-gapped or latency-sensitive use
+- **`sensitive_kinds`** + **`sensitive_kind_mode`** — gate **state-altering**
+  commands whose target **kind** matches one of `sensitive_kinds`, on **every**
+  context, while leaving reads of that kind alone — the middle tier between "block
+  all access to a kind" (`protected_resources`) and "gate by location"
+  (`protected_contexts`/`protected_namespaces`). `sensitive_kind_mode` is
+  `off` (default), `confirm`, or `block`. Kinds match singular/plural/short-name
+  forms (`node`/`nodes`/`no`). It matches a resource token, an inspectable `-f`
+  manifest kind, and the implicit node target of `cordon`/`uncordon`/`drain`; it
+  does **not** cover un-inspectable sources (`-f -`, a URL, `-k`, `--raw`) — use
+  `protected_resources` for a fail-closed block that also covers those. Manage
+  with `config sensitive-kind <off|confirm|block>` and
+  `config add-sensitive-kind <kind>` / `config remove-sensitive-kind <kind>`
+  (adding the first kind while the mode is `off` bumps it to `confirm`)
+- **`read_only`** — global **read-only / freeze** (the incident panic button).
+  When true, **every** state-altering command is blocked regardless of
+  context/namespace/actor; reads pass, a genuine `--dry-run` passes, and `--yes`
+  does **not** override it (it is absolute, not a confirm). Toggle with
+  `kubectl-guard freeze` / `kubectl-guard unfreeze`, or per-invocation via the
+  `KUBECTL_GUARD_READONLY` env var (e.g. during an incident). Off by default
+- **`require_justification`** — when true, a gated command requires a free-text
+  reason to approve; the reason is recorded on the audit entry (for compliance /
+  post-incident review). An empty reason **aborts** (fail closed). Non-interactive
+  approvals supply it with `--reason "<why>"`; `--yes` without a reason aborts. Off
+  by default. Toggle with `config require-justification on`
+- **`strict_config_perms`** — when true, a group/world-writable config file (or
+  its parent directory) becomes a **fatal, fail-closed** error (every command
+  denied until the mode is fixed) instead of a warning. `Save` writes `0600`; a
+  looser mode lets another user rewrite the policy — e.g. empty the protected
+  lists — and silently disable protection. Off by default. Also settable via the
+  `KUBECTL_GUARD_STRICT` env var
+- **`audit_hmac_key_file`** — path to a file whose contents are the **HMAC key**
+  for the tamper-evident audit chain. When set (or `KUBECTL_GUARD_AUDIT_KEY` is
+  exported, which takes precedence and is used directly as the key), each entry's
+  chain hash is an HMAC, so an attacker who can write the log cannot forge a valid
+  continuation without the key. Unset ⇒ plain SHA-256 (still tamper-evident, but
+  forgeable by a local attacker). Verify with `config audit verify`. Keep the key
+  file `0600` — the guarantee depends on it staying secret
+- **`redact_output`** — `off` (default) or `structured`. **Opt-in** structured
+  redaction of read output: on a non-interactive, non-watch `get -o json|yaml`,
+  the guard runs kubectl as a child and blanks **known** secret fields (Secret
+  `data`/`stringData`, container `env[].value` in Pods and workload templates,
+  the last-applied-configuration annotation) before re-emitting. `off` is
+  byte-for-byte identical to no guard on the output path (`syscall.Exec`
+  passthrough). It is best-effort **defense-in-depth against accidental
+  disclosure, explicitly NOT a containment boundary**: an unparseable document
+  passes through **unredacted** (fail-open), and only known built-in schemas are
+  touched (never a CRD, never free text). Every other command — mutations,
+  interactive verbs, table/jsonpath/wide reads, and `get -w` — keeps the untouched
+  passthrough. Set with `config redact-output structured`. See
+  [Secret redaction](#secret-redaction)
+- **`enforced`** — **system-layer only.** Marks a system baseline config
+  (`/etc/kubectl-guard/config.yaml`) as an enforced protection **floor**: it is
+  merged **under** the user config **most-restrictive-wins** (the user can only
+  *add* protection, never weaken it), and it **forbids the env escape hatches**
+  (`KUBECTL_GUARD_BYPASS`, `KUBECTL_GUARD_AUDIT_LOG`, `KUBECTL_GUARD_CONFIG`) so an
+  enforced baseline is never one env var away from off. Ignored in a user config.
+  `config list` and `doctor` tag entries that came from the system layer with
+  `[system]`. See [Layered / enforced config](#layered--enforced-config)
 
 Manage via CLI:
 
@@ -710,12 +937,22 @@ kubectl-guard config add-resource secret  # Block a resource everywhere
 kubectl-guard config remove-resource secret
 kubectl-guard config add-namespace kube-system  # Gate state changes in a namespace
 kubectl-guard config add-namespace 'prod-*'      # Glob patterns supported
+kubectl-guard config add-namespace 'prod-*' --mode block   # Per-pattern mode
 kubectl-guard config remove-namespace kube-system
+kubectl-guard config add-cluster 'https://api.prod.example.com:6443'  # Protect by API-server URL
+kubectl-guard config add-cluster '*.prod.example.com' --mode block    # Or a host glob
+kubectl-guard config remove-cluster '*.prod.example.com'
+kubectl-guard config add-sensitive-kind node     # Gate mutations to nodes everywhere
+kubectl-guard config sensitive-kind block        # off | confirm | block
+kubectl-guard config remove-sensitive-kind node
 kubectl-guard config confirm-mode type-name  # Stronger confirmation prompt
 kubectl-guard config context-mode block      # Hard-block state changes on protected contexts
 kubectl-guard config namespace-mode block    # Hard-block state changes on protected namespaces
+kubectl-guard config require-justification on # Require --reason to approve a gated command
+kubectl-guard config redact-output structured # Opt-in structured output redaction
 kubectl-guard config audit-mode all          # Log every command (default)
 kubectl-guard config audit                # Show audit log path + recent entries
+kubectl-guard config audit verify         # Verify the tamper-evident audit chain
 kubectl-guard config validate             # Check the config for problems (exit non-zero if any)
 kubectl-guard config setup                # Re-run setup wizard
 kubectl-guard config init                 # Write config non-interactively (headless)
@@ -750,6 +987,35 @@ Validation checks the mode fields (`confirm_mode`, `audit_mode`, `context_mode`,
 treat it as the literal string `prod-[` and protect nothing you intended), and
 that protected-resource entries are non-empty. Unknown fields are ignored
 (forward-compatible with configs written by a newer version).
+
+### Layered / enforced config
+
+An admin can ship a **system baseline** at `/etc/kubectl-guard/config.yaml`. It
+is merged **under** each user's `~/.kubectl-guard.yaml` **most-restrictive-wins**:
+the union of the protected lists, and the *stricter* of any mode. The user layer
+can therefore only ever **add** protection, never weaken the baseline.
+
+```yaml
+# /etc/kubectl-guard/config.yaml  (system baseline)
+enforced: true
+protected_contexts:
+  - 'prod-*'
+context_mode: block
+```
+
+With `enforced: true`, the baseline is a non-negotiable floor: the env escape
+hatches are **forbidden** — `KUBECTL_GUARD_BYPASS` is ignored (the command still
+runs guarded and the refused attempt is audited), and `KUBECTL_GUARD_AUDIT_LOG` /
+`KUBECTL_GUARD_CONFIG` are ignored so the policy and audit destinations cannot be
+redirected away. An enforced baseline that does not set `audit_log` still writes
+to the default path, never an env-chosen one.
+
+`kubectl-guard config list` tags entries that come from the system layer with
+`[system]`, and `kubectl-guard doctor` reports the enforced baseline (and a light
+permission check on the system file) so you can see the effective floor. The
+system config path itself is never env-derived, so enforcement cannot be
+self-referentially defeated. (`enforced` is meaningful **only** in the system
+layer; it is ignored in a user config.)
 
 ### Glob pattern semantics
 
@@ -829,17 +1095,70 @@ instead of discovering it at execution time.
 kubectl-guard explain --json -- delete pods --all      # agent preflight
 ```
 
-### Diagnostics
+### Diagnostics — `doctor`
 
 ```bash
-kubectl-guard doctor                      # Check PATH-shadowing interception
+kubectl-guard doctor                       # Health battery + effective posture
+kubectl-guard doctor --json                # Machine-readable report
+kubectl-guard doctor --require-interception # Fail (not warn) if not intercepting
 ```
 
-`doctor` reports whether `kubectl` on `PATH` resolves to the guard (i.e.
-interception is **ACTIVE**), lists every `kubectl` found on `PATH` in order
-(like `which -a kubectl`), and prints the resolved path of the **real**
-kubectl the guard forwards to. Use it after `make install-shim` to confirm
+`doctor` answers "is the guard actually protecting me?" It runs a battery of
+checks and exits **non-zero if any check fails**:
+
+- **kubectl reachable** — the real kubectl is on `PATH` (and prints its resolved
+  path).
+- **interception active** — `kubectl` on `PATH` resolves to the guard
+  (PATH-shadowing). By default an inactive shadow is a **warning** (an alias
+  install is legitimate and invisible to the process); `--require-interception`
+  promotes it to a **failure** so CI/monitoring can gate on it.
+- **system baseline** — whether an enforced/present baseline is active and where,
+  plus a light permission check on the system file.
+- **config readable / valid** — the effective (merged) config loads and passes
+  validation.
+- **config permissions** — not group/world-writable (a **failure** under
+  `strict_config_perms`).
+- **audit log writable**.
+- **current context resolvable** — a **failure** when protected contexts are
+  configured but the context cannot be resolved (fail-closed).
+
+It then prints the **effective posture** (protected contexts/namespaces/clusters/
+resources, sensitive kinds, the modes, `blast_radius`, `sensitive_access`,
+`unknown_verb`, `audit_mode`, `read_only`, enforced baseline). `--json` emits the
+whole report as a structured object. Run it after `make install-shim` to confirm
 agents and non-interactive shells are covered.
+
+### Global read-only — `freeze` / `unfreeze`
+
+```bash
+kubectl-guard freeze      # Block ALL state-altering commands everywhere (incident switch)
+kubectl-guard unfreeze    # Lift read-only mode
+```
+
+`freeze` sets `read_only: true` (the incident panic button): every non-safe
+command is blocked regardless of context/namespace/actor, reads still pass, and
+`--yes` does **not** override it. `unfreeze` lifts it. Both persist to the config
+(audited; `unfreeze` is a weakening, so it is gated by `require_confirm_weakening`
+when on). For a one-off without editing the config, use
+`KUBECTL_GUARD_READONLY=1`.
+
+### Uninstall — `uninstall`
+
+```bash
+kubectl-guard uninstall                         # Remove the PATH-shadow shim
+kubectl-guard uninstall --purge                 # Also delete config + audit log
+kubectl-guard uninstall --shim-dir <dir>        # Non-default shim location
+```
+
+`uninstall` reverses `make install-shim`: it removes the `kubectl` shim symlink
+and the shim's `kubectl-guard` binary, prints the exact `PATH` line to strip
+(pointing at the shell rc that contains it, read-only), and verifies interception
+is now inactive. It is idempotent — a missing shim is reported, not an error. A
+real `kubectl` regular file is never deleted. `--purge` additionally deletes the
+config file, the audit log, its rotated archives, and lock file after a
+confirmation (skip with `--yes`); the destruction is recorded in the audit chain
+first, so a configured off-box sink still captures it. `make uninstall-shim`
+wraps this command.
 
 ### Automation escape hatch (audited)
 
@@ -960,7 +1279,12 @@ than blocking on stdin.
 | `KUBECTL_GUARD_NO_PROMPT` | Truthy: skip the setup wizard (headless). The resulting posture is set by `KUBECTL_GUARD_BOOTSTRAP`. |
 | `KUBECTL_GUARD_BOOTSTRAP` | `deny` (default) \| `empty` \| `prompt` — headless first-run posture when there is no config. `deny` refuses state-altering commands and writes no config. |
 | `KUBECTL_GUARD_CONFIRM` | Truthy (`yes`): auto-confirm gated commands (audited as `auto-confirmed`). |
-| `KUBECTL_GUARD_BYPASS` | Truthy: disable the guard entirely for one invocation (audited as `bypassed`; discouraged). |
+| `KUBECTL_GUARD_BYPASS` | Truthy: disable the guard entirely for one invocation (audited as `bypassed`; discouraged). Forbidden under an enforced system baseline. |
+| `KUBECTL_GUARD_CONFIG` | Override the config file location. Forbidden (ignored) under an enforced system baseline. |
+| `KUBECTL_GUARD_AUDIT_LOG` | Override the audit log location. Forbidden (ignored) under an enforced system baseline. |
+| `KUBECTL_GUARD_STRICT` | Truthy: fail closed on a group/world-writable config (same as `strict_config_perms: true`). |
+| `KUBECTL_GUARD_READONLY` | Truthy: global read-only / freeze for one invocation — block everything except known-safe reads (including unclassified plugin verbs). |
+| `KUBECTL_GUARD_AUDIT_KEY` | HMAC key for the tamper-evident audit chain (used directly as the key; takes precedence over `audit_hmac_key_file`). |
 
 ## Limitations
 
@@ -979,22 +1303,41 @@ knowing:
   scanning a manifest and `kubectl` re-reading it. The threat model is
   accidents and unsupervised agents, not an adversary swapping a symlink
   mid-flight.
-- **Unknown verbs pass through.** Unrecognized commands (e.g. some plugins)
-  are forwarded without a prompt, but verb normalization prevents uppercase
-  bypass attempts.
+- **Unknown verbs pass through by default.** Unrecognized commands (e.g. some
+  plugins) are forwarded without a prompt, but verb normalization prevents
+  uppercase bypass attempts. On a **protected** target you can close this with
+  `unknown_verb: gate|deny`.
 - **`-k` kustomize** directories are conservatively blocked when resource
   protection is active, but their contents are not deeply parsed.
-- **No output redaction — the guard blocks commands, it does not filter their
-  output.** Once a command is allowed, kubectl's output flows straight to your
-  terminal: the guard hands off with `exec` and never sees it. So a secret
-  value that reaches you *through* a permitted command — an env var in
-  `get pod -o yaml`, a token an app wrote to `logs` — is not redacted. Protect
-  the resource (`config add-resource secret`) and gate the access vectors
-  (`exec`, `cp`, `port-forward`) instead; those are decisions the guard can make
-  from the command line, with certainty, before anything runs. This is a
-  deliberate design decision — see
-  [docs/redaction-decision.md](docs/redaction-decision.md) for the full
-  rationale and the cost analysis behind it.
+- **Env can redirect config + audit destination.** `KUBECTL_GUARD_CONFIG` and
+  `KUBECTL_GUARD_AUDIT_LOG` point the policy file and audit log elsewhere —
+  consistent with the "a determined user can bypass" framing above. An
+  **enforced** system baseline (`enforced: true`) forbids these (and
+  `KUBECTL_GUARD_BYPASS`), so an admin-set floor is not one env var from off.
+- **Audit tamper-evidence is evident, not proof.** Without an HMAC key
+  (`audit_hmac_key_file` / `KUBECTL_GUARD_AUDIT_KEY`) the SHA-256 chain detects
+  edits but a local attacker with the log can recompute it; with a key, forgery
+  needs the key. Either way, **tail-truncation** (deleting the newest entries) is
+  undetectable from the file alone — ship entries off-box (`audit_webhook_url`,
+  `audit_syslog`) for an external anchor.
+- **Cluster-identity matching is only as complete as your list.** A
+  `server_pattern` like `*.prod.example.com` does **not** match the apex
+  `prod.example.com`, and a cluster reachable via multiple URLs/IPs must have each
+  form listed (see `protected_clusters`).
+- **Output redaction is defense-in-depth, not a boundary.** By default the guard
+  blocks commands and does not filter output — once a command is allowed,
+  kubectl's output flows straight to your terminal (the guard hands off with
+  `exec` and never sees it), so a secret reaching you *through* a permitted
+  command — an env var in `get pod -o yaml`, a token an app wrote to `logs` — is
+  not redacted. The **opt-in** `redact_output: structured` blanks *known* secret
+  fields on a non-interactive `get -o json|yaml`, but it is best-effort
+  defense-in-depth against **accidental** disclosure, **not** a containment
+  boundary: it fails **open** on an unparseable document and covers only known
+  built-in schemas (never CRDs, never free text). The primary controls stay the
+  ones the guard can make from the command line with certainty, before anything
+  runs: protect the resource (`config add-resource secret`) and gate the access
+  vectors (`exec`, `cp`, `port-forward`). See
+  [docs/redaction-decision.md](docs/redaction-decision.md) for the full rationale.
 
 ## Reliability
 

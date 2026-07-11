@@ -10,7 +10,7 @@ import (
 // gated on an UNPROTECTED context, while read verbs pass.
 func TestSensitiveAccessGate(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		SensitiveAccess:   config.SensitiveAccessGate,
 	})
 	defer cleanup()
@@ -50,7 +50,7 @@ func TestSensitiveAccessBlock(t *testing.T) {
 // TestSensitiveAccessOffUnchanged: with the default (off), the sensitive verbs
 // behave exactly as before — gated only on a protected context/namespace.
 func TestSensitiveAccessOffUnchanged(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 
 	// exec on an UNPROTECTED context passes (old behavior).
@@ -68,7 +68,7 @@ func TestSensitiveAccessOffUnchanged(t *testing.T) {
 func TestSensitiveAccessComposesMostRestrictive(t *testing.T) {
 	// sensitive gate + context block: the context block wins (Blocked).
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeBlock,
 		SensitiveAccess:   config.SensitiveAccessGate,
 	})
@@ -79,7 +79,7 @@ func TestSensitiveAccessComposesMostRestrictive(t *testing.T) {
 
 	// sensitive block + unprotected context: sensitive block wins (Blocked).
 	cleanup2 := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		SensitiveAccess:   config.SensitiveAccessBlock,
 	})
 	defer cleanup2()
@@ -166,7 +166,7 @@ func TestSensitiveAccessNotBypassedByDryRun(t *testing.T) {
 	}
 	// A NON-sensitive verb still gets the dry-run skip on a protected context.
 	cleanup2 := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		SensitiveAccess:   config.SensitiveAccessBlock,
 		SensitiveVerbs:    []string{"create"},
 	})
@@ -197,39 +197,39 @@ func TestSensitiveVerbsWhitespaceTolerant(t *testing.T) {
 func TestSensitiveAccessNotBypassedByInClusterAllow(t *testing.T) {
 	// block: exec in-cluster under in_cluster=allow must still be Blocked.
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"}, // so the in-cluster branch is entered
+		ProtectedContexts: config.Patterns("prod-*"), // so the in-cluster branch is entered
 		InCluster:         config.InClusterAllow,
 		SensitiveAccess:   config.SensitiveAccessBlock,
 	})
 	defer cleanup()
 	res, _, _, _ := checkWithResolvers([]string{"exec", "pod", "--", "cat", "/etc/secret"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != Blocked {
 		t.Errorf("exec in-cluster, in_cluster=allow, sensitive=block = %v, want Blocked", res)
 	}
 
 	// gate: same setup, gate mode -> RequireConfirmation, not Allow.
 	cleanup2 := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		InCluster:         config.InClusterAllow,
 		SensitiveAccess:   config.SensitiveAccessGate,
 	})
 	defer cleanup2()
 	res, _, _, _ = checkWithResolvers([]string{"exec", "pod", "--", "sh"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != RequireConfirmation {
 		t.Errorf("exec in-cluster, in_cluster=allow, sensitive=gate = %v, want RequireConfirmation", res)
 	}
 
 	// A NON-sensitive command still gets the in_cluster=allow blanket pass.
 	cleanup3 := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		InCluster:         config.InClusterAllow,
 		SensitiveAccess:   config.SensitiveAccessBlock,
 	})
 	defer cleanup3()
 	res, _, _, _ = checkWithResolvers([]string{"delete", "pod", "x"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != Allow {
 		t.Errorf("non-sensitive delete in-cluster, in_cluster=allow = %v, want Allow (blanket pass unaffected)", res)
 	}

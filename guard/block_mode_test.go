@@ -10,7 +10,7 @@ import (
 // command on a protected context is hard-blocked (Blocked, not RequireConfirmation).
 func TestContextBlockModeBlocks(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeBlock,
 	})
 	defer cleanup()
@@ -24,7 +24,7 @@ func TestContextBlockModeBlocks(t *testing.T) {
 // state-altering command on a protected context still requires confirmation.
 func TestContextConfirmModeUnchanged(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeConfirm,
 	})
 	defer cleanup()
@@ -38,7 +38,7 @@ func TestContextConfirmModeUnchanged(t *testing.T) {
 // commands; reads on a protected context still pass.
 func TestContextBlockModeReadOnlyAllowed(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeBlock,
 	})
 	defer cleanup()
@@ -52,7 +52,7 @@ func TestContextBlockModeReadOnlyAllowed(t *testing.T) {
 // commands on a protected namespace.
 func TestNamespaceBlockModeBlocks(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		NamespaceMode:       config.NamespaceModeBlock,
 	})
 	defer cleanup()
@@ -66,9 +66,9 @@ func TestNamespaceBlockModeBlocks(t *testing.T) {
 // block (or vice versa), block wins (most restrictive).
 func TestBlockWinsWhenEitherModeBlock(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:   []string{"prod-*"},
+		ProtectedContexts:   config.Patterns("prod-*"),
 		ContextMode:         config.ContextModeConfirm,
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		NamespaceMode:       config.NamespaceModeBlock,
 	})
 	defer cleanup()
@@ -82,7 +82,7 @@ func TestBlockWinsWhenEitherModeBlock(t *testing.T) {
 // TestBlockModeAppliesToAllNamespaces: -A on a block-mode namespace config blocks.
 func TestBlockModeAppliesToAllNamespaces(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		NamespaceMode:       config.NamespaceModeBlock,
 	})
 	defer cleanup()

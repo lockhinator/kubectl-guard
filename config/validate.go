@@ -62,10 +62,20 @@ func (c *Config) Validate() []string {
 			"blast_radius: %q is not valid (want %q, %q, or %q)",
 			c.BlastRadius, BlastRadiusOff, BlastRadiusGate, BlastRadiusBlock))
 	}
+	if c.SensitiveKind != "" && !validSensitiveKindMode(c.SensitiveKind) {
+		problems = append(problems, fmt.Sprintf(
+			"sensitive_kind_mode: %q is not valid (want %q, %q, or %q)",
+			c.SensitiveKind, SensitiveKindOff, SensitiveKindConfirm, SensitiveKindBlock))
+	}
 	if c.UnknownVerb != "" && !validUnknownVerbMode(c.UnknownVerb) {
 		problems = append(problems, fmt.Sprintf(
 			"unknown_verb: %q is not valid (want %q, %q, or %q)",
 			c.UnknownVerb, UnknownVerbAllow, UnknownVerbGate, UnknownVerbDeny))
+	}
+	if c.RedactOutput != "" && !validRedactOutputMode(c.RedactOutput) {
+		problems = append(problems, fmt.Sprintf(
+			"redact_output: %q is not valid (want %q or %q)",
+			c.RedactOutput, RedactOutputOff, RedactOutputStructured))
 	}
 	if c.AuditMaxSizeMB < 0 {
 		problems = append(problems, fmt.Sprintf("audit_max_size_mb: %d is negative (use 0 to disable rotation)", c.AuditMaxSizeMB))
@@ -106,13 +116,45 @@ func (c *Config) Validate() []string {
 	}
 
 	for _, p := range c.ProtectedContexts {
-		if err := validateGlobPattern(p); err != nil {
-			problems = append(problems, fmt.Sprintf("protected_contexts: pattern %q %v", p, err))
+		if p.Pattern == "" {
+			// An empty pattern matches nothing, so it protects nothing — but a
+			// misspelled key (`patern:`) or a `{mode: block}` with no pattern decodes
+			// to this and would otherwise pass validation, silently dropping the
+			// intended protection. Fail closed.
+			problems = append(problems, "protected_contexts: an entry has an empty pattern (a missing or misspelled `pattern:` key protects nothing)")
+		} else if err := validateGlobPattern(p.Pattern); err != nil {
+			problems = append(problems, fmt.Sprintf("protected_contexts: pattern %q %v", p.Pattern, err))
+		}
+		if p.Mode != "" && !validContextMode(p.Mode) {
+			problems = append(problems, fmt.Sprintf(
+				"protected_contexts: pattern %q has invalid mode %q (want %q or %q)",
+				p.Pattern, p.Mode, ContextModeConfirm, ContextModeBlock))
 		}
 	}
 	for _, p := range c.ProtectedNamespaces {
-		if err := validateGlobPattern(p); err != nil {
-			problems = append(problems, fmt.Sprintf("protected_namespaces: pattern %q %v", p, err))
+		if p.Pattern == "" {
+			problems = append(problems, "protected_namespaces: an entry has an empty pattern (a missing or misspelled `pattern:` key protects nothing)")
+		} else if err := validateGlobPattern(p.Pattern); err != nil {
+			problems = append(problems, fmt.Sprintf("protected_namespaces: pattern %q %v", p.Pattern, err))
+		}
+		if p.Mode != "" && !validNamespaceMode(p.Mode) {
+			problems = append(problems, fmt.Sprintf(
+				"protected_namespaces: pattern %q has invalid mode %q (want %q or %q)",
+				p.Pattern, p.Mode, NamespaceModeConfirm, NamespaceModeBlock))
+		}
+	}
+
+	for _, pc := range c.ProtectedClusters {
+		if pc.Server == "" && pc.ServerPattern == "" {
+			// A missing/misspelled key (`serer:` / `{mode: block}` with no server)
+			// decodes to this and would otherwise protect nothing. Fail closed,
+			// mirroring the empty-pattern rejection above.
+			problems = append(problems, "protected_clusters: an entry must set server or server_pattern (an empty entry protects nothing)")
+		}
+		if pc.Mode != "" && !validContextMode(pc.Mode) {
+			problems = append(problems, fmt.Sprintf(
+				"protected_clusters: entry %q has invalid mode %q (want %q or %q)",
+				pc.identifier(), pc.Mode, ContextModeConfirm, ContextModeBlock))
 		}
 	}
 
@@ -197,9 +239,25 @@ func validBlastRadiusMode(m string) bool {
 	return false
 }
 
+func validSensitiveKindMode(m string) bool {
+	switch m {
+	case SensitiveKindOff, SensitiveKindConfirm, SensitiveKindBlock:
+		return true
+	}
+	return false
+}
+
 func validUnknownVerbMode(m string) bool {
 	switch m {
 	case UnknownVerbAllow, UnknownVerbGate, UnknownVerbDeny:
+		return true
+	}
+	return false
+}
+
+func validRedactOutputMode(m string) bool {
+	switch m {
+	case RedactOutputOff, RedactOutputStructured:
 		return true
 	}
 	return false

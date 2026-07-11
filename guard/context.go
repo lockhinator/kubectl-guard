@@ -4,10 +4,42 @@ package guard
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
+
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
+
+// EnvLegacyContext, when truthy, makes context/namespace resolution shell out to
+// kubectl (the pre-v1.0 behavior) instead of parsing the kubeconfig directly via
+// client-go's clientcmd. A safety hatch in case clientcmd ever diverges from a
+// user's kubectl version.
+const EnvLegacyContext = "KUBECTL_GUARD_LEGACY_CONTEXT"
+
+func useLegacyContext() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvLegacyContext))) {
+	case "1", "t", "true", "yes", "y":
+		return true
+	}
+	return false
+}
+
+// loadKubeconfig parses the kubeconfig directly — no kubectl subprocess — using
+// the same loading rules kubectl itself uses: an explicit --kubeconfig path wins,
+// otherwise the $KUBECONFIG precedence list (colon-separated) is merged, else
+// ~/.kube/config. This is the client-go equivalent of what kubectl does to
+// resolve the current context, so it stays faithful to kubectl's own view.
+func loadKubeconfig(kubeconfig string) (*clientcmdapi.Config, error) {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if kubeconfig != "" {
+		rules.ExplicitPath = kubeconfig
+	}
+	return rules.Load()
+}
 
 // KubectlContext represents a kubectl context.
 type KubectlContext struct {
@@ -24,10 +56,41 @@ func GetCurrentContext() (string, error) {
 	return ResolveContext(nil)
 }
 
-// GetAllContexts returns all available kubectl contexts. It targets the REAL
-// kubectl (via RealKubectlPath) so a PATH-shadowing shim cannot make the guard
-// recurse into itself.
+// GetAllContexts returns all available kubectl contexts by parsing the kubeconfig
+// directly (client-go), so it works without kubectl on PATH and spawns no
+// subprocess. Contexts are returned in name order for deterministic output. Set
+// KUBECTL_GUARD_LEGACY_CONTEXT=1 to fall back to shelling out to kubectl.
 func GetAllContexts() ([]KubectlContext, error) {
+	if useLegacyContext() {
+		return legacyGetAllContexts()
+	}
+	cfg, err := loadKubeconfig("")
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(cfg.Contexts))
+	for name := range cfg.Contexts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	contexts := make([]KubectlContext, 0, len(names))
+	for _, name := range names {
+		c := cfg.Contexts[name]
+		contexts = append(contexts, KubectlContext{
+			Name:      name,
+			Cluster:   c.Cluster,
+			AuthInfo:  c.AuthInfo,
+			Namespace: c.Namespace,
+			Current:   name == cfg.CurrentContext,
+		})
+	}
+	return contexts, nil
+}
+
+// legacyGetAllContexts is the pre-v1.0 shell-out implementation, kept behind
+// KUBECTL_GUARD_LEGACY_CONTEXT. It targets the REAL kubectl (via RealKubectlPath)
+// so a PATH-shadowing shim cannot make the guard recurse into itself.
+func legacyGetAllContexts() ([]KubectlContext, error) {
 	cmd, err := kubectlCommand("config", "get-contexts", "--no-headers")
 	if err != nil {
 		return nil, err
@@ -87,10 +150,26 @@ func resolveContextWith(args []string, current CurrentContextFunc) (string, erro
 	return current(p.Kubeconfig)
 }
 
-// defaultCurrentContext shells out to `kubectl config current-context`,
-// honoring an explicit --kubeconfig path. It targets the REAL kubectl so a
-// PATH-shadowing shim cannot make the guard recurse into itself.
+// defaultCurrentContext resolves the current context by parsing the kubeconfig
+// directly (client-go), honoring an explicit --kubeconfig path. No kubectl
+// subprocess. An unset current-context yields "" (the guard then fails closed on
+// an empty context exactly as before). Set KUBECTL_GUARD_LEGACY_CONTEXT=1 to shell
+// out to kubectl instead.
 func defaultCurrentContext(kubeconfig string) (string, error) {
+	if useLegacyContext() {
+		return legacyCurrentContext(kubeconfig)
+	}
+	cfg, err := loadKubeconfig(kubeconfig)
+	if err != nil {
+		return "", err
+	}
+	return cfg.CurrentContext, nil
+}
+
+// legacyCurrentContext is the pre-v1.0 shell-out to `kubectl config
+// current-context`, kept behind KUBECTL_GUARD_LEGACY_CONTEXT. It targets the REAL
+// kubectl so a PATH-shadowing shim cannot make the guard recurse into itself.
+func legacyCurrentContext(kubeconfig string) (string, error) {
 	base := []string{"config", "current-context"}
 	if kubeconfig != "" {
 		base = append([]string{"--kubeconfig=" + kubeconfig}, base...)
@@ -117,6 +196,43 @@ type NamespaceForContextFunc func(kubeconfig, context string) (string, error)
 // reports no context namespace, so resolution falls back to "default" and no
 // kubectl subprocess is spawned during unit tests that don't opt in.
 func noContextNamespace(_, _ string) (string, error) { return "", nil }
+
+// ServerForContextFunc resolves the API server URL for a context (or "" =
+// current) under a kubeconfig ("" = default rules). Injected so the decision core
+// can gate on cluster identity without a real kubeconfig in tests.
+type ServerForContextFunc func(kubeconfig, context string) (server string, err error)
+
+// defaultServerForContext resolves the API server for a context by parsing the
+// kubeconfig directly (the #31 clientcmd loader), mirroring how kubectl maps
+// context -> cluster -> server. There is no legacy shell-out form: server
+// resolution has no pre-clientcmd implementation, and it is only consulted when
+// protected_clusters is configured.
+func defaultServerForContext(kubeconfig, context string) (string, error) {
+	cfg, err := loadKubeconfig(kubeconfig)
+	if err != nil {
+		return "", err
+	}
+	name := context
+	if name == "" {
+		name = cfg.CurrentContext
+	}
+	if name == "" {
+		return "", fmt.Errorf("no current context to resolve a server for")
+	}
+	kctx, ok := cfg.Contexts[name]
+	if !ok || kctx == nil {
+		return "", fmt.Errorf("context %q not found in kubeconfig", name)
+	}
+	cl, ok := cfg.Clusters[kctx.Cluster]
+	if !ok || cl == nil {
+		return "", fmt.Errorf("cluster %q not found in kubeconfig", kctx.Cluster)
+	}
+	return cl.Server, nil
+}
+
+// noServerForContext is the test-seam resolver (checkWith): it resolves nothing,
+// so existing tests never touch a kubeconfig for server resolution.
+func noServerForContext(string, string) (string, error) { return "", nil }
 
 // InClusterFunc reports whether the guard is running in-cluster (inside a pod on
 // the serviceaccount config, or CI with an in-cluster kubeconfig) and, if so, the
@@ -203,12 +319,33 @@ func defaultContextNamespace(kubeconfig, context string) (string, error) {
 	return ns, err
 }
 
-// lookupContextNamespace reads the namespace baked into a context via
-// `kubectl config view --minify`, honoring an explicit --kubeconfig/--context.
-// It targets the REAL kubectl so a PATH-shadowing shim cannot make the guard
-// recurse into itself. An empty result means the context sets no namespace
-// (kubectl then defaults to "default").
+// lookupContextNamespace reads the namespace baked into a context by parsing the
+// kubeconfig directly (client-go), honoring an explicit --kubeconfig/--context.
+// context "" means the current context. An empty result means the context sets no
+// namespace (kubectl then defaults to "default"). No kubectl subprocess. Set
+// KUBECTL_GUARD_LEGACY_CONTEXT=1 to shell out to kubectl instead.
 func lookupContextNamespace(kubeconfig, context string) (string, error) {
+	if useLegacyContext() {
+		return legacyLookupContextNamespace(kubeconfig, context)
+	}
+	cfg, err := loadKubeconfig(kubeconfig)
+	if err != nil {
+		return "", err
+	}
+	if context == "" {
+		context = cfg.CurrentContext
+	}
+	if c, ok := cfg.Contexts[context]; ok {
+		return c.Namespace, nil
+	}
+	return "", nil
+}
+
+// legacyLookupContextNamespace is the pre-v1.0 shell-out to
+// `kubectl config view --minify`, kept behind KUBECTL_GUARD_LEGACY_CONTEXT. It
+// targets the REAL kubectl so a PATH-shadowing shim cannot make the guard recurse
+// into itself.
+func legacyLookupContextNamespace(kubeconfig, context string) (string, error) {
 	var args []string
 	if kubeconfig != "" {
 		args = append(args, "--kubeconfig="+kubeconfig)

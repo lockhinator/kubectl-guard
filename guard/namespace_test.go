@@ -63,7 +63,7 @@ func TestParseArgsAllNamespacesFalse(t *testing.T) {
 // TestAllNamespacesFalseNotGated: --all-namespaces=false on a scoped delete must
 // not be gated by namespace protection just because a namespace is protected.
 func TestAllNamespacesFalseNotGated(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"delete", "pod", "x", "-n", "default", "--all-namespaces=false"}, staticContext("dev"))
 	if res != Allow {
@@ -83,7 +83,7 @@ func TestResolvedNamespaceDefault(t *testing.T) {
 // TestNamespaceGatedPrompts: state-altering command targeting a protected
 // namespace requires confirmation, even on an unprotected context.
 func TestNamespaceGatedPrompts(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"delete", "pod", "nginx", "-n", "kube-system"}, staticContext("dev"))
 	if res != RequireConfirmation {
@@ -94,7 +94,7 @@ func TestNamespaceGatedPrompts(t *testing.T) {
 // TestNamespaceUnprotectedPassesThrough: same command on an unprotected
 // namespace is allowed.
 func TestNamespaceUnprotectedPassesThrough(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"delete", "pod", "nginx", "-n", "default"}, staticContext("dev"))
 	if res != Allow {
@@ -104,7 +104,7 @@ func TestNamespaceUnprotectedPassesThrough(t *testing.T) {
 
 // TestNamespaceGlobMatch: protected namespace patterns use glob matching.
 func TestNamespaceGlobMatch(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"delete", "pod", "nginx", "-n", "prod-us-east-1"}, staticContext("dev"))
 	if res != RequireConfirmation {
@@ -115,7 +115,7 @@ func TestNamespaceGlobMatch(t *testing.T) {
 // TestAllNamespacesGated: --all-namespaces on a state-altering command gates
 // when any namespace is protected (it spans protected namespaces).
 func TestAllNamespacesGated(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"delete", "pods", "--all-namespaces"}, staticContext("dev"))
 	if res != RequireConfirmation {
@@ -137,8 +137,8 @@ func TestAllNamespacesNoProtection(t *testing.T) {
 // protection is also configured; either triggers gating.
 func TestNamespaceAndContextCompose(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:   []string{"prod-*"},
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedContexts:   config.Patterns("prod-*"),
+		ProtectedNamespaces: config.Patterns("kube-system"),
 	})
 	defer cleanup()
 	// Unprotected context, protected namespace -> gated by namespace.
@@ -155,7 +155,7 @@ func TestNamespaceAndContextCompose(t *testing.T) {
 
 // TestNamespaceReadOnlyPasses: read-only commands on a protected namespace pass.
 func TestNamespaceReadOnlyPasses(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"get", "pods", "-n", "kube-system"}, staticContext("dev"))
 	if res != Allow {
@@ -173,7 +173,7 @@ func fakeContextNamespace(ns string) NamespaceForContextFunc {
 // TestNamespaceFromContextGated: with no -n flag, the namespace baked into the
 // resolved context is consulted; a protected one gates the command.
 func TestNamespaceFromContextGated(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	res, _, _, _ := checkWithResolvers(
 		[]string{"delete", "pod", "nginx"},
@@ -181,6 +181,7 @@ func TestNamespaceFromContextGated(t *testing.T) {
 		fakeContextNamespace("kube-system"),
 		noShortNames,
 		notInCluster,
+		noServerForContext,
 	)
 	if res != RequireConfirmation {
 		t.Errorf("result = %v, want RequireConfirmation (context namespace protected)", res)
@@ -190,7 +191,7 @@ func TestNamespaceFromContextGated(t *testing.T) {
 // TestNamespaceFromContextUnprotected: a context whose namespace is unprotected
 // passes through.
 func TestNamespaceFromContextUnprotected(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	res, _, _, _ := checkWithResolvers(
 		[]string{"delete", "pod", "nginx"},
@@ -198,6 +199,7 @@ func TestNamespaceFromContextUnprotected(t *testing.T) {
 		fakeContextNamespace("team-a"),
 		noShortNames,
 		notInCluster,
+		noServerForContext,
 	)
 	if res != Allow {
 		t.Errorf("result = %v, want Allow (context namespace unprotected)", res)
@@ -207,7 +209,7 @@ func TestNamespaceFromContextUnprotected(t *testing.T) {
 // TestNamespaceFlagOverridesContextNamespace: an explicit -n wins over the
 // context's baked-in namespace (tier 1 beats tier 2).
 func TestNamespaceFlagOverridesContextNamespace(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	// -n default overrides a context pinned to the protected kube-system.
 	res, _, _, _ := checkWithResolvers(
@@ -216,6 +218,7 @@ func TestNamespaceFlagOverridesContextNamespace(t *testing.T) {
 		fakeContextNamespace("kube-system"),
 		noShortNames,
 		notInCluster,
+		noServerForContext,
 	)
 	if res != Allow {
 		t.Errorf("result = %v, want Allow (-n default overrides context namespace)", res)
@@ -227,6 +230,7 @@ func TestNamespaceFlagOverridesContextNamespace(t *testing.T) {
 		fakeContextNamespace("default"),
 		noShortNames,
 		notInCluster,
+		noServerForContext,
 	)
 	if res2 != RequireConfirmation {
 		t.Errorf("result = %v, want RequireConfirmation (-n kube-system)", res2)
@@ -237,7 +241,7 @@ func TestNamespaceFlagOverridesContextNamespace(t *testing.T) {
 // protected namespace, not just an explicit -n.
 func TestNamespaceFromContextBlockMode(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		NamespaceMode:       config.NamespaceModeBlock,
 	})
 	defer cleanup()
@@ -247,6 +251,7 @@ func TestNamespaceFromContextBlockMode(t *testing.T) {
 		fakeContextNamespace("kube-system"),
 		noShortNames,
 		notInCluster,
+		noServerForContext,
 	)
 	if res != Blocked {
 		t.Errorf("result = %v, want Blocked (context namespace, block mode)", res)
@@ -256,7 +261,7 @@ func TestNamespaceFromContextBlockMode(t *testing.T) {
 // TestNamespaceFromContextLookupErrorFallsBack: a lookup error falls back to
 // "default" (best-effort) rather than failing closed on every command.
 func TestNamespaceFromContextLookupErrorFallsBack(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	errResolver := func(_, _ string) (string, error) { return "", errors.New("kubectl not found") }
 	res, _, _, _ := checkWithResolvers(
@@ -265,6 +270,7 @@ func TestNamespaceFromContextLookupErrorFallsBack(t *testing.T) {
 		errResolver,
 		noShortNames,
 		notInCluster,
+		noServerForContext,
 	)
 	if res != Allow {
 		t.Errorf("result = %v, want Allow (lookup error falls back to default, which is unprotected)", res)
@@ -274,7 +280,7 @@ func TestNamespaceFromContextLookupErrorFallsBack(t *testing.T) {
 // TestNamespaceFromContextNotConsultedWithoutProtection: the context-namespace
 // resolver is not invoked when no namespace protection is configured.
 func TestNamespaceFromContextNotConsultedWithoutProtection(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	called := false
 	spy := func(_, _ string) (string, error) { called = true; return "kube-system", nil }
@@ -284,6 +290,7 @@ func TestNamespaceFromContextNotConsultedWithoutProtection(t *testing.T) {
 		spy,
 		noShortNames,
 		notInCluster,
+		noServerForContext,
 	)
 	if called {
 		t.Error("context-namespace resolver was called with no namespace protection configured")
@@ -296,11 +303,11 @@ func TestNamespaceFromContextNotConsultedWithoutProtection(t *testing.T) {
 // resolving the namespace for a "get"/"describe" is wasted work (a subprocess
 // on the hot read path).
 func TestReadOnlyDoesNotResolveContextNamespace(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	called := false
 	spy := func(_, _ string) (string, error) { called = true; return "kube-system", nil }
-	res, _, _, _ := checkWithResolvers([]string{"get", "pods"}, staticContext("dev"), spy, noShortNames, notInCluster)
+	res, _, _, _ := checkWithResolvers([]string{"get", "pods"}, staticContext("dev"), spy, noShortNames, notInCluster, noServerForContext)
 	if called {
 		t.Error("read-only 'get pods' invoked the context-namespace resolver")
 	}

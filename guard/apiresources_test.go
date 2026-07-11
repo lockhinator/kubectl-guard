@@ -202,23 +202,23 @@ func TestGuardBlocksDiscoveredShortName(t *testing.T) {
 	}
 
 	// `get ss` is blocked via discovery.
-	res, _, _, _ := checkWithResolvers([]string{"get", "ss"}, staticContext("dev"), noContextNamespace, discover, notInCluster)
+	res, _, _, _ := checkWithResolvers([]string{"get", "ss"}, staticContext("dev"), noContextNamespace, discover, notInCluster, noServerForContext)
 	if res != Blocked {
 		t.Errorf("get ss = %v, want Blocked (discovered short name)", res)
 	}
 	// `get pods` is allowed.
-	res, _, _, _ = checkWithResolvers([]string{"get", "pods"}, staticContext("dev"), noContextNamespace, discover, notInCluster)
+	res, _, _, _ = checkWithResolvers([]string{"get", "pods"}, staticContext("dev"), noContextNamespace, discover, notInCluster, noServerForContext)
 	if res != Allow {
 		t.Errorf("get pods = %v, want Allow", res)
 	}
 	// If discovery yields nothing (offline/RBAC), the built-in behavior stands:
 	// the full name still blocks, the short name does not (no regression, no
 	// crash).
-	res, _, _, _ = checkWithResolvers([]string{"get", "secretstore"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster)
+	res, _, _, _ = checkWithResolvers([]string{"get", "secretstore"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster, noServerForContext)
 	if res != Blocked {
 		t.Errorf("get secretstore with no discovery = %v, want Blocked (full name always works)", res)
 	}
-	res, _, _, _ = checkWithResolvers([]string{"get", "ss"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster)
+	res, _, _, _ = checkWithResolvers([]string{"get", "ss"}, staticContext("dev"), noContextNamespace, noShortNames, notInCluster, noServerForContext)
 	if res != Allow {
 		t.Errorf("get ss with no discovery = %v, want Allow (fallback to built-ins, no crash)", res)
 	}
@@ -229,12 +229,12 @@ func TestGuardBlocksDiscoveredShortName(t *testing.T) {
 func TestDiscoveryNotRunWithoutProtection(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	if err := config.Save(&config.Config{ProtectedContexts: []string{"prod-*"}}); err != nil {
+	if err := config.Save(&config.Config{ProtectedContexts: config.Patterns("prod-*")}); err != nil {
 		t.Fatal(err)
 	}
 	called := false
 	spy := func(*config.Config, []string) map[string]string { called = true; return nil }
-	_, _, _, _ = checkWithResolvers([]string{"get", "pods"}, staticContext("dev"), noContextNamespace, spy, notInCluster)
+	_, _, _, _ = checkWithResolvers([]string{"get", "pods"}, staticContext("dev"), noContextNamespace, spy, notInCluster, noServerForContext)
 	if called {
 		t.Error("discovery was invoked with no resource protection configured")
 	}

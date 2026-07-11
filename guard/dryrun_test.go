@@ -44,7 +44,7 @@ func TestParseArgsDryRun(t *testing.T) {
 // protected context is Allowed (no prompt). Reverting the dry-run check makes
 // this RequireConfirmation.
 func TestDryRunSkipsContextGating(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"--context=prod-cluster", "apply", "--dry-run=client", "-f", "x.yaml"}, staticContext("prod-cluster"))
 	if res != Allow {
@@ -54,7 +54,7 @@ func TestDryRunSkipsContextGating(t *testing.T) {
 
 // TestDryRunServerSkipsGating: --dry-run=server also skips gating.
 func TestDryRunServerSkipsGating(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"--context=prod-cluster", "apply", "--dry-run=server", "-f", "x.yaml"}, staticContext("prod-cluster"))
 	if res != Allow {
@@ -64,7 +64,7 @@ func TestDryRunServerSkipsGating(t *testing.T) {
 
 // TestDryRunNoneStillGates: --dry-run=none is a real apply and must still gate.
 func TestDryRunNoneStillGates(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"--context=prod-cluster", "apply", "--dry-run=none", "-f", "x.yaml"}, staticContext("prod-cluster"))
 	if res != RequireConfirmation {
@@ -74,7 +74,7 @@ func TestDryRunNoneStillGates(t *testing.T) {
 
 // TestNoDryRunStillGates: an apply with no --dry-run still requires confirmation.
 func TestNoDryRunStillGates(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"--context=prod-cluster", "apply", "-f", "x.yaml"}, staticContext("prod-cluster"))
 	if res != RequireConfirmation {
@@ -95,7 +95,7 @@ func TestDryRunProtectedResourceStillBlocked(t *testing.T) {
 
 // TestDryRunNamespaceGatingSkipped: dry-run also skips namespace protection.
 func TestDryRunNamespaceGatingSkipped(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: []string{"kube-system"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedNamespaces: config.Patterns("kube-system")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"apply", "--dry-run=client", "-f", "x.yaml", "-n", "kube-system"}, staticContext("dev"))
 	if res != Allow {
@@ -109,7 +109,7 @@ func TestDryRunNamespaceGatingSkipped(t *testing.T) {
 // an Allow, defeating "absolute" block mode).
 func TestDryRunFalseFormsDoNotBypassBlockMode(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeBlock,
 	})
 	defer cleanup()
@@ -124,7 +124,7 @@ func TestDryRunFalseFormsDoNotBypassBlockMode(t *testing.T) {
 // TestDryRunFalseFormStillGatesConfirm: the same false forms still require
 // confirmation on a confirm-mode protected context (not Allowed).
 func TestDryRunFalseFormStillGatesConfirm(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	res, _, _, _ := checkWith([]string{"--context=prod-cluster", "delete", "pod", "nginx", "--dry-run=0"}, staticContext("prod-cluster"))
 	if res != RequireConfirmation {

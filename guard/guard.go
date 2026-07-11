@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/lockhinator/kubectl-guard/config"
 )
@@ -91,7 +90,7 @@ const (
 // loaded config (non-nil for Allow/Blocked/RequireConfirmation) so callers do
 // not need to re-read the file.
 func Check(args []string) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace, DiscoverShortNames, defaultInCluster)
+	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace, DiscoverShortNames, defaultInCluster, defaultServerForContext)
 }
 
 // ShortNameDiscoverer returns discovered CRD short names for the command's
@@ -108,28 +107,39 @@ func noShortNames(*config.Config, []string) map[string]string { return nil }
 // tests never spawn a kubectl subprocess; tier-2 namespace resolution and CRD
 // short-name discovery are exercised via checkWithResolvers with injected fakes.
 func checkWith(args []string, current CurrentContextFunc) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, current, noContextNamespace, noShortNames, notInCluster)
+	return checkWithResolvers(args, current, noContextNamespace, noShortNames, notInCluster, noServerForContext)
 }
 
 // checkWithResolvers is the testable core of Check: the current-context lookup,
 // the context-namespace lookup, the CRD short-name discovery, and the in-cluster
 // detection are all injected so the protection decision can be exercised without
 // kubectl or a real pod.
-func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer, inCluster InClusterFunc) (Result, string, *config.Config, error) {
-	// Config must be readable; if we cannot tell what is protected we refuse.
-	exists, err := config.Exists()
+func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer, inCluster InClusterFunc, serverFor ServerForContextFunc) (Result, string, *config.Config, error) {
+	// Config must be readable; if we cannot tell what is protected we refuse. The
+	// decision path loads the EFFECTIVE config: the enforced SYSTEM baseline (if
+	// any) merged most-restrictively under the USER config (issue #86). The merged
+	// config already has the merge + ApplyDefaults applied, and its enforcement
+	// metadata (SystemEnforced / pinned audit sink) travels with it so the audit
+	// writes and env-forbidding downstream honor the floor automatically. When no
+	// system layer exists this is byte-identical to the prior Exists()+Load() path.
+	cfg, exists, err := config.LoadEffective()
 	if err != nil {
-		return Deny, "", nil, fmt.Errorf("cannot read config status: %w", err)
+		return Deny, "", nil, fmt.Errorf("cannot load config: %w", err)
 	}
 	if !exists {
 		return SetupRequired, "", nil, nil
 	}
 
-	cfg, err := config.Load()
-	if err != nil {
-		return Deny, "", nil, fmt.Errorf("cannot load config: %w", err)
+	// A group/world-writable config is a tamper signal: anyone who can rewrite
+	// ~/.kubectl-guard.yaml can disable protection by emptying the protected lists.
+	// In strict mode (strict_config_perms or KUBECTL_GUARD_STRICT) this fails
+	// CLOSED — refuse every command until the mode is fixed — so a tampered or
+	// exposed config can never run with silently-weakened protection. The
+	// non-strict WARNING is surfaced by the caller (main), which owns user-facing
+	// output; the decision core only enforces the strict deny.
+	if insecure, detail, permErr := config.InsecureConfigPerms(); permErr == nil && insecure && cfg.StrictPerms() {
+		return Deny, "", cfg, fmt.Errorf("strict mode is set and %s; refusing until fixed (secure the config: chmod 600 the file and 700 its directory)", detail)
 	}
-	cfg.ApplyDefaults()
 
 	// A config with an invalid known-field value silently downgrades protection:
 	// e.g. context_mode: "blck" is not "block", so the runtime falls back to
@@ -180,20 +190,62 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// early return pass a dry-run of a wide mutation through.
 	blastActive := IsBlastRadiusActive(cfg, args)
 
+	// Sensitive-kind policy: a state-altering command whose target kind (token or
+	// -f manifest) matches sensitive_kinds is gated on EVERY context, while reads
+	// of the kind pass. Orthogonal to context/namespace like sensitive-access and
+	// blast-radius, so it threads through the same seams (in-cluster fall-through,
+	// read-only early return, the gate, and block-mode).
+	sensitiveKindActive := IsSensitiveKindActive(cfg, args)
+
+	// Global read-only / freeze mode (incident panic button). When active, EVERY
+	// command that is not a KNOWN-SAFE read is Blocked regardless of
+	// context/namespace/actor, so an operator can freeze all mutations instantly
+	// and everywhere. This fails SAFE: it gates on "not provably a safe read"
+	// (!IsSafeCommandWith), not "known-dangerous" (IsStateAlteringWith) — otherwise
+	// an unknown/plugin mutating verb the guard cannot classify (e.g. a krew plugin
+	// that spawns a privileged pod) would slip the panic button. The tradeoff is
+	// that read-only plugins are also blocked under freeze, which is the correct
+	// default for an incident. A genuine --dry-run of a KNOWN state-altering verb
+	// still passes (it changes nothing); a --dry-run token on an unknown verb buys
+	// no pass (the plugin may ignore it). --yes does NOT override — this is
+	// absolute, unlike a confirm. KUBECTL_GUARD_BYPASS still bypasses (the
+	// documented, loudly-audited escape hatch). Checked before context/namespace
+	// gating because it does not depend on which context is targeted.
+	genuineDryRun := IsStateAlteringWith(cfg, args) && p.IsDryRun() && SupportsDryRun(args)
+	if cfg.ReadOnlyActive() && !IsSafeCommandWith(cfg, args) && !genuineDryRun {
+		return Blocked, ctx, cfg, nil
+	}
+
 	// --server points at an arbitrary API server the guard cannot map to a
 	// context name. When context protection is configured, fail closed rather
 	// than allow a command against an unverified (possibly production) cluster.
 	// Use --context pointing at a named context instead.
-	if p.HasServer && len(cfg.ProtectedContexts) > 0 {
-		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts are configured (use --context instead)")
+	if p.HasServer && (len(cfg.ProtectedContexts) > 0 || len(cfg.ProtectedClusters) > 0) {
+		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts or clusters are configured (use --context instead)")
 	}
 
 	// --cluster retargets the API server via a named kubeconfig cluster, decoupled
 	// from the context NAME the guard gates on: `--context=dev --cluster=prod`
 	// gates on "dev" while the command hits prod. Refuse it under protected
 	// contexts, like --server.
-	if p.HasClusterOverride && len(cfg.ProtectedContexts) > 0 {
-		return Deny, ctx, cfg, fmt.Errorf("--cluster overrides the cluster target independently of the context name; refusing because protected contexts are configured (use --context instead)")
+	if p.HasClusterOverride && (len(cfg.ProtectedContexts) > 0 || len(cfg.ProtectedClusters) > 0) {
+		return Deny, ctx, cfg, fmt.Errorf("--cluster overrides the cluster target independently of the context name; refusing because protected contexts or clusters are configured (use --context instead)")
+	}
+
+	// Cluster-identity protection (#85): resolve the target context's API server
+	// and match it against protected_clusters, so protection keys on the CLUSTER
+	// the command hits, not just the spoofable context NAME. Purely additive — a
+	// resolution failure just means cluster protection does not apply (name-based
+	// protection is unchanged). Only resolve when cluster protection is configured,
+	// so a name-only config never touches the server resolver (byte-identical to
+	// before this feature).
+	clusterProtected := false
+	targetServer := ""
+	if cfg.HasProtectedClusters() {
+		if srv, serr := serverFor(p.Kubeconfig, ctx); serr == nil && srv != "" {
+			targetServer = srv
+			clusterProtected = cfg.IsClusterProtected(srv)
+		}
 	}
 
 	// A state-altering command in dry-run mode (--dry-run=client|server, not
@@ -233,13 +285,19 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 			return Deny, "", cfg, fmt.Errorf("running in-cluster with no named context and in_cluster=deny; refusing (set in_cluster: namespace to gate by the serviceaccount namespace instead)")
 		case config.InClusterAllow:
 			// in_cluster: allow passes the (unevaluable) context protection
-			// through, but sensitive-access and blast-radius are orthogonal — they
-			// gate on what the verb can read/reach and on how much it destroys, not
-			// on the context — so a sensitive verb or a wide/bulk mutation must
-			// still be gated even in-cluster. Fall through to the unified gate below
-			// (contextProtected stays false); only a command that is neither gets
-			// the blanket allow here.
-			if !sensitiveActive && !blastActive {
+			// through, but the orthogonal, context-INDEPENDENT signals must still
+			// gate even in-cluster: sensitive-access and blast-radius and
+			// sensitive-kind (about what a verb reads/reaches or how much it
+			// destroys), AND namespace protection for an EXPLICITLY-named target
+			// (-n <ns>, -A, or the namespace as the command's object) — those are
+			// fully evaluable from argv regardless of the unresolvable context.
+			// Only the IMPLICIT run-in namespace (the serviceaccount-namespace
+			// fallback) is relaxed by allow, so explicitNSProtected passes
+			// fallbackNS "" (no SA-namespace gating). Fall through to the unified
+			// gate below when any of these apply (contextProtected stays false);
+			// only a command gated by none gets the blanket allow here.
+			explicitNSProtected := namespaceTargetProtected(cfg, p, ctx, "", nsFor)
+			if !sensitiveActive && !blastActive && !sensitiveKindActive && !explicitNSProtected {
 				return Allow, "", cfg, nil
 			}
 		default: // InClusterNamespace: context protection cannot be evaluated
@@ -256,6 +314,29 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 			}
 			inClusterNamespace = saNS
 		}
+	}
+
+	// A resolved server matching protected_clusters gates the command even when the
+	// context NAME is unprotected (an alias, or a crafted --kubeconfig/--context).
+	// Purely additive: this can only turn contextProtected from false to true, so
+	// it flows through the impersonation block, the unified gate, and unknownProtected
+	// exactly like name protection, and never weakens an existing decision.
+	//
+	// Note it does NOT interact with the in-cluster fall-through above (the
+	// InClusterAllow early return): cluster protection resolved a server from a
+	// kubeconfig, which is the resolvable-context path, whereas that branch is only
+	// reached when the context NAME is unresolvable. So the fail-open there is left
+	// exactly as-is.
+	//
+	// nameProtected records that the context NAME matched protected_contexts,
+	// distinct from a cluster-only match. It matters for the block decision below:
+	// the name's ctxMode is authoritative for a name match, but for a CLUSTER-only
+	// match ctxMode is just the global fallback (EffectiveContextMode of an
+	// unprotected name returns the global mode), which would wrongly escalate a
+	// per-entry `mode: confirm` cluster to block under global context_mode: block.
+	nameProtected := contextProtected
+	if clusterProtected {
+		contextProtected = true
 	}
 
 	// Optional policy: deny any impersonation (--as*) on a protected context.
@@ -287,7 +368,7 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	unknownStrict := cfg.UnknownVerbMode() != config.UnknownVerbAllow && IsUnknownCommand(cfg, args)
 
 	stateAltering := IsStateAlteringWith(cfg, args)
-	if !stateAltering && !sensitiveActive && !blastActive && !unknownStrict {
+	if !stateAltering && !sensitiveActive && !blastActive && !sensitiveKindActive && !unknownStrict {
 		return Allow, ctx, cfg, nil
 	}
 
@@ -310,19 +391,43 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 			LeadingVerb(args))
 	}
 
-	if contextProtected || namespaceProtected || sensitiveActive || blastActive {
-		// Per-actor policy: a matching actor policy can make context/namespace
-		// protection STRICTER for a known actor (e.g. an agent label gets block
-		// where a human gets confirm). It never weakens the global posture.
-		ctxMode, nsMode := cfg.EffectiveModesForActor(resolveActor(cfg, currentUser()))
+	if contextProtected || namespaceProtected || sensitiveActive || blastActive || sensitiveKindActive {
+		// Per-pattern + per-actor modes. The base modes come from the matched
+		// context/namespace PATTERN (EffectiveContextMode / EffectiveNamespaceMode);
+		// a matching actor policy can then make them STRICTER (confirm → block) for a
+		// known actor, but never weaker than the per-pattern/global posture.
+		actor := resolveActor(cfg, currentUser())
+		runNS := resolveTargetNamespace(cfg, p, ctx, inClusterNamespace, nsFor)
+		// ctxMode: per-pattern mode for the matched context, tightened by the actor
+		// policy. nsActorMode: the run-in namespace's per-pattern mode, tightened by
+		// the actor policy — its ONLY role here is to carry the actor's unconditional
+		// namespace tightening (block regardless of which namespace), because the
+		// authoritative per-pattern namespace mode across ALL target routes (-A, a
+		// namespace named as the object, or the run-in namespace) is computed by
+		// effectiveNamespaceModeForTarget and unioned in below.
+		ctxMode, nsActorMode := cfg.EffectiveModesForActor(actor, ctx, runNS)
+		nsBlock := nsActorMode == config.NamespaceModeBlock ||
+			effectiveNamespaceModeForTarget(cfg, p, runNS) == config.NamespaceModeBlock
+
+		// A protected-cluster match blocks when its OWN effective mode is block
+		// (EffectiveClusterMode: the per-entry mode, or the global context mode when
+		// the entry inherits). This is kept separate from the name arm below: for a
+		// cluster-ONLY match the name-derived ctxMode is just the global fallback, so
+		// folding it into the name arm would escalate a per-entry `mode: confirm`
+		// cluster to block under global context_mode: block. Using EffectiveClusterMode
+		// honors the entry's own mode. Most-restrictive across name + cluster wins.
+		clusterBlock := clusterProtected && cfg.EffectiveClusterMode(targetServer) == config.ContextModeBlock
 
 		// Block mode: hard-refuse with no prompt. If ANY matching signal is in
 		// block mode, block wins (most restrictive). --yes cannot bypass this: it
 		// only auto-confirms RequireConfirmation, and Blocked is a separate result.
-		if (contextProtected && ctxMode == config.ContextModeBlock) ||
-			(namespaceProtected && nsMode == config.NamespaceModeBlock) ||
+		// The name arm uses nameProtected (not contextProtected) so a cluster-only
+		// match does not borrow the name's global-fallback ctxMode.
+		if (nameProtected && ctxMode == config.ContextModeBlock) || clusterBlock ||
+			(namespaceProtected && nsBlock) ||
 			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) ||
-			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) {
+			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) ||
+			(sensitiveKindActive && cfg.SensitiveKindMode() == config.SensitiveKindBlock) {
 			return Blocked, ctx, cfg, nil
 		}
 		return RequireConfirmation, ctx, cfg, nil
@@ -350,6 +455,29 @@ func IsSensitiveAccess(cfg *config.Config, args []string) bool {
 	return cfg.SensitiveAccessMode() != config.SensitiveAccessOff && cfg.IsSensitiveVerb(commandVerb(args))
 }
 
+// ClusterProtected reports whether the command's target context resolves to an
+// API server matched by protected_clusters, returning the resolved server. It is
+// for the message/explain layer so a cluster-driven gate can be named as such. It
+// reads the kubeconfig to resolve the server (like ResolvedTargetNamespace), so
+// it is for the gated/interactive path only, never the hot read path. It returns
+// ("", false) when no cluster protection is configured or the server cannot be
+// resolved — matching the decision core's additive, resolve-only-when-configured
+// behavior, so it can never claim a gate the core did not make.
+func ClusterProtected(cfg *config.Config, args []string, ctx string) (server string, protected bool) {
+	if cfg == nil || !cfg.HasProtectedClusters() {
+		return "", false
+	}
+	p := ParseArgs(args)
+	srv, err := defaultServerForContext(p.Kubeconfig, ctx)
+	if err != nil || srv == "" {
+		return "", false
+	}
+	if cfg.IsClusterProtected(srv) {
+		return srv, true
+	}
+	return "", false
+}
+
 // namespaceTargetProtected reports whether the command targets a protected
 // namespace, by any of three routes (any match gates):
 //
@@ -372,6 +500,75 @@ func namespaceTargetProtected(cfg namespaceChecker, p ParsedArgs, ctx, fallbackN
 		return true
 	}
 	return cfg.IsNamespaceProtected(resolveTargetNamespace(cfg, p, ctx, fallbackNS, nsFor))
+}
+
+// effectiveNamespaceModeForTarget returns the MOST RESTRICTIVE per-pattern
+// namespace mode across every route by which the command targets a PROTECTED
+// namespace — mirroring namespaceTargetProtected's three routes so the mode and
+// the "is it protected?" decision can never disagree:
+//
+//  1. --all-namespaces spans every namespace → most restrictive over ALL patterns
+//     (MostRestrictiveNamespaceMode), because the command touches each of them;
+//  2. a namespace addressed as the command's OBJECT (`delete namespace kube-system`)
+//     → that namespace's EffectiveNamespaceMode (a wide/unenumerable object target
+//     → all patterns, same as route 1);
+//  3. the namespace the command runs IN (runNS) → its EffectiveNamespaceMode.
+//
+// It returns block if ANY protected route resolves to block, else confirm. Only a
+// PROTECTED namespace contributes (guarded by IsNamespaceProtected), so an
+// unprotected run-in namespace does not fold the global mode in. Actor-policy
+// tightening is applied by the caller (it is unconditional, so it composes as a
+// union with this result). runNS is precomputed by the caller to avoid a repeated
+// context-namespace lookup.
+func effectiveNamespaceModeForTarget(cfg *config.Config, p ParsedArgs, runNS string) string {
+	isBlock := func(m string) bool { return m == config.NamespaceModeBlock }
+	if p.AllNamespaces && cfg.HasProtectedNamespaces() && isBlock(cfg.MostRestrictiveNamespaceMode()) {
+		return config.NamespaceModeBlock
+	}
+	if t := namespaceTargetsFrom(p); t.Kind && cfg.HasProtectedNamespaces() {
+		if t.Wide {
+			if isBlock(cfg.MostRestrictiveNamespaceMode()) {
+				return config.NamespaceModeBlock
+			}
+		} else {
+			for _, name := range t.Names {
+				if cfg.IsNamespaceProtected(name) && isBlock(cfg.EffectiveNamespaceMode(name)) {
+					return config.NamespaceModeBlock
+				}
+			}
+		}
+	}
+	if cfg.IsNamespaceProtected(runNS) && isBlock(cfg.EffectiveNamespaceMode(runNS)) {
+		return config.NamespaceModeBlock
+	}
+	return config.NamespaceModeConfirm
+}
+
+// EffectiveTargetModes returns the actor-effective context and namespace
+// protection modes the guard's block decision used for a command: the per-pattern
+// context mode for the resolved context, and the most-restrictive per-pattern
+// namespace mode across every target route, each tightened by the matching actor
+// policy. It is for the message/explain layer (labeling a Blocked or gated
+// decision) and may shell out for namespace resolution, so it is for the gated
+// path only, never the hot read path. cfg==nil yields the safe confirm defaults.
+func EffectiveTargetModes(cfg *config.Config, args []string, ctx string) (ctxMode, nsMode string) {
+	if cfg == nil {
+		return config.ContextModeConfirm, config.NamespaceModeConfirm
+	}
+	p := ParseArgs(args)
+	fallbackNS := ""
+	if saNS, inCl := defaultInCluster(); inCl {
+		fallbackNS = saNS
+	}
+	runNS := resolveTargetNamespace(cfg, p, ctx, fallbackNS, defaultContextNamespace)
+	actor := resolveActor(cfg, currentUser())
+	cm, nsActorMode := cfg.EffectiveModesForActor(actor, ctx, runNS)
+	nsMode = config.NamespaceModeConfirm
+	if nsActorMode == config.NamespaceModeBlock ||
+		effectiveNamespaceModeForTarget(cfg, p, runNS) == config.NamespaceModeBlock {
+		nsMode = config.NamespaceModeBlock
+	}
+	return cm, nsMode
 }
 
 // protectedNamespaceNameTarget reports whether a state-altering command targets
@@ -475,7 +672,12 @@ func ExecKubectl(args []string) error {
 	// Prepend "kubectl" to args for proper argv[0]
 	fullArgs := append([]string{"kubectl"}, args...)
 
-	return syscall.Exec(kubectl, fullArgs, os.Environ())
+	// execReplace is platform-specific: on unix it is syscall.Exec (process
+	// replacement, preserving kubectl's exit code); on native Windows — an
+	// explicit non-goal (see README "Platform support") — it returns an error
+	// (Windows has no execve). The binary short-circuits with a WSL2 message on
+	// GOOS=windows before reaching here, so the Windows stub is a belt-and-braces.
+	return execReplace(kubectl, fullArgs, os.Environ())
 }
 
 // RunKubectl runs the REAL kubectl and returns its output. It uses
@@ -539,6 +741,18 @@ func RealKubectlPath() (string, error) {
 	// No self-shadow on PATH (plain alias install): defer to the standard
 	// lookup so the common case keeps working.
 	return exec.LookPath("kubectl")
+}
+
+// DefaultShimDir returns the PATH-shadowing shim directory that
+// `make install-shim` creates: $HOME/.local/share/kubectl-guard/shims. It
+// mirrors the Makefile's SHIM_DIR default so `kubectl-guard uninstall` removes
+// exactly what the installer put there.
+func DefaultShimDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "share", "kubectl-guard", "shims"), nil
 }
 
 // sameExecutable reports whether path and other refer to the same executable

@@ -471,7 +471,7 @@ func TestIsNamespaceProtectedUsesGlob(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{ProtectedNamespaces: tt.patterns}
+			cfg := &Config{ProtectedNamespaces: Patterns(tt.patterns...)}
 			if got := cfg.IsNamespaceProtected(tt.namespace); got != tt.protected {
 				t.Errorf("IsNamespaceProtected(%q) with %v = %v, want %v",
 					tt.namespace, tt.patterns, got, tt.protected)
@@ -488,12 +488,12 @@ func TestIsNamespaceProtectedUsesGlob(t *testing.T) {
 func TestEscapedRangeStillProtects(t *testing.T) {
 	const pattern, name = `prod-[a-\z]`, "prod-x"
 
-	ctxCfg := &Config{ProtectedContexts: []string{pattern}}
+	ctxCfg := &Config{ProtectedContexts: Patterns(pattern)}
 	if !ctxCfg.IsContextProtected(name) {
 		t.Errorf("IsContextProtected(%q) with pattern %q = false; context is UNPROTECTED", name, pattern)
 	}
 
-	nsCfg := &Config{ProtectedNamespaces: []string{pattern}}
+	nsCfg := &Config{ProtectedNamespaces: Patterns(pattern)}
 	if !nsCfg.IsNamespaceProtected(name) {
 		t.Errorf("IsNamespaceProtected(%q) with pattern %q = false; namespace is UNPROTECTED", name, pattern)
 	}
@@ -507,8 +507,8 @@ func TestContextAndNamespaceShareOneMatcher(t *testing.T) {
 
 	for _, p := range patterns {
 		for _, in := range inputs {
-			ctxCfg := &Config{ProtectedContexts: []string{p}}
-			nsCfg := &Config{ProtectedNamespaces: []string{p}}
+			ctxCfg := &Config{ProtectedContexts: Patterns(p)}
+			nsCfg := &Config{ProtectedNamespaces: Patterns(p)}
 			if a, b := ctxCfg.IsContextProtected(in), nsCfg.IsNamespaceProtected(in); a != b {
 				t.Errorf("pattern %q vs %q: context=%v namespace=%v; the two must agree", p, in, a, b)
 			}

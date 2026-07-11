@@ -66,8 +66,8 @@ func TestInvalidConfigFailsClosed(t *testing.T) {
 // classes/escapes. A false positive here would break every command.
 func TestValidConfigDoesNotFailClosed(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:   []string{"prod-*", "arn:aws:eks:*:*:cluster/prod-[a-z]"},
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedContexts:   config.Patterns("prod-*", "arn:aws:eks:*:*:cluster/prod-[a-z]"),
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		ProtectedResources:  []string{"secret"},
 		ConfirmMode:         config.ConfirmModeTypeName,
 		AuditMode:           config.AuditModeGated,

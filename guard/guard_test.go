@@ -51,7 +51,7 @@ func TestCheck(t *testing.T) {
 // through when it cannot verify it is safe.
 func TestCheckFailClosed(t *testing.T) {
 	t.Run("corrupt config is denied", func(t *testing.T) {
-		cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+		cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 		// Corrupt the file after it was written.
 		path := filepath.Join(os.Getenv("HOME"), ".kubectl-guard.yaml")
 		if err := os.WriteFile(path, []byte(":::not valid yaml:::["), 0600); err != nil {
@@ -69,7 +69,7 @@ func TestCheckFailClosed(t *testing.T) {
 	})
 
 	t.Run("unresolvable context with protected contexts is denied", func(t *testing.T) {
-		cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+		cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 		defer cleanup()
 		bad := func(string) (string, error) { return "", errors.New("kubectl not found") }
 
@@ -102,7 +102,7 @@ func TestCheckFailClosed(t *testing.T) {
 // not bypass the guard, because kubectl (and now the guard) ignores flags
 // after "--".
 func TestCheckContextProtection(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 
 	prod := func(string) (string, error) { return "prod-cluster", nil }
@@ -193,7 +193,7 @@ func TestCheckContextProtection(t *testing.T) {
 // and short-name aliases.
 func TestCheckResourceProtection(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts:  config.Patterns("prod-*"),
 		ProtectedResources: []string{"secret", "configmap"},
 	})
 	defer cleanup()
@@ -255,7 +255,7 @@ func TestCheckResourceProtection(t *testing.T) {
 // Check level: G1 (clustered -f), G5 (comma resource lists), G7 (all/*).
 func TestCheckResourceProtectionRound2(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts:  []string{"prod-*"},
+		ProtectedContexts:  config.Patterns("prod-*"),
 		ProtectedResources: []string{"secret"},
 	})
 	defer cleanup()

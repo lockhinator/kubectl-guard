@@ -15,7 +15,7 @@ func TestInitFromEnv(t *testing.T) {
 	if !ok {
 		t.Fatal("ok = false, want true (protection values were provided)")
 	}
-	if !reflect.DeepEqual(cfg.ProtectedContexts, []string{"prod-*", "prod-cluster"}) {
+	if !reflect.DeepEqual(cfg.ProtectedContexts, Patterns("prod-*", "prod-cluster")) {
 		t.Errorf("ProtectedContexts = %v, want [prod-* prod-cluster]", cfg.ProtectedContexts)
 	}
 	if !reflect.DeepEqual(cfg.ProtectedResources, []string{"secret", "configmap"}) {
@@ -53,7 +53,7 @@ func TestInitFromEnvIgnoresInvalidConfirmMode(t *testing.T) {
 
 func TestInitFromFlags(t *testing.T) {
 	cfg := InitFromFlags("prod-*,prod-cluster", "secret", ConfirmModeTypeName)
-	if !reflect.DeepEqual(cfg.ProtectedContexts, []string{"prod-*", "prod-cluster"}) {
+	if !reflect.DeepEqual(cfg.ProtectedContexts, Patterns("prod-*", "prod-cluster")) {
 		t.Errorf("ProtectedContexts = %v", cfg.ProtectedContexts)
 	}
 	if !reflect.DeepEqual(cfg.ProtectedResources, []string{"secret"}) {

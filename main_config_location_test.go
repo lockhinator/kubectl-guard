@@ -34,7 +34,7 @@ func TestConfigLocationEnvOverride(t *testing.T) {
 	}
 
 	// Read-back goes through the override too.
-	if got := loadCfg(t).ProtectedContexts; len(got) != 1 || got[0] != "prod-*" {
+	if got := loadCfg(t).ProtectedContexts; len(got) != 1 || got[0].Pattern != "prod-*" {
 		t.Errorf("config read back from custom path = %v, want [prod-*]", got)
 	}
 }

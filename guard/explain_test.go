@@ -14,7 +14,7 @@ import (
 // the internal explainFrom seam (no context/kubectl needed).
 func TestExplainFromReasons(t *testing.T) {
 	cfg := &config.Config{
-		ProtectedContexts:  []string{"prod-*"},
+		ProtectedContexts:  config.Patterns("prod-*"),
 		ProtectedResources: []string{"secret"},
 		SensitiveAccess:    config.SensitiveAccessGate,
 		BlastRadius:        config.BlastRadiusGate,
@@ -100,7 +100,7 @@ func TestExplainWritesNoAudit(t *testing.T) {
 	_ = os.Setenv("HOME", dir)
 	defer func() { _ = os.Setenv("HOME", orig) }()
 
-	cfg := &config.Config{ProtectedContexts: []string{"prod-*"}}
+	cfg := &config.Config{ProtectedContexts: config.Patterns("prod-*")}
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}

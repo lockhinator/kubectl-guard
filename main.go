@@ -578,7 +578,7 @@ func runGuard(args []string) error {
 			// same decision the guard made.
 			ctxMode := config.ContextModeConfirm
 			if cfg != nil {
-				ctxMode, _ = cfg.EffectiveModesForActor(guard.CurrentActor(cfg))
+				ctxMode, _ = guard.EffectiveTargetModes(cfg, forwarded, ctx)
 			}
 			switch {
 			case cfg != nil && cfg.ReadOnlyActive() && !guard.IsSafeCommandWith(cfg, forwarded):
@@ -1000,13 +1000,13 @@ func newConfigCommand() *cobra.Command {
 			}
 			ui.PrintSuccess("Wrote config: " + path)
 			if len(cfg.ProtectedContexts) > 0 {
-				ui.PrintInfo("Protected contexts: " + strings.Join(cfg.ProtectedContexts, ", "))
+				ui.PrintInfo("Protected contexts: " + strings.Join(cfg.ProtectedContextPatterns(), ", "))
 			}
 			if len(cfg.ProtectedResources) > 0 {
 				ui.PrintInfo("Protected resources: " + strings.Join(cfg.ProtectedResources, ", "))
 			}
 			if len(cfg.ProtectedNamespaces) > 0 {
-				ui.PrintInfo("Protected namespaces: " + strings.Join(cfg.ProtectedNamespaces, ", "))
+				ui.PrintInfo("Protected namespaces: " + strings.Join(cfg.ProtectedNamespacePatterns(), ", "))
 			}
 			ui.PrintInfo("Confirm mode: " + cfg.ConfirmMode)
 			return nil
@@ -1040,27 +1040,66 @@ func newConfigCommand() *cobra.Command {
 			},
 		})
 	}
+	// newAddProtectedCmd builds an add-context / add-namespace command with an
+	// optional --mode flag for a per-pattern protection mode. When --mode is NOT
+	// given, it calls the plain adder, which is a pure no-op on an existing pattern
+	// (never touching its mode — so a bare re-add can never downgrade a block
+	// pattern). When --mode IS given (confirm | block | - for inherit), it calls the
+	// mode-aware adder, which adds or UPDATES the pattern's mode. The mode is
+	// pre-validated here for a clear error, because the adder's false return also
+	// means "no change", which must not be conflated with an invalid mode.
+	newAddProtectedCmd := func(use, short, doneTmpl, noopTmpl string, hidden bool,
+		plain func(*config.Config, string) bool,
+		withMode func(*config.Config, string, string) bool,
+		valid func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective)) *cobra.Command {
+		var modeRaw string
+		cmd := &cobra.Command{
+			Use:               use,
+			Short:             short,
+			Args:              cobra.ExactArgs(1),
+			Hidden:            hidden,
+			ValidArgsFunction: valid,
+			RunE: func(c *cobra.Command, a []string) error {
+				pattern := a[0]
+				modeChanged := c.Flags().Changed("mode")
+				mode := normalizeInheritMode(modeRaw)
+				if modeChanged && mode != "" && !isValidProtectionMode(mode) {
+					return fmt.Errorf("invalid --mode %q (want %q, %q, or %q to inherit the global mode)",
+						modeRaw, config.ContextModeConfirm, config.ContextModeBlock, "-")
+				}
+				return mutateConfig(func(cfg *config.Config) bool {
+					if modeChanged {
+						return withMode(cfg, pattern, mode)
+					}
+					return plain(cfg, pattern)
+				}, fmt.Sprintf(doneTmpl, pattern), fmt.Sprintf(noopTmpl, pattern))
+			},
+		}
+		cmd.Flags().StringVar(&modeRaw, "mode", "", "per-pattern protection mode: confirm | block | - (inherit the global mode)")
+		return cmd
+	}
+
 	// Dynamic completions: add-* offers candidates to add (available contexts,
 	// common resource kinds), remove-* offers what is currently protected.
 	completeAddContext := firstArgComplete(availableContexts)
 	completeRemoveContext := firstArgComplete(func() []string {
-		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedContexts })
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedContextPatterns() })
 	})
 	completeAddResource := firstArgComplete(commonResourceKinds)
 	completeRemoveResource := firstArgComplete(func() []string {
 		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedResources })
 	})
 	completeRemoveNamespace := firstArgComplete(func() []string {
-		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedNamespaces })
+		return loadProtectedList(func(c *config.Config) []string { return c.ProtectedNamespacePatterns() })
 	})
 
-	addCmd("add-context <pattern>", "Add a context/pattern to the protected list", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", false, completeAddContext)
-	addCmd("add <pattern>", "Alias for add-context", (*config.Config).AddContext, "Added context: %s", "Context already protected: %s", true, completeAddContext)
+	rootCmd.AddCommand(newAddProtectedCmd("add-context <pattern>", "Add a context/pattern to the protected list (optional --mode)", "Added context: %s", "Context already protected: %s", false, (*config.Config).AddContext, (*config.Config).AddContextWithMode, completeAddContext))
+	rootCmd.AddCommand(newAddProtectedCmd("add <pattern>", "Alias for add-context", "Added context: %s", "Context already protected: %s", true, (*config.Config).AddContext, (*config.Config).AddContextWithMode, completeAddContext))
 	addCmd("remove-context <pattern>", "Remove a context/pattern from the protected list", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", false, completeRemoveContext)
 	addCmd("remove <pattern>", "Alias for remove-context", (*config.Config).RemoveContext, "Removed context: %s", "Context not in protected list: %s", true, completeRemoveContext)
 	addCmd("add-resource <name>", "Add a resource to block on every context (e.g. secret)", (*config.Config).AddResource, "Blocked resource: %s", "Resource already protected: %s", false, completeAddResource)
 	addCmd("remove-resource <name>", "Remove a resource from the blocked list", (*config.Config).RemoveResource, "Unblocked resource: %s", "Resource not in protected list: %s", false, completeRemoveResource)
-	addCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*)", (*config.Config).AddNamespace, "Protected namespace: %s", "Namespace already protected: %s", false, nil)
+	rootCmd.AddCommand(newAddProtectedCmd("add-namespace <pattern>", "Add a namespace/pattern to the protected list (e.g. kube-system, prod-*; optional --mode)", "Protected namespace: %s", "Namespace already protected: %s", false, (*config.Config).AddNamespace, (*config.Config).AddNamespaceWithMode, nil))
 	addCmd("remove-namespace <pattern>", "Remove a namespace/pattern from the protected list", (*config.Config).RemoveNamespace, "Removed namespace: %s", "Namespace not in protected list: %s", false, completeRemoveNamespace)
 
 	rootCmd.AddCommand(&cobra.Command{
@@ -1809,8 +1848,8 @@ func printConfig() error {
 	if len(cfg.ProtectedContexts) == 0 {
 		fmt.Println("  (none)")
 	} else {
-		for _, ctx := range cfg.ProtectedContexts {
-			fmt.Printf("  - %s\n", ctx)
+		for _, pp := range cfg.ProtectedContexts {
+			fmt.Printf("  - %s\n", formatPattern(pp))
 		}
 	}
 
@@ -1827,8 +1866,8 @@ func printConfig() error {
 	if len(cfg.ProtectedNamespaces) == 0 {
 		fmt.Println("  (none)")
 	} else {
-		for _, ns := range cfg.ProtectedNamespaces {
-			fmt.Printf("  - %s\n", ns)
+		for _, pp := range cfg.ProtectedNamespaces {
+			fmt.Printf("  - %s\n", formatPattern(pp))
 		}
 	}
 
@@ -1930,6 +1969,23 @@ func displayMode(m string) string {
 	return m
 }
 
+// isValidProtectionMode reports whether m is a valid per-pattern protection mode
+// (confirm or block). The two axes (context/namespace) share the same values.
+func isValidProtectionMode(m string) bool {
+	return m == config.ContextModeConfirm || m == config.ContextModeBlock
+}
+
+// formatPattern renders a protected pattern with its mode for `config list`:
+// "prod-* (block)" for an explicit per-pattern mode, "staging-* (inherit)" when
+// it inherits the global context_mode / namespace_mode.
+func formatPattern(pp config.ProtectedPattern) string {
+	mode := pp.Mode
+	if mode == "" {
+		mode = "inherit"
+	}
+	return fmt.Sprintf("%s (%s)", pp.Pattern, mode)
+}
+
 // printCommandOverrides lists the configured command classification overrides.
 func printCommandOverrides(cfg *config.Config) {
 	ui.PrintInfo("Command overrides:")
@@ -1971,7 +2027,7 @@ func loadOrCreateConfig() (*config.Config, error) {
 		cfg.ApplyDefaults()
 		return cfg, nil
 	}
-	cfg := &config.Config{ProtectedContexts: []string{}}
+	cfg := &config.Config{ProtectedContexts: []config.ProtectedPattern{}}
 	cfg.ApplyDefaults()
 	return cfg, nil
 }

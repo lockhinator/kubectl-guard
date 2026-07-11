@@ -229,7 +229,7 @@ func TestGuardBlocksDiscoveredShortName(t *testing.T) {
 func TestDiscoveryNotRunWithoutProtection(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	if err := config.Save(&config.Config{ProtectedContexts: []string{"prod-*"}}); err != nil {
+	if err := config.Save(&config.Config{ProtectedContexts: config.Patterns("prod-*")}); err != nil {
 		t.Fatal(err)
 	}
 	called := false

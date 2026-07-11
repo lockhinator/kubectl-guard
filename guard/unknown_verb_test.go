@@ -46,7 +46,7 @@ func TestUnknownVerbNotLaunderedByArgVerb(t *testing.T) {
 	}
 	// End-to-end: denied on a protected context.
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		UnknownVerb:       config.UnknownVerbDeny,
 	})
 	defer cleanup()
@@ -74,7 +74,7 @@ func TestUnknownVerbNotLaunderedByArgVerb(t *testing.T) {
 func TestUnknownVerbInClusterComposition(t *testing.T) {
 	// in_cluster: allow — unknown verb passes (allow opts out of the axis).
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"}, // so the in-cluster branch is entered
+		ProtectedContexts: config.Patterns("prod-*"), // so the in-cluster branch is entered
 		InCluster:         config.InClusterAllow,
 		UnknownVerb:       config.UnknownVerbDeny,
 	})
@@ -90,8 +90,8 @@ func TestUnknownVerbInClusterComposition(t *testing.T) {
 	// be entered at all (the in-cluster policy is scoped to protected contexts,
 	// per #83); the SA namespace is then the gating target.
 	cleanup2 := withTempHome(t, &config.Config{
-		ProtectedContexts:   []string{"prod-*"},
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedContexts:   config.Patterns("prod-*"),
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		InCluster:           config.InClusterNamespace,
 		UnknownVerb:         config.UnknownVerbDeny,
 	})
@@ -107,7 +107,7 @@ func TestUnknownVerbInClusterComposition(t *testing.T) {
 // confirmation on a protected context but passes on an unprotected one.
 func TestUnknownVerbGate(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		UnknownVerb:       config.UnknownVerbGate,
 	})
 	defer cleanup()
@@ -127,7 +127,7 @@ func TestUnknownVerbGate(t *testing.T) {
 // on a protected context (fail-closed) but passes on an unprotected one.
 func TestUnknownVerbDeny(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		UnknownVerb:       config.UnknownVerbDeny,
 	})
 	defer cleanup()
@@ -142,7 +142,7 @@ func TestUnknownVerbDeny(t *testing.T) {
 // TestUnknownVerbAllowUnchanged: the default (allow) passes unknown verbs even on
 // protected contexts (backward compatible).
 func TestUnknownVerbAllowUnchanged(t *testing.T) {
-	cleanup := withTempHome(t, &config.Config{ProtectedContexts: []string{"prod-*"}})
+	cleanup := withTempHome(t, &config.Config{ProtectedContexts: config.Patterns("prod-*")})
 	defer cleanup()
 	if res, _, _, _ := checkWith([]string{"my-plugin", "sync"}, staticContext("prod-1")); res != Allow {
 		t.Errorf("unknown verb with default allow = %v, want Allow (unchanged)", res)
@@ -153,7 +153,7 @@ func TestUnknownVerbAllowUnchanged(t *testing.T) {
 // (by -n) is gated even on an unprotected context.
 func TestUnknownVerbGateNamespace(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedNamespaces: []string{"kube-system"},
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		UnknownVerb:         config.UnknownVerbDeny,
 	})
 	defer cleanup()
@@ -170,7 +170,7 @@ func TestUnknownVerbGateNamespace(t *testing.T) {
 // context in BLOCK mode is Blocked (inherits the context mode).
 func TestUnknownVerbBlockModeContext(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		ContextMode:       config.ContextModeBlock,
 		UnknownVerb:       config.UnknownVerbGate,
 	})
@@ -184,7 +184,7 @@ func TestUnknownVerbBlockModeContext(t *testing.T) {
 // longer unknown, so unknown_verb: deny does not apply to it.
 func TestUnknownVerbRespectsOverride(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
-		ProtectedContexts: []string{"prod-*"},
+		ProtectedContexts: config.Patterns("prod-*"),
 		UnknownVerb:       config.UnknownVerbDeny,
 		CommandOverrides:  config.CommandOverrides{Safe: []string{"my-plugin"}},
 	})

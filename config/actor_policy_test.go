@@ -23,7 +23,7 @@ func TestEffectiveModesForActor(t *testing.T) {
 		{actor: "alice", wantCtx: ContextModeConfirm, wantNS: NamespaceModeConfirm}, // unmatched
 	}
 	for _, tc := range cases {
-		gotCtx, gotNS := cfg.EffectiveModesForActor(tc.actor)
+		gotCtx, gotNS := cfg.EffectiveModesForActor(tc.actor, "", "")
 		if gotCtx != tc.wantCtx || gotNS != tc.wantNS {
 			t.Errorf("EffectiveModesForActor(%q) = (%s,%s), want (%s,%s)", tc.actor, gotCtx, gotNS, tc.wantCtx, tc.wantNS)
 		}
@@ -34,7 +34,7 @@ func TestEffectiveModesForActor(t *testing.T) {
 		ContextMode:   ContextModeBlock,
 		ActorPolicies: []ActorPolicy{{Actor: "human-*", ContextMode: ContextModeConfirm}},
 	}
-	if got, _ := blockGlobal.EffectiveModesForActor("human-bob"); got != ContextModeBlock {
+	if got, _ := blockGlobal.EffectiveModesForActor("human-bob", "", ""); got != ContextModeBlock {
 		t.Errorf("global block + actor confirm = %s, want block (cannot weaken)", got)
 	}
 }

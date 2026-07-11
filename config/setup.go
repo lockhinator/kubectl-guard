@@ -83,7 +83,7 @@ func BootstrapMode() (mode string, valid bool) {
 // meaningless without something to protect). Empty tokens are skipped.
 func InitFromEnv() (cfg *Config, ok bool) {
 	cfg = &Config{}
-	cfg.ProtectedContexts = append(cfg.ProtectedContexts, splitCSV(os.Getenv(EnvProtectedContexts))...)
+	cfg.ProtectedContexts = append(cfg.ProtectedContexts, Patterns(splitCSV(os.Getenv(EnvProtectedContexts))...)...)
 	cfg.ProtectedResources = append(cfg.ProtectedResources, splitCSV(os.Getenv(EnvProtectedResources))...)
 	if m := strings.TrimSpace(os.Getenv(EnvConfirmMode)); isValidConfirmMode(m) {
 		cfg.ConfirmMode = m
@@ -96,7 +96,7 @@ func InitFromEnv() (cfg *Config, ok bool) {
 // like the env vars). It powers `config init`. Empty strings are ignored.
 func InitFromFlags(protectedContexts, protectedResources, confirmMode string) *Config {
 	cfg := &Config{}
-	cfg.ProtectedContexts = append(cfg.ProtectedContexts, splitCSV(protectedContexts)...)
+	cfg.ProtectedContexts = append(cfg.ProtectedContexts, Patterns(splitCSV(protectedContexts)...)...)
 	cfg.ProtectedResources = append(cfg.ProtectedResources, splitCSV(protectedResources)...)
 	if m := strings.TrimSpace(confirmMode); isValidConfirmMode(m) {
 		cfg.ConfirmMode = m
@@ -163,11 +163,11 @@ func RunSetup(contextNames []string, save func(*Config) error) bool {
 
 	// Build config from selections
 	cfg := &Config{
-		ProtectedContexts: make([]string, 0),
+		ProtectedContexts: make([]ProtectedPattern, 0),
 	}
 	for _, item := range selected {
 		if item.Selected {
-			cfg.ProtectedContexts = append(cfg.ProtectedContexts, item.Name)
+			cfg.ProtectedContexts = append(cfg.ProtectedContexts, ProtectedPattern{Pattern: item.Name})
 		}
 	}
 
@@ -182,7 +182,7 @@ func RunSetup(contextNames []string, save func(*Config) error) bool {
 	ui.PrintSuccess("Saved to " + path)
 
 	if len(cfg.ProtectedContexts) > 0 {
-		ui.PrintInfo("Protected: " + strings.Join(cfg.ProtectedContexts, ", "))
+		ui.PrintInfo("Protected: " + strings.Join(patternStrings(cfg.ProtectedContexts), ", "))
 	} else {
 		ui.PrintInfo("No contexts protected.")
 	}

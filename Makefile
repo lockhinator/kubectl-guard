@@ -1,4 +1,4 @@
-.PHONY: build install install-shim install-local uninstall test clean lint fmt
+.PHONY: build install install-shim install-local uninstall uninstall-shim test clean lint fmt
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -42,6 +42,13 @@ uninstall:
 	rm -f $(INSTALL_PATH)/$(BINARY)
 	rm -f $(HOME)/go/bin/$(BINARY)
 	rm -f $(SHIM_DIR)/$(BINARY) $(SHIM_DIR)/kubectl
+
+# uninstall-shim removes just the PATH-shadowing shim via the guard's own
+# `uninstall` command, which also reports the PATH line to strip from your shell
+# config and verifies interception is inactive. Use `kubectl-guard uninstall
+# --purge` to additionally remove the config + audit log.
+uninstall-shim: build
+	./$(BINARY) uninstall
 
 test:
 	go test ./... -v

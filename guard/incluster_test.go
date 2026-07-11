@@ -156,20 +156,40 @@ func TestInClusterDeny(t *testing.T) {
 	}
 }
 
-// TestInClusterAllow passes commands through in-cluster with no gating — even a
-// state-altering command in a PROTECTED serviceaccount namespace, which pins that
-// "allow" is a full passthrough (namespace protection does NOT apply, unlike
-// "namespace" mode).
+// TestInClusterAllow: "allow" relaxes only the UNEVALUABLE axes — the context
+// name and the IMPLICIT serviceaccount run-in namespace. It is NOT a full
+// passthrough: namespace protection for an EXPLICITLY-named target (-n, -A, or the
+// namespace as the object) is evaluable from argv and STILL gates in-cluster.
+// (Regression for the release-gate composition fail-open where an explicit
+// protected namespace slipped through the InClusterAllow early return.)
 func TestInClusterAllow(t *testing.T) {
 	cleanup := withTempHome(t, &config.Config{
 		ProtectedContexts:   config.Patterns("prod-*"),
-		ProtectedNamespaces: config.Patterns("kube-system"), // protected, yet allow passes it
+		ProtectedNamespaces: config.Patterns("kube-system"),
 		InCluster:           config.InClusterAllow,
 	})
 	defer cleanup()
 
+	// The IMPLICIT SA run-in namespace is relaxed by allow: a plain command whose
+	// pod runs in the protected kube-system SA namespace passes through.
 	if res := checkInCluster(t, []string{"delete", "pod", "x"}, inClusterAs("kube-system")); res != Allow {
-		t.Errorf("in_cluster=allow in a protected SA namespace = %v, want Allow (full passthrough)", res)
+		t.Errorf("in_cluster=allow, implicit SA namespace = %v, want Allow (SA-namespace relaxed)", res)
+	}
+	// An EXPLICIT -n at a protected namespace still gates (evaluable from argv).
+	if res := checkInCluster(t, []string{"delete", "pod", "x", "-n", "kube-system"}, inClusterAs("team-a")); res != RequireConfirmation {
+		t.Errorf("in_cluster=allow, -n kube-system = %v, want RequireConfirmation (explicit target gates)", res)
+	}
+	// --all-namespaces spans every namespace while one is protected → gates.
+	if res := checkInCluster(t, []string{"delete", "pods", "-A"}, inClusterAs("team-a")); res != RequireConfirmation {
+		t.Errorf("in_cluster=allow, -A with a protected namespace = %v, want RequireConfirmation", res)
+	}
+	// The namespace as the command's OBJECT still gates.
+	if res := checkInCluster(t, []string{"delete", "namespace", "kube-system"}, inClusterAs("team-a")); res != RequireConfirmation {
+		t.Errorf("in_cluster=allow, delete namespace kube-system = %v, want RequireConfirmation", res)
+	}
+	// A plain command whose implicit target is NOT protected still passes.
+	if res := checkInCluster(t, []string{"delete", "pod", "x"}, inClusterAs("team-a")); res != Allow {
+		t.Errorf("in_cluster=allow, unprotected implicit namespace = %v, want Allow", res)
 	}
 }
 

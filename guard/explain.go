@@ -96,7 +96,12 @@ func explainBlocked(r *ExplainResult, cfg *config.Config, args []string, ctx str
 		return
 	}
 	ctxMode, nsMode := EffectiveTargetModes(cfg, args, ctx)
+	// The cases mirror runGuard's Blocked-reason precedence EXACTLY (main.go), so
+	// `explain` reports the same reason the runtime would — an agent branches on
+	// the --json reason token, and the two must never disagree.
 	switch {
+	case cfg != nil && cfg.ReadOnlyActive() && !IsSafeCommandWith(cfg, args):
+		r.Rule, r.Reason = "read-only-mode", "global read-only / freeze mode: only known-safe reads run"
 	case cfg != nil && cfg.IsContextProtected(ctx) && ctxMode == config.ContextModeBlock:
 		r.Rule, r.Reason = "protected-context-block-mode", fmt.Sprintf("protected context %q is in block mode", ctx)
 	case IsSensitiveAccess(cfg, args) && cfg != nil && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock:
@@ -104,6 +109,8 @@ func explainBlocked(r *ExplainResult, cfg *config.Config, args []string, ctx str
 	case IsBlastRadiusActive(cfg, args) && cfg != nil && cfg.BlastRadiusMode() == config.BlastRadiusBlock:
 		_, why := BlastRadius(args)
 		r.Rule, r.Reason = "blast-radius-block", fmt.Sprintf("wide-scope mutation (blast_radius: block): %s", why)
+	case IsSensitiveKindActive(cfg, args) && cfg != nil && cfg.SensitiveKindMode() == config.SensitiveKindBlock:
+		r.Rule, r.Reason = "sensitive-kind-block", "targets a sensitive kind (sensitive_kind_mode: block)"
 	default:
 		if srv, ok := ClusterProtected(cfg, args, ctx); ok && cfg.EffectiveClusterMode(srv) == config.ContextModeBlock {
 			r.Rule, r.Reason = "protected-cluster-block-mode", fmt.Sprintf("protected cluster %q is in block mode", srv)

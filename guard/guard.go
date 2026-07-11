@@ -285,13 +285,19 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 			return Deny, "", cfg, fmt.Errorf("running in-cluster with no named context and in_cluster=deny; refusing (set in_cluster: namespace to gate by the serviceaccount namespace instead)")
 		case config.InClusterAllow:
 			// in_cluster: allow passes the (unevaluable) context protection
-			// through, but sensitive-access and blast-radius are orthogonal — they
-			// gate on what the verb can read/reach and on how much it destroys, not
-			// on the context — so a sensitive verb or a wide/bulk mutation must
-			// still be gated even in-cluster. Fall through to the unified gate below
-			// (contextProtected stays false); only a command that is neither gets
-			// the blanket allow here.
-			if !sensitiveActive && !blastActive && !sensitiveKindActive {
+			// through, but the orthogonal, context-INDEPENDENT signals must still
+			// gate even in-cluster: sensitive-access and blast-radius and
+			// sensitive-kind (about what a verb reads/reaches or how much it
+			// destroys), AND namespace protection for an EXPLICITLY-named target
+			// (-n <ns>, -A, or the namespace as the command's object) — those are
+			// fully evaluable from argv regardless of the unresolvable context.
+			// Only the IMPLICIT run-in namespace (the serviceaccount-namespace
+			// fallback) is relaxed by allow, so explicitNSProtected passes
+			// fallbackNS "" (no SA-namespace gating). Fall through to the unified
+			// gate below when any of these apply (contextProtected stays false);
+			// only a command gated by none gets the blanket allow here.
+			explicitNSProtected := namespaceTargetProtected(cfg, p, ctx, "", nsFor)
+			if !sensitiveActive && !blastActive && !sensitiveKindActive && !explicitNSProtected {
 				return Allow, "", cfg, nil
 			}
 		default: // InClusterNamespace: context protection cannot be evaluated

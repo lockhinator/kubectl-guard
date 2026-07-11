@@ -57,6 +57,41 @@ func TestExplainFromReasons(t *testing.T) {
 	}
 }
 
+// TestExplainBlockedReasons: explainBlocked must attribute a Blocked decision to
+// the SAME reason the runtime reports, in the same precedence order. Regression
+// for the release-gate finding where read-only/freeze and sensitive-kind blocks
+// were misattributed to protected-namespace-block-mode.
+func TestExplainBlockedReasons(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *config.Config
+		args []string
+		rule string
+	}{
+		{
+			name: "read-only / freeze block",
+			cfg:  &config.Config{ReadOnly: true},
+			args: []string{"delete", "deployment", "web"},
+			rule: "read-only-mode",
+		},
+		{
+			name: "sensitive-kind block",
+			cfg:  &config.Config{SensitiveKinds: []string{"node"}, SensitiveKind: config.SensitiveKindBlock},
+			args: []string{"delete", "node", "w1"},
+			rule: "sensitive-kind-block",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.ApplyDefaults()
+			r := explainFrom(Blocked, "dev", tc.cfg, nil, tc.args)
+			if r.Rule != tc.rule {
+				t.Errorf("rule = %q, want %q (reason: %q)", r.Rule, tc.rule, r.Reason)
+			}
+		})
+	}
+}
+
 // TestExplainClass reports the verb classification.
 func TestExplainClass(t *testing.T) {
 	cfg := &config.Config{}

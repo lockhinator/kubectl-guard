@@ -91,6 +91,8 @@ func run() error {
 			return runGuard(os.Args[1:])
 		case "doctor":
 			return runDoctor(os.Args[2:])
+		case "uninstall":
+			return runUninstall(os.Args[2:])
 		case "freeze":
 			return runFreeze(true)
 		case "unfreeze":
@@ -473,6 +475,312 @@ func runFreeze(on bool) error {
 		ui.PrintSuccess("Read-only mode DISABLED (unfreeze): state-altering commands are gated normally again.")
 	}
 	return nil
+}
+
+// runUninstall reverses the PATH-shadowing install: it removes the `kubectl`
+// shim symlink and the `kubectl-guard` binary copy from the shim directory,
+// prints the exact PATH line to strip from the user's shell rc (pointing at the
+// rc file that contains it, read-only), and verifies interception is now
+// inactive by reusing the doctor's PATH inspection. It is idempotent — a missing
+// shim is reported, not an error. --purge additionally removes the config file
+// and audit log after a confirmation (skipped with --yes). --shim-dir overrides
+// the default shim location for non-standard installs.
+func runUninstall(args []string) error {
+	purge := hasFlag(args, "--purge")
+	assumeYes := hasFlag(args, "--yes") || hasFlag(args, "-y")
+
+	defaultShimDir, err := guard.DefaultShimDir()
+	if err != nil {
+		return fmt.Errorf("cannot determine the shim directory: %w", err)
+	}
+	shimDir, custom, err := flagValue(args, "--shim-dir")
+	if err != nil {
+		return err
+	}
+	if !custom {
+		shimDir = defaultShimDir
+	}
+	// trusted marks the dir as unambiguously the guard's own shim location (the
+	// default), which lets removeShim delete a kubectl-guard binary COPY there. A
+	// custom --shim-dir is not trusted, so the binary is only removed when a
+	// kubectl shim symlink is found beside it — a mistargeted path at a real bin
+	// dir cannot silently delete the primary kubectl-guard binary. Compare cleaned
+	// paths so a non-canonical default (trailing slash, /./) still reads as trusted.
+	trusted := filepath.Clean(shimDir) == filepath.Clean(defaultShimDir)
+
+	res, err := removeShim(shimDir, trusted)
+	if err != nil {
+		return err
+	}
+	if res.removedKubectl || res.removedGuard {
+		ui.PrintSuccess("Removed the kubectl-guard shim from " + shimDir)
+	} else {
+		ui.PrintInfo("No kubectl-guard shim found in " + shimDir + " (nothing to remove).")
+	}
+	if res.skippedKubectl != "" {
+		ui.PrintWarning(res.skippedKubectl)
+	}
+	if res.skippedGuard != "" {
+		ui.PrintWarning(res.skippedGuard)
+	}
+
+	// The installer prepends the shim dir to PATH; tell the user the exact line
+	// to remove and — read-only — point at the rc file(s) that reference it.
+	pathLine := fmt.Sprintf("export PATH=%q", shimDir+":$PATH")
+	ui.PrintInfo("")
+	ui.PrintInfo("Remove this line from your shell config (~/.zshrc, ~/.bashrc) if present, then reload your shell:")
+	fmt.Fprintln(os.Stderr, "  "+pathLine)
+	if hits := shellConfigsContaining(shimDir); len(hits) > 0 {
+		ui.PrintInfo("The shim directory is referenced in:")
+		for _, h := range hits {
+			fmt.Fprintln(os.Stderr, "  "+h)
+		}
+	}
+
+	if purge {
+		if err := purgeGuardFiles(assumeYes); err != nil {
+			return err
+		}
+	}
+
+	// Verify interception is now inactive. PATH is unchanged in this process, but
+	// the shim files are gone, so the first kubectl on PATH now resolves to the
+	// real binary (or none). A still-active result means another shim precedes it
+	// on PATH or the current shell has not been reloaded.
+	d := guard.Doctor()
+	ui.PrintInfo("")
+	switch {
+	case d.Intercepted:
+		ui.PrintWarning("Interception still ACTIVE — another kubectl shim is earlier on PATH, or this shell has not reloaded its PATH. Run 'kubectl-guard doctor' after reloading your shell.")
+	case d.RealKubectlPath != "" && looksLikeGuardShim(d.RealKubectlPath):
+		// Doctor only recognizes THIS binary's inode as "the guard"; a SEPARATE
+		// kubectl-guard install earlier on PATH would otherwise be mislabeled as
+		// the real kubectl. Catch that so we don't falsely claim protection is off.
+		ui.PrintWarning("This shim is removed, but another kubectl-guard shim is still earlier on PATH (" + d.RealKubectlPath + "). Interception is STILL ACTIVE via that install — remove it too, then run 'kubectl-guard doctor' to confirm.")
+	default:
+		suffix := "."
+		if d.RealKubectlPath != "" {
+			suffix = " (" + d.RealKubectlPath + ")."
+		}
+		ui.PrintSuccess("Interception is now INACTIVE; kubectl resolves to the real binary" + suffix)
+	}
+	return nil
+}
+
+// looksLikeGuardShim reports whether the kubectl at path is itself a
+// kubectl-guard shim (a symlink whose resolved target is a kubectl-guard
+// binary). It catches a SECOND guard install left earlier on PATH, which
+// guard.Doctor — comparing only against the running binary's inode — would
+// otherwise mistake for the real kubectl.
+func looksLikeGuardShim(path string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(filepath.Base(resolved), "kubectl-guard")
+}
+
+// shimRemoval records what removeShim actually deleted, so runUninstall can
+// report accurately and stay idempotent.
+type shimRemoval struct {
+	removedKubectl bool
+	removedGuard   bool
+	removedDir     bool
+	skippedKubectl string // non-empty when a kubectl was intentionally left in place
+	skippedGuard   string // non-empty when a kubectl-guard binary was intentionally left in place
+}
+
+// removeShim deletes the guard's PATH-shadowing shim from dir: the `kubectl`
+// symlink (ONLY when it is a symlink — a real kubectl regular file is never
+// deleted, so a mistargeted --shim-dir cannot wipe the user's kubectl) and the
+// `kubectl-guard` binary, then the dir itself if it is left empty (via
+// os.Remove, which refuses a non-empty directory — the shim is never removed
+// recursively). Missing files are not an error.
+//
+// The kubectl-guard binary is removed only when the dir is trusted (the default
+// shim dir), the binary is a symlink, or a kubectl shim symlink was just removed
+// beside it. This mirrors the kubectl guarantee: a mistargeted custom --shim-dir
+// at a real bin dir (e.g. /usr/local/bin, $HOME/go/bin) will NOT silently delete
+// the primary kubectl-guard binary that lives there.
+func removeShim(dir string, trusted bool) (shimRemoval, error) {
+	var res shimRemoval
+
+	kubectlPath := filepath.Join(dir, "kubectl")
+	if info, err := os.Lstat(kubectlPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			if err := os.Remove(kubectlPath); err != nil {
+				return res, fmt.Errorf("removing shim symlink %s: %w", kubectlPath, err)
+			}
+			res.removedKubectl = true
+		} else {
+			res.skippedKubectl = fmt.Sprintf("%s is a regular file, not the guard's symlink — left untouched (delete it yourself if it is a stale shim).", kubectlPath)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return res, fmt.Errorf("inspecting %s: %w", kubectlPath, err)
+	}
+
+	guardPath := filepath.Join(dir, "kubectl-guard")
+	if info, err := os.Lstat(guardPath); err == nil {
+		isSymlink := info.Mode()&os.ModeSymlink != 0
+		if trusted || isSymlink || res.removedKubectl {
+			if err := os.Remove(guardPath); err != nil {
+				return res, fmt.Errorf("removing shim binary %s: %w", guardPath, err)
+			}
+			res.removedGuard = true
+		} else {
+			res.skippedGuard = fmt.Sprintf("%s left untouched: --shim-dir is not the default shim dir and no kubectl shim was found beside it, so this may be a real kubectl-guard binary (delete it yourself if it is a stale shim).", guardPath)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return res, fmt.Errorf("inspecting %s: %w", guardPath, err)
+	}
+
+	if res.removedKubectl || res.removedGuard {
+		if err := os.Remove(dir); err == nil {
+			res.removedDir = true
+		}
+	}
+	return res, nil
+}
+
+// purgeGuardFiles removes the config file, the audit log, its rotated archives
+// (<log>.N) and lock file after a confirmation (skipped when assumeYes). Missing
+// files are not an error. Powers `uninstall --purge`. Before deleting, it writes
+// a final audit record so a configured off-box sink (audit webhook) still
+// captures that the trail was destroyed.
+func purgeGuardFiles(assumeYes bool) error {
+	cfgPath, err := config.Path()
+	if err != nil {
+		return err
+	}
+	var cfg *config.Config
+	if exists, _ := config.Exists(); exists {
+		cfg, _ = config.Load()
+	}
+	auditPath, _ := config.AuditPath(cfg)
+
+	// auditFiles enumerates the audit log plus its rotated archives and lock file,
+	// so --purge does not claim to have wiped the trail while leaving <log>.1..N
+	// (or a stale <log>.lock) behind.
+	auditFiles := func() []string {
+		if auditPath == "" {
+			return nil
+		}
+		out := []string{auditPath, auditPath + ".lock"}
+		return append(out, auditArchives(auditPath)...)
+	}
+
+	// Existing files, for the confirmation preview.
+	var existing []string
+	for _, p := range append([]string{cfgPath}, auditFiles()...) {
+		if _, err := os.Lstat(p); err == nil {
+			existing = append(existing, p)
+		}
+	}
+	if len(existing) == 0 {
+		ui.PrintInfo("--purge: no config or audit files to remove.")
+		return nil
+	}
+
+	ui.PrintWarning("--purge will permanently delete:")
+	for _, p := range existing {
+		fmt.Fprintln(os.Stderr, "  - "+p)
+	}
+	if !assumeYes {
+		if ui.Confirm("Delete these files?", 0) != ui.ConfirmApproved {
+			ui.PrintInfo("Purge aborted; config and audit files left in place.")
+			return nil
+		}
+	}
+
+	// Record the purge in the audit chain BEFORE deleting it. If auditing is off
+	// this is a no-op (no local write, no recreation); if a webhook sink is
+	// configured, the destruction is captured off-box. Deletion below re-globs the
+	// audit files so an entry that (re)created or rotated the log is still removed.
+	if cfg != nil {
+		_ = guard.AppendAudit(cfg, guard.AuditEntry{
+			Command: "uninstall --purge",
+			Outcome: guard.OutcomeConfigChange,
+			Reason:  "removing config and audit log (uninstall --purge)",
+		})
+	}
+
+	for _, p := range append([]string{cfgPath}, auditFiles()...) {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("removing %s: %w", p, err)
+		}
+	}
+	ui.PrintSuccess("Removed the files listed above.")
+	return nil
+}
+
+// auditArchives returns the rotated audit archives (<path>.N, numeric suffix)
+// for the audit log at path, mirroring the guard's own rotation naming so
+// --purge removes the whole chain, not just the live log. The <path>.lock file
+// (non-numeric suffix) is intentionally not matched here — it is handled
+// separately.
+func auditArchives(path string) []string {
+	matches, _ := filepath.Glob(path + ".*")
+	var out []string
+	for _, m := range matches {
+		suffix := strings.TrimPrefix(m, path+".")
+		if _, err := strconv.Atoi(suffix); err == nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// shellConfigsContaining returns the shell rc files under $HOME that reference
+// needle (the shim directory), so uninstall can point the user at the exact file
+// whose PATH line to strip. It is strictly read-only — it never edits them.
+func shellConfigsContaining(needle string) []string {
+	home, err := os.UserHomeDir()
+	if err != nil || needle == "" {
+		return nil
+	}
+	var hits []string
+	for _, name := range []string{".zshrc", ".bashrc", ".bash_profile", ".profile"} {
+		data, err := os.ReadFile(filepath.Join(home, name))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), needle) {
+			hits = append(hits, filepath.Join(home, name))
+		}
+	}
+	return hits
+}
+
+// flagValue returns the value of a `--name value` or `--name=value` flag in
+// args, stopping at the "--" separator. found reports whether the flag was
+// present at all; err is non-nil when the flag was given without a usable value
+// (trailing, empty, or immediately followed by another flag) so a forgotten
+// value errors loudly instead of silently falling back to a default or eating
+// the next flag as a path.
+func flagValue(args []string, name string) (value string, found bool, err error) {
+	for i, a := range args {
+		if a == "--" {
+			return "", false, nil
+		}
+		if a == name {
+			if i+1 >= len(args) {
+				return "", true, fmt.Errorf("%s requires a directory argument", name)
+			}
+			v := args[i+1]
+			if v == "--" || strings.HasPrefix(v, "-") {
+				return "", true, fmt.Errorf("%s requires a directory argument (got %q)", name, v)
+			}
+			return v, true, nil
+		}
+		if strings.HasPrefix(a, name+"=") {
+			v := strings.TrimPrefix(a, name+"=")
+			if v == "" {
+				return "", true, fmt.Errorf("%s requires a non-empty directory argument", name)
+			}
+			return v, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // runBypass executes the command against the real kubectl with the guard fully
@@ -1933,6 +2241,11 @@ func newRootCommand() *cobra.Command {
 		Short: "Preflight: would a kubectl command be gated, and why?",
 		RunE:  func(_ *cobra.Command, args []string) error { return runExplain(args) },
 	})
+	root.AddCommand(&cobra.Command{
+		Use:   "uninstall",
+		Short: "Remove the PATH-shadowing shim (and, with --purge, config + audit log)",
+		RunE:  func(_ *cobra.Command, args []string) error { return runUninstall(args) },
+	})
 	return root
 }
 
@@ -2263,6 +2576,10 @@ Usage:
   kubectl-guard freeze                Global read-only mode: block ALL
                                       state-altering commands (incident switch)
   kubectl-guard unfreeze              Lift read-only mode
+  kubectl-guard uninstall [--purge] [--shim-dir <dir>]
+                                      Remove the PATH-shadowing shim and report
+                                      the PATH line to strip; --purge also
+                                      deletes the config + audit log (confirmed)
   kubectl-guard --version             Print version (or -V)
   kubectl-guard --help                Print this help
 

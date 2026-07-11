@@ -660,6 +660,18 @@ func RealKubectlPath() (string, error) {
 	return exec.LookPath("kubectl")
 }
 
+// DefaultShimDir returns the PATH-shadowing shim directory that
+// `make install-shim` creates: $HOME/.local/share/kubectl-guard/shims. It
+// mirrors the Makefile's SHIM_DIR default so `kubectl-guard uninstall` removes
+// exactly what the installer put there.
+func DefaultShimDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "share", "kubectl-guard", "shims"), nil
+}
+
 // sameExecutable reports whether path and other refer to the same executable
 // file, following symlinks (the shim is a symlink to the guard binary) and
 // comparing inodes via os.SameFile.

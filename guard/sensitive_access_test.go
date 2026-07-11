@@ -203,7 +203,7 @@ func TestSensitiveAccessNotBypassedByInClusterAllow(t *testing.T) {
 	})
 	defer cleanup()
 	res, _, _, _ := checkWithResolvers([]string{"exec", "pod", "--", "cat", "/etc/secret"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != Blocked {
 		t.Errorf("exec in-cluster, in_cluster=allow, sensitive=block = %v, want Blocked", res)
 	}
@@ -216,7 +216,7 @@ func TestSensitiveAccessNotBypassedByInClusterAllow(t *testing.T) {
 	})
 	defer cleanup2()
 	res, _, _, _ = checkWithResolvers([]string{"exec", "pod", "--", "sh"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != RequireConfirmation {
 		t.Errorf("exec in-cluster, in_cluster=allow, sensitive=gate = %v, want RequireConfirmation", res)
 	}
@@ -229,7 +229,7 @@ func TestSensitiveAccessNotBypassedByInClusterAllow(t *testing.T) {
 	})
 	defer cleanup3()
 	res, _, _, _ = checkWithResolvers([]string{"delete", "pod", "x"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("team-a"), noServerForContext)
 	if res != Allow {
 		t.Errorf("non-sensitive delete in-cluster, in_cluster=allow = %v, want Allow (blanket pass unaffected)", res)
 	}

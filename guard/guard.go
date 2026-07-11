@@ -91,7 +91,7 @@ const (
 // loaded config (non-nil for Allow/Blocked/RequireConfirmation) so callers do
 // not need to re-read the file.
 func Check(args []string) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace, DiscoverShortNames, defaultInCluster)
+	return checkWithResolvers(args, defaultCurrentContext, defaultContextNamespace, DiscoverShortNames, defaultInCluster, defaultServerForContext)
 }
 
 // ShortNameDiscoverer returns discovered CRD short names for the command's
@@ -108,14 +108,14 @@ func noShortNames(*config.Config, []string) map[string]string { return nil }
 // tests never spawn a kubectl subprocess; tier-2 namespace resolution and CRD
 // short-name discovery are exercised via checkWithResolvers with injected fakes.
 func checkWith(args []string, current CurrentContextFunc) (Result, string, *config.Config, error) {
-	return checkWithResolvers(args, current, noContextNamespace, noShortNames, notInCluster)
+	return checkWithResolvers(args, current, noContextNamespace, noShortNames, notInCluster, noServerForContext)
 }
 
 // checkWithResolvers is the testable core of Check: the current-context lookup,
 // the context-namespace lookup, the CRD short-name discovery, and the in-cluster
 // detection are all injected so the protection decision can be exercised without
 // kubectl or a real pod.
-func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer, inCluster InClusterFunc) (Result, string, *config.Config, error) {
+func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer, inCluster InClusterFunc, serverFor ServerForContextFunc) (Result, string, *config.Config, error) {
 	// Config must be readable; if we cannot tell what is protected we refuse.
 	exists, err := config.Exists()
 	if err != nil {
@@ -221,16 +221,32 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 	// context name. When context protection is configured, fail closed rather
 	// than allow a command against an unverified (possibly production) cluster.
 	// Use --context pointing at a named context instead.
-	if p.HasServer && len(cfg.ProtectedContexts) > 0 {
-		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts are configured (use --context instead)")
+	if p.HasServer && (len(cfg.ProtectedContexts) > 0 || len(cfg.ProtectedClusters) > 0) {
+		return Deny, ctx, cfg, fmt.Errorf("--server overrides the cluster target and cannot be mapped to a context; refusing because protected contexts or clusters are configured (use --context instead)")
 	}
 
 	// --cluster retargets the API server via a named kubeconfig cluster, decoupled
 	// from the context NAME the guard gates on: `--context=dev --cluster=prod`
 	// gates on "dev" while the command hits prod. Refuse it under protected
 	// contexts, like --server.
-	if p.HasClusterOverride && len(cfg.ProtectedContexts) > 0 {
-		return Deny, ctx, cfg, fmt.Errorf("--cluster overrides the cluster target independently of the context name; refusing because protected contexts are configured (use --context instead)")
+	if p.HasClusterOverride && (len(cfg.ProtectedContexts) > 0 || len(cfg.ProtectedClusters) > 0) {
+		return Deny, ctx, cfg, fmt.Errorf("--cluster overrides the cluster target independently of the context name; refusing because protected contexts or clusters are configured (use --context instead)")
+	}
+
+	// Cluster-identity protection (#85): resolve the target context's API server
+	// and match it against protected_clusters, so protection keys on the CLUSTER
+	// the command hits, not just the spoofable context NAME. Purely additive — a
+	// resolution failure just means cluster protection does not apply (name-based
+	// protection is unchanged). Only resolve when cluster protection is configured,
+	// so a name-only config never touches the server resolver (byte-identical to
+	// before this feature).
+	clusterProtected := false
+	targetServer := ""
+	if cfg.HasProtectedClusters() {
+		if srv, serr := serverFor(p.Kubeconfig, ctx); serr == nil && srv != "" {
+			targetServer = srv
+			clusterProtected = cfg.IsClusterProtected(srv)
+		}
 	}
 
 	// A state-altering command in dry-run mode (--dry-run=client|server, not
@@ -293,6 +309,29 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 			}
 			inClusterNamespace = saNS
 		}
+	}
+
+	// A resolved server matching protected_clusters gates the command even when the
+	// context NAME is unprotected (an alias, or a crafted --kubeconfig/--context).
+	// Purely additive: this can only turn contextProtected from false to true, so
+	// it flows through the impersonation block, the unified gate, and unknownProtected
+	// exactly like name protection, and never weakens an existing decision.
+	//
+	// Note it does NOT interact with the in-cluster fall-through above (the
+	// InClusterAllow early return): cluster protection resolved a server from a
+	// kubeconfig, which is the resolvable-context path, whereas that branch is only
+	// reached when the context NAME is unresolvable. So the fail-open there is left
+	// exactly as-is.
+	//
+	// nameProtected records that the context NAME matched protected_contexts,
+	// distinct from a cluster-only match. It matters for the block decision below:
+	// the name's ctxMode is authoritative for a name match, but for a CLUSTER-only
+	// match ctxMode is just the global fallback (EffectiveContextMode of an
+	// unprotected name returns the global mode), which would wrongly escalate a
+	// per-entry `mode: confirm` cluster to block under global context_mode: block.
+	nameProtected := contextProtected
+	if clusterProtected {
+		contextProtected = true
 	}
 
 	// Optional policy: deny any impersonation (--as*) on a protected context.
@@ -365,10 +404,21 @@ func checkWithResolvers(args []string, current CurrentContextFunc, nsFor Namespa
 		nsBlock := nsActorMode == config.NamespaceModeBlock ||
 			effectiveNamespaceModeForTarget(cfg, p, runNS) == config.NamespaceModeBlock
 
+		// A protected-cluster match blocks when its OWN effective mode is block
+		// (EffectiveClusterMode: the per-entry mode, or the global context mode when
+		// the entry inherits). This is kept separate from the name arm below: for a
+		// cluster-ONLY match the name-derived ctxMode is just the global fallback, so
+		// folding it into the name arm would escalate a per-entry `mode: confirm`
+		// cluster to block under global context_mode: block. Using EffectiveClusterMode
+		// honors the entry's own mode. Most-restrictive across name + cluster wins.
+		clusterBlock := clusterProtected && cfg.EffectiveClusterMode(targetServer) == config.ContextModeBlock
+
 		// Block mode: hard-refuse with no prompt. If ANY matching signal is in
 		// block mode, block wins (most restrictive). --yes cannot bypass this: it
 		// only auto-confirms RequireConfirmation, and Blocked is a separate result.
-		if (contextProtected && ctxMode == config.ContextModeBlock) ||
+		// The name arm uses nameProtected (not contextProtected) so a cluster-only
+		// match does not borrow the name's global-fallback ctxMode.
+		if (nameProtected && ctxMode == config.ContextModeBlock) || clusterBlock ||
 			(namespaceProtected && nsBlock) ||
 			(sensitiveActive && cfg.SensitiveAccessMode() == config.SensitiveAccessBlock) ||
 			(blastActive && cfg.BlastRadiusMode() == config.BlastRadiusBlock) ||
@@ -398,6 +448,29 @@ func IsSensitiveAccess(cfg *config.Config, args []string) bool {
 		return false
 	}
 	return cfg.SensitiveAccessMode() != config.SensitiveAccessOff && cfg.IsSensitiveVerb(commandVerb(args))
+}
+
+// ClusterProtected reports whether the command's target context resolves to an
+// API server matched by protected_clusters, returning the resolved server. It is
+// for the message/explain layer so a cluster-driven gate can be named as such. It
+// reads the kubeconfig to resolve the server (like ResolvedTargetNamespace), so
+// it is for the gated/interactive path only, never the hot read path. It returns
+// ("", false) when no cluster protection is configured or the server cannot be
+// resolved — matching the decision core's additive, resolve-only-when-configured
+// behavior, so it can never claim a gate the core did not make.
+func ClusterProtected(cfg *config.Config, args []string, ctx string) (server string, protected bool) {
+	if cfg == nil || !cfg.HasProtectedClusters() {
+		return "", false
+	}
+	p := ParseArgs(args)
+	srv, err := defaultServerForContext(p.Kubeconfig, ctx)
+	if err != nil || srv == "" {
+		return "", false
+	}
+	if cfg.IsClusterProtected(srv) {
+		return srv, true
+	}
+	return "", false
 }
 
 // namespaceTargetProtected reports whether the command targets a protected

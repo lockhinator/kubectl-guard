@@ -4,6 +4,7 @@ package guard
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -195,6 +196,43 @@ type NamespaceForContextFunc func(kubeconfig, context string) (string, error)
 // reports no context namespace, so resolution falls back to "default" and no
 // kubectl subprocess is spawned during unit tests that don't opt in.
 func noContextNamespace(_, _ string) (string, error) { return "", nil }
+
+// ServerForContextFunc resolves the API server URL for a context (or "" =
+// current) under a kubeconfig ("" = default rules). Injected so the decision core
+// can gate on cluster identity without a real kubeconfig in tests.
+type ServerForContextFunc func(kubeconfig, context string) (server string, err error)
+
+// defaultServerForContext resolves the API server for a context by parsing the
+// kubeconfig directly (the #31 clientcmd loader), mirroring how kubectl maps
+// context -> cluster -> server. There is no legacy shell-out form: server
+// resolution has no pre-clientcmd implementation, and it is only consulted when
+// protected_clusters is configured.
+func defaultServerForContext(kubeconfig, context string) (string, error) {
+	cfg, err := loadKubeconfig(kubeconfig)
+	if err != nil {
+		return "", err
+	}
+	name := context
+	if name == "" {
+		name = cfg.CurrentContext
+	}
+	if name == "" {
+		return "", fmt.Errorf("no current context to resolve a server for")
+	}
+	kctx, ok := cfg.Contexts[name]
+	if !ok || kctx == nil {
+		return "", fmt.Errorf("context %q not found in kubeconfig", name)
+	}
+	cl, ok := cfg.Clusters[kctx.Cluster]
+	if !ok || cl == nil {
+		return "", fmt.Errorf("cluster %q not found in kubeconfig", kctx.Cluster)
+	}
+	return cl.Server, nil
+}
+
+// noServerForContext is the test-seam resolver (checkWith): it resolves nothing,
+// so existing tests never touch a kubeconfig for server resolution.
+func noServerForContext(string, string) (string, error) { return "", nil }
 
 // InClusterFunc reports whether the guard is running in-cluster (inside a pod on
 // the serviceaccount config, or CI with an in-cluster kubeconfig) and, if so, the

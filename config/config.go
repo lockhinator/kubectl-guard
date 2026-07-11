@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -177,6 +178,152 @@ func Patterns(names ...string) []ProtectedPattern {
 	return out
 }
 
+// ProtectedCluster protects by CLUSTER identity (the API server URL) rather than
+// the spoofable context name. Exactly one of Server (exact URL) or ServerPattern
+// (glob) identifies the cluster; Mode is the optional per-entry mode ("" inherits
+// the global context_mode, else "confirm"|"block"). Unlike ProtectedPattern it is
+// always a YAML mapping, so it needs no custom (Un)MarshalYAML.
+//
+// ServerPattern uses the same glob semantics as context/namespace patterns, so
+// "*.prod.example.com" matches subdomains but NOT the apex "prod.example.com" —
+// list the apex separately (or add a "prod.example.com" exact server) if the API
+// server lives there. Match on the API server URL means a cluster reachable via
+// multiple distinct URLs/IPs must have each form listed to be fully covered.
+type ProtectedCluster struct {
+	Server        string `yaml:"server,omitempty"`
+	ServerPattern string `yaml:"server_pattern,omitempty"`
+	Mode          string `yaml:"mode,omitempty"`
+}
+
+// normalizeServerForMatch lower-cases and trims a trailing slash so server URLs
+// compare stably (scheme+host are case-insensitive; API servers rarely carry a
+// path). Used for BOTH the config value and the resolved server, so a Prod/prod
+// or trailing-slash difference cannot dodge protection.
+func normalizeServerForMatch(s string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(s), "/"))
+}
+
+// isDefaultPort reports whether port is the default for scheme (so it can be
+// dropped when canonicalizing a server URL).
+func isDefaultPort(scheme, port string) bool {
+	return (scheme == "https" && port == "443") || (scheme == "http" && port == "80")
+}
+
+// canonicalServer returns a canonical form of an API server URL for EXACT
+// comparison, so two spellings that reach the SAME cluster compare equal. It
+// lower-cases the scheme+host, strips a trailing FQDN dot ("host." == "host"),
+// drops userinfo (credentials do not change the target), and drops a default port
+// ("https://h" == "https://h:443"). A bare host or unparseable value falls back to
+// lower-case + trailing slash/dot trim. This closes the trailing-dot and
+// default-port/userinfo evasions against an attacker-crafted kubeconfig.
+func canonicalServer(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" {
+		return strings.TrimRight(strings.ToLower(s), "/.")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.TrimRight(strings.ToLower(u.Hostname()), ".")
+	port := u.Port()
+	if isDefaultPort(scheme, port) {
+		port = ""
+	}
+	hostport := host
+	if port != "" {
+		hostport += ":" + port
+	}
+	path := strings.TrimRight(u.Path, "/")
+	if scheme != "" {
+		return scheme + "://" + hostport + path
+	}
+	return hostport + path
+}
+
+// serverHosts returns the host forms of a server URL for glob matching: the bare
+// "host" and, when the port is non-default, "host:port". The hostname is
+// lower-cased and its trailing FQDN dot stripped. Best-effort (net/url); nil on
+// parse failure. This lets a pattern like "*.prod.example.com" match
+// "https://api.prod.example.com.:6443" even though matchGlob's "*" would otherwise
+// have to cross the "//" and the port in the full URL.
+func serverHosts(server string) []string {
+	u, err := url.Parse(strings.TrimSpace(server))
+	if err != nil || u.Host == "" {
+		return nil
+	}
+	hostname := strings.TrimRight(strings.ToLower(u.Hostname()), ".")
+	if hostname == "" {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(h string) {
+		if h != "" && !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	// Include the explicit "host:port" form (so a pattern written with a port still
+	// matches) AND the bare "host" (so a port-less pattern matches a ported server).
+	if port := u.Port(); port != "" {
+		add(hostname + ":" + port)
+	}
+	add(hostname)
+	return out
+}
+
+// matches reports whether this entry protects the given (raw) server URL. An
+// exact Server is compared on the canonical form (canonicalServer), so trailing
+// slash/dot, case, userinfo, and default-port differences that still hit the same
+// cluster cannot dodge it. A ServerPattern is matched against the canonical URL
+// AND each host form, so both "https://prod.eks..." (full) and "*.prod.example.com"
+// (host) styles work.
+func (pc ProtectedCluster) matches(server string) bool {
+	cs := canonicalServer(server)
+	if cs == "" {
+		return false
+	}
+	if pc.Server != "" && canonicalServer(pc.Server) == cs {
+		return true
+	}
+	if pc.ServerPattern != "" {
+		pat := normalizeServerForMatch(pc.ServerPattern)
+		// Match the pattern against several forms of the target so it works
+		// regardless of how the user wrote it: the CANONICAL URL (default port /
+		// userinfo dropped), the RAW normalized URL (port kept — so a full-URL
+		// pattern written with an explicit :443/:80 still matches), and each host
+		// form (with and without port). Trying more forms only ever ADDS a match
+		// (fail-safe), so it cannot introduce a bypass.
+		targets := append([]string{cs, normalizeServerForMatch(server)}, serverHosts(server)...)
+		for _, t := range targets {
+			if matchGlob(pat, t) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// identifier returns the raw string that identifies this entry (its Server or
+// ServerPattern), used for dedupe and removal.
+func (pc ProtectedCluster) identifier() string {
+	if pc.ServerPattern != "" {
+		return pc.ServerPattern
+	}
+	return pc.Server
+}
+
+// key returns the display/completion key for this entry, distinguishing an exact
+// server from a pattern ("server=https://..." / "server_pattern=*.prod...").
+func (pc ProtectedCluster) key() string {
+	if pc.ServerPattern != "" {
+		return "server_pattern=" + pc.ServerPattern
+	}
+	return "server=" + pc.Server
+}
+
 // patternStrings returns just the glob patterns from a ProtectedPattern slice,
 // for display, joining, and completion where the per-pattern mode is not needed.
 func patternStrings(pats []ProtectedPattern) []string {
@@ -200,6 +347,13 @@ type Config struct {
 	// commands. A bare-string YAML entry inherits the global context_mode; an
 	// object entry ({pattern, mode}) sets a per-pattern mode. See ProtectedPattern.
 	ProtectedContexts []ProtectedPattern `yaml:"protected_contexts,omitempty"`
+
+	// ProtectedClusters protect by CLUSTER identity (the API server URL) rather
+	// than the spoofable context NAME. A command is gated if the context name
+	// matches ProtectedContexts OR the resolved API server matches a
+	// ProtectedClusters entry. Strictly additive: a server that cannot be resolved
+	// simply leaves name-based protection unchanged. See ProtectedCluster.
+	ProtectedClusters []ProtectedCluster `yaml:"protected_clusters,omitempty"`
 
 	// ProtectedResources are resource names (e.g. "secret") whose access is
 	// blocked entirely on every context, regardless of verb. Singular, plural,
@@ -955,6 +1109,118 @@ func (c *Config) RemoveContext(pattern string) bool {
 	for i := range c.ProtectedContexts {
 		if c.ProtectedContexts[i].Pattern == pattern {
 			c.ProtectedContexts = append(c.ProtectedContexts[:i], c.ProtectedContexts[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// HasProtectedClusters reports whether any cluster-identity protection is
+// configured. When false, the guard never resolves a server (name-based
+// protection is byte-identical to before this feature).
+func (c *Config) HasProtectedClusters() bool {
+	return len(c.ProtectedClusters) > 0
+}
+
+// IsClusterProtected reports whether the resolved API server matches any
+// protected_clusters entry. Comparison is case-insensitive (see
+// ProtectedCluster.matches).
+func (c *Config) IsClusterProtected(server string) bool {
+	for _, pc := range c.ProtectedClusters {
+		if pc.matches(server) {
+			return true
+		}
+	}
+	return false
+}
+
+// EffectiveClusterMode returns the MOST RESTRICTIVE mode among the protected
+// cluster entries matching server: a matching entry with an explicit Mode uses
+// that mode; a matching entry with Mode=="" inherits the global CONTEXT mode.
+// block beats confirm. When no entry matches, the global context mode is the
+// fallback. Mirrors mostRestrictiveMode / EffectiveContextMode for the cluster
+// axis (which reuses the context mode constants and global).
+func (c *Config) EffectiveClusterMode(server string) string {
+	global := c.effectiveContextMode()
+	matched := false
+	for _, pc := range c.ProtectedClusters {
+		if !pc.matches(server) {
+			continue
+		}
+		matched = true
+		mode := pc.Mode
+		if mode == "" {
+			mode = global
+		}
+		if mode == ContextModeBlock {
+			return ContextModeBlock
+		}
+	}
+	if !matched {
+		return global
+	}
+	return ContextModeConfirm
+}
+
+// ProtectedClusterKeys returns the display/completion keys of the protected
+// cluster list (e.g. "server=https://prod", "server_pattern=*.prod.example.com"),
+// for `config list` and shell completion.
+func (c *Config) ProtectedClusterKeys() []string {
+	out := make([]string, 0, len(c.ProtectedClusters))
+	for _, pc := range c.ProtectedClusters {
+		out = append(out, pc.key())
+	}
+	return out
+}
+
+// AddProtectedCluster adds (or updates the mode of) a protected cluster entry.
+// value is treated as an exact Server unless it contains a glob metacharacter
+// (* ? [), in which case it is a ServerPattern. Dedupe is by the (Server|
+// ServerPattern) value: re-adding an existing entry updates its Mode (returns
+// true) or is a no-op if the mode is identical (returns false). An empty value or
+// an invalid mode is rejected (returns false plus an error) so the config fails
+// closed rather than silently dropping the intended protection.
+func (c *Config) AddProtectedCluster(value, mode string) (changed bool, err error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false, fmt.Errorf("protected cluster value is empty (want a server URL or a server pattern)")
+	}
+	if mode != "" && !validContextMode(mode) {
+		return false, fmt.Errorf("invalid mode %q (want %q or %q)", mode, ContextModeConfirm, ContextModeBlock)
+	}
+	isPattern := strings.ContainsAny(value, "*?[")
+	for i := range c.ProtectedClusters {
+		pc := c.ProtectedClusters[i]
+		if (isPattern && pc.ServerPattern == value) || (!isPattern && pc.Server == value) {
+			if c.ProtectedClusters[i].Mode == mode {
+				return false, nil
+			}
+			c.ProtectedClusters[i].Mode = mode
+			return true, nil
+		}
+	}
+	entry := ProtectedCluster{Mode: mode}
+	if isPattern {
+		entry.ServerPattern = value
+	} else {
+		entry.Server = value
+	}
+	c.ProtectedClusters = append(c.ProtectedClusters, entry)
+	return true, nil
+}
+
+// RemoveProtectedCluster removes an entry identified by its Server or
+// ServerPattern string. It also accepts the display key form ("server=..." /
+// "server_pattern=...") so a value taken from ProtectedClusterKeys (e.g. shell
+// completion) removes the entry it names. Returns false if nothing matched.
+func (c *Config) RemoveProtectedCluster(value string) bool {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "server_pattern=")
+	value = strings.TrimPrefix(value, "server=")
+	for i := range c.ProtectedClusters {
+		pc := c.ProtectedClusters[i]
+		if pc.Server == value || pc.ServerPattern == value {
+			c.ProtectedClusters = append(c.ProtectedClusters[:i], c.ProtectedClusters[i+1:]...)
 			return true
 		}
 	}

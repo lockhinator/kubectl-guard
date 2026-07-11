@@ -36,6 +36,9 @@ func WeakensProtection(old, new *Config) []string {
 	// both count (see weakenedPatterns).
 	w = append(w, weakenedPatterns("context", old.ProtectedContexts, new.ProtectedContexts, old.effectiveContextMode(), new.effectiveContextMode())...)
 	w = append(w, weakenedPatterns("namespace", old.ProtectedNamespaces, new.ProtectedNamespaces, old.effectiveNamespaceMode(), new.effectiveNamespaceMode())...)
+	// Cluster-identity protection inherits the global CONTEXT mode, so a removed
+	// entry or a per-entry mode downgrade is weakening on the same axis as contexts.
+	w = append(w, weakenedClusters(old.ProtectedClusters, new.ProtectedClusters, old.effectiveContextMode(), new.effectiveContextMode())...)
 	w = append(w, removedEach("removed protected resource", old.ProtectedResources, new.ProtectedResources)...)
 	w = append(w, removedEach("removed sensitive kind", old.SensitiveKinds, new.SensitiveKinds)...)
 
@@ -207,6 +210,43 @@ func weakenedPatterns(kind string, old, new []ProtectedPattern, oldGlobal, newGl
 		}
 		if rank[newEff] < rank[oldEff] {
 			w = append(w, fmt.Sprintf("downgraded protected %s %q mode from %q to %q", kind, o.Pattern, oldEff, newEff))
+		}
+	}
+	return w
+}
+
+// weakenedClusters reports weakening of the protected_clusters list: an entry
+// present in old but removed in new, or an entry whose per-entry EFFECTIVE mode
+// dropped (block → confirm, or block → inherit when the new global context mode is
+// confirm). Keyed by the display key so an exact server and a same-string pattern
+// do not collide. A pure inherit→inherit pair is skipped (that change is the
+// GLOBAL context_mode, already reported by the context_mode comparison).
+func weakenedClusters(old, new []ProtectedCluster, oldGlobal, newGlobal string) []string {
+	rank := contextModeRank // confirm=1, block=2
+	newByKey := make(map[string]ProtectedCluster, len(new))
+	for _, p := range new {
+		newByKey[p.key()] = p
+	}
+	var w []string
+	for _, o := range old {
+		n, ok := newByKey[o.key()]
+		if !ok {
+			w = append(w, "removed protected cluster: "+o.key())
+			continue
+		}
+		if o.Mode == "" && n.Mode == "" {
+			continue // pure inherit both sides — covered by the global comparison.
+		}
+		oldEff := o.Mode
+		if oldEff == "" {
+			oldEff = oldGlobal
+		}
+		newEff := n.Mode
+		if newEff == "" {
+			newEff = newGlobal
+		}
+		if rank[newEff] < rank[oldEff] {
+			w = append(w, fmt.Sprintf("downgraded protected cluster %q mode from %q to %q", o.key(), oldEff, newEff))
 		}
 	}
 	return w

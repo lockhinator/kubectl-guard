@@ -139,6 +139,20 @@ func (c *Config) Validate() []string {
 		}
 	}
 
+	for _, pc := range c.ProtectedClusters {
+		if pc.Server == "" && pc.ServerPattern == "" {
+			// A missing/misspelled key (`serer:` / `{mode: block}` with no server)
+			// decodes to this and would otherwise protect nothing. Fail closed,
+			// mirroring the empty-pattern rejection above.
+			problems = append(problems, "protected_clusters: an entry must set server or server_pattern (an empty entry protects nothing)")
+		}
+		if pc.Mode != "" && !validContextMode(pc.Mode) {
+			problems = append(problems, fmt.Sprintf(
+				"protected_clusters: entry %q has invalid mode %q (want %q or %q)",
+				pc.identifier(), pc.Mode, ContextModeConfirm, ContextModeBlock))
+		}
+	}
+
 	for i, r := range c.ProtectedResources {
 		if strings.TrimSpace(r) == "" {
 			problems = append(problems, fmt.Sprintf("protected_resources: entry %d is empty", i))

@@ -258,3 +258,53 @@ func TestConfigInitInProc(t *testing.T) {
 		t.Errorf("init: ConfirmMode = %q, want type-name", cfg.ConfirmMode)
 	}
 }
+
+// TestConfigClusterCommandsInProc covers the add-cluster / remove-cluster CLI:
+// auto-detecting exact server vs pattern, the --mode flag, invalid-mode/empty
+// errors, persistence, the `config list` section, and removal (#85).
+func TestConfigClusterCommandsInProc(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KUBECTL_GUARD_CONFIG", "")
+	t.Setenv("KUBECTL_GUARD_AUDIT_LOG", "")
+
+	// Exact server (no glob metachar) -> Server.
+	mustRun(t, "add-cluster", "https://prod.eks.amazonaws.com")
+	// Pattern (glob metachar) with a per-entry block mode -> ServerPattern.
+	mustRun(t, "add-cluster", "*.prod.example.com", "--mode", "block")
+
+	cfg := loadCfg(t)
+	if len(cfg.ProtectedClusters) != 2 {
+		t.Fatalf("ProtectedClusters = %+v, want 2 entries", cfg.ProtectedClusters)
+	}
+	if cfg.ProtectedClusters[0].Server != "https://prod.eks.amazonaws.com" || cfg.ProtectedClusters[0].ServerPattern != "" {
+		t.Errorf("exact entry stored wrong: %+v", cfg.ProtectedClusters[0])
+	}
+	if cfg.ProtectedClusters[1].ServerPattern != "*.prod.example.com" || cfg.ProtectedClusters[1].Mode != "block" {
+		t.Errorf("pattern entry stored wrong: %+v", cfg.ProtectedClusters[1])
+	}
+
+	// Invalid mode is rejected without writing.
+	if _, err := runConfigInProc(t, "add-cluster", "https://x", "--mode", "loud"); err == nil {
+		t.Error("add-cluster with invalid mode: expected error")
+	}
+
+	// list shows the Protected clusters section with the keys.
+	out, err := runConfigInProc(t, "list")
+	if err != nil {
+		t.Fatalf("config list: %v", err)
+	}
+	// The section header is written via ui.PrintInfo (stderr); the entries are
+	// written to stdout (captured here), so assert on the entry keys.
+	if !strings.Contains(out, "server=https://prod.eks.amazonaws.com") ||
+		!strings.Contains(out, "server_pattern=*.prod.example.com (block)") {
+		t.Errorf("list missing protected cluster entries, got:\n%s", out)
+	}
+
+	// Remove by raw server value and by the pattern value.
+	mustRun(t, "remove-cluster", "https://prod.eks.amazonaws.com")
+	mustRun(t, "remove-cluster", "*.prod.example.com")
+	if got := loadCfg(t).ProtectedClusters; len(got) != 0 {
+		t.Errorf("remove-cluster did not clear the list: %+v", got)
+	}
+}

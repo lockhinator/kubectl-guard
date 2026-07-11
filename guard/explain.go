@@ -105,6 +105,10 @@ func explainBlocked(r *ExplainResult, cfg *config.Config, args []string, ctx str
 		_, why := BlastRadius(args)
 		r.Rule, r.Reason = "blast-radius-block", fmt.Sprintf("wide-scope mutation (blast_radius: block): %s", why)
 	default:
+		if srv, ok := ClusterProtected(cfg, args, ctx); ok && cfg.EffectiveClusterMode(srv) == config.ContextModeBlock {
+			r.Rule, r.Reason = "protected-cluster-block-mode", fmt.Sprintf("protected cluster %q is in block mode", srv)
+			return
+		}
 		r.Rule, r.Reason = "protected-namespace-block-mode", fmt.Sprintf("protected namespace is in block mode (namespace_mode: %s)", nsMode)
 	}
 }
@@ -116,6 +120,7 @@ func explainGated(r *ExplainResult, cfg *config.Config, args []string, ctx strin
 	}
 	wide, blastReason := BlastRadius(args)
 	nameTarget, byName := ProtectedNamespaceNameTarget(cfg, args)
+	clusterServer, clusterHit := ClusterProtected(cfg, args, ctx)
 	p := ParseArgs(args)
 	switch {
 	case IsSensitiveAccess(cfg, args) && !cfg.IsContextProtected(ctx) && !byName:
@@ -128,6 +133,8 @@ func explainGated(r *ExplainResult, cfg *config.Config, args []string, ctx strin
 		r.Rule, r.Reason = "protected-namespace", fmt.Sprintf("targets protected namespace %q", p.Namespace)
 	case cfg.IsContextProtected(ctx):
 		r.Rule, r.Reason = "protected-context", fmt.Sprintf("protected context %q", ctx)
+	case clusterHit:
+		r.Rule, r.Reason = "protected-cluster", fmt.Sprintf("resolved API server %q matches protected_clusters", clusterServer)
 	case wide && cfg.BlastRadiusMode() != config.BlastRadiusOff:
 		r.Rule, r.Reason = "blast-radius", fmt.Sprintf("wide-scope mutation (blast_radius: %s): %s", cfg.BlastRadiusMode(), blastReason)
 	case IsUnknownCommand(cfg, args) && cfg.UnknownVerbMode() != config.UnknownVerbAllow:

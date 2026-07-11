@@ -79,7 +79,7 @@ func TestUnknownVerbInClusterComposition(t *testing.T) {
 		UnknownVerb:       config.UnknownVerbDeny,
 	})
 	res, _, _, _ := checkWithResolvers([]string{"my-plugin", "sync"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("kube-system"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("kube-system"), noServerForContext)
 	cleanup()
 	if res != Allow {
 		t.Errorf("unknown verb in-cluster under in_cluster=allow = %v, want Allow (allow opts out of the protected-target axis)", res)
@@ -97,7 +97,7 @@ func TestUnknownVerbInClusterComposition(t *testing.T) {
 	})
 	defer cleanup2()
 	res, _, _, _ = checkWithResolvers([]string{"my-plugin", "sync"},
-		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("kube-system"))
+		unresolvableContext, noContextNamespace, noShortNames, inClusterAs("kube-system"), noServerForContext)
 	if res != Deny {
 		t.Errorf("unknown verb in-cluster (namespace mode) in a protected SA namespace = %v, want Deny", res)
 	}

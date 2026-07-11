@@ -536,11 +536,36 @@ type Config struct {
 	// ADDS short names, so it can never weaken protection below the built-ins.
 	DiscoverShortNames *bool `yaml:"discover_short_names,omitempty"`
 
+	// Enforced marks a SYSTEM-layer config as an enforced baseline. It is
+	// meaningful ONLY in the system layer (/etc/kubectl-guard/config.yaml, or
+	// SystemConfigPath): when true, the system config is a protection FLOOR the
+	// user cannot weaken, and the env escape hatches (KUBECTL_GUARD_BYPASS /
+	// KUBECTL_GUARD_AUDIT_LOG / KUBECTL_GUARD_CONFIG) are forbidden. It is ignored
+	// in a user config. See LoadEffective / Merge / EnforcedSystemConfig.
+	Enforced bool `yaml:"enforced,omitempty"`
+
 	// discovered maps a runtime-discovered short name to its canonical resource
 	// form (e.g. "ss" -> "secretstore"). It is populated by the guard from the
 	// api-resources cache before matching and is NOT serialized. nil means "not
 	// discovered / built-ins only".
 	discovered map[string]string `yaml:"-"`
+
+	// systemEnforced is set on a MERGED config (by LoadEffective) when an enforced
+	// system layer was applied. It is the single signal the env-forbidding checks
+	// consult (AuditPath, Path). Never serialized; the merged config is never saved.
+	systemEnforced bool `yaml:"-"`
+
+	// auditLogPinned is set on a MERGED config when an enforced system layer pins
+	// the audit destination (system audit_log non-empty). "" = not pinned. Exposed
+	// via PinnedAuditLog for display; env-ignoring itself is gated on systemEnforced
+	// so an enforced baseline that does NOT set audit_log still ignores the env
+	// override and falls back to the default (never the env). Never serialized.
+	auditLogPinned string `yaml:"-"`
+
+	// systemLayer is the raw SYSTEM-layer config that produced a MERGED config
+	// (nil when there is no system layer). It backs `config list` provenance
+	// ("[system]" tags) and doctor's baseline reporting. Never serialized.
+	systemLayer *Config `yaml:"-"`
 }
 
 // defaultSensitiveVerbs are the verbs the sensitive-access policy applies to
@@ -876,14 +901,11 @@ func (c *Config) SetAuditMode(mode string) bool {
 	return true
 }
 
-// Path returns the full path to the config file. The KUBECTL_GUARD_CONFIG env
-// var overrides the location (for team / containerized / CI use where $HOME is
-// not the right place, e.g. a mounted /etc/kubectl-guard/config.yaml). Without
-// it, the default is ~/.kubectl-guard.yaml, unchanged.
-func Path() (string, error) {
-	if p := strings.TrimSpace(os.Getenv(EnvConfig)); p != "" {
-		return p, nil
-	}
+// defaultUserConfigPath returns the HOME-based user config location
+// (~/.kubectl-guard.yaml), the non-env branch of Path(). It is the path the user
+// layer loads from under an enforced system config, where KUBECTL_GUARD_CONFIG is
+// forbidden.
+func defaultUserConfigPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -891,14 +913,47 @@ func Path() (string, error) {
 	return filepath.Join(home, configFileName), nil
 }
 
+// Path returns the full path to the USER config file. The KUBECTL_GUARD_CONFIG
+// env var overrides the location (for team / containerized / CI use where $HOME
+// is not the right place). Without it, the default is ~/.kubectl-guard.yaml.
+//
+// EXCEPTION (issue #86): when an ENFORCED system config is present, the env
+// override is IGNORED and the default path is used — an enforced baseline must
+// not be defeatable by pointing the user layer somewhere the admin cannot see.
+// The SYSTEM config path itself (SystemConfigPath) is never env-derived, so this
+// cannot be self-referentially defeated. Making Path() enforcement-aware routes
+// BOTH the decision path (LoadEffective) and the mutation path (Load/Save via
+// Path) at the same file, so `config add-context` edits exactly what the guard
+// reads.
+func Path() (string, error) {
+	if enforcedSystemActive() {
+		return defaultUserConfigPath()
+	}
+	if p := strings.TrimSpace(os.Getenv(EnvConfig)); p != "" {
+		return p, nil
+	}
+	return defaultUserConfigPath()
+}
+
 // AuditPath returns the audit log path. Precedence, highest first: the
 // KUBECTL_GUARD_AUDIT_LOG env var (a per-invocation override, symmetric with
 // KUBECTL_GUARD_CONFIG), then the config's audit_log field, then the default
 // ~/.kubectl-guard-audit.log. The env var wins over the config field so a
 // container/CI runner can redirect the log without editing a mounted config.
+//
+// EXCEPTION (issue #86): when cfg comes from an ENFORCED system baseline
+// (cfg.SystemEnforced()), the env override is IGNORED — an enforced audit trail
+// must not be redirectable away by an env var. The destination is then the merged
+// audit_log field (the system's pinned value if it set one, else the user's) or
+// the default. This is stronger than pinning only when the system sets audit_log:
+// it fully honors the non-negotiable "an enforced baseline is not one env var from
+// off" invariant, so even an enforced baseline that leaves audit_log unset writes
+// to the default rather than the attacker-chosen env path.
 func AuditPath(cfg *Config) (string, error) {
-	if p := strings.TrimSpace(os.Getenv(EnvAuditLog)); p != "" {
-		return p, nil
+	if !cfg.SystemEnforced() {
+		if p := strings.TrimSpace(os.Getenv(EnvAuditLog)); p != "" {
+			return p, nil
+		}
 	}
 	if cfg != nil && cfg.AuditLog != "" {
 		return cfg.AuditLog, nil
@@ -970,6 +1025,23 @@ func InsecureConfigPerms() (insecure bool, detail string, err error) {
 	if err != nil {
 		return false, "", err
 	}
+	return insecurePermsAt(path)
+}
+
+// SystemConfigInsecurePerms reports whether the enforced system config file (or
+// its parent directory) is group/world-writable — a LIGHT integrity check (#86,
+// co-designed with #133). A hostile system file can only ADD protection (Merge is
+// most-restrictive), so this is about integrity, not a bypass; it surfaces as a
+// doctor warning. Returns insecure=false when the file does not exist. The full
+// uid==0 ancestor-ownership walk is deferred to #133 — getting /etc ownership
+// right is the OS's job.
+func SystemConfigInsecurePerms() (insecure bool, detail string, err error) {
+	return insecurePermsAt(SystemConfigPath)
+}
+
+// insecurePermsAt is the shared permission check behind InsecureConfigPerms and
+// SystemConfigInsecurePerms.
+func insecurePermsAt(path string) (insecure bool, detail string, err error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1010,6 +1082,33 @@ func (c *Config) ReadOnlyActive() bool {
 		return true
 	}
 	return boolEnv(EnvReadOnly)
+}
+
+// SystemEnforced reports whether this (merged) config was produced with an
+// enforced system baseline applied. It is the signal the env-forbidding checks
+// consult. Nil-safe (a nil config is not enforced).
+func (c *Config) SystemEnforced() bool {
+	return c != nil && c.systemEnforced
+}
+
+// PinnedAuditLog returns the audit destination pinned by an enforced system
+// baseline (system audit_log), and whether one is pinned. Used for display;
+// AuditPath's env-ignoring is gated on SystemEnforced, not on this.
+func (c *Config) PinnedAuditLog() (string, bool) {
+	if c == nil || c.auditLogPinned == "" {
+		return "", false
+	}
+	return c.auditLogPinned, true
+}
+
+// SystemLayer returns the raw SYSTEM-layer config that produced this merged
+// config, or nil when there is no system layer. It backs `config list`
+// provenance and doctor's baseline reporting.
+func (c *Config) SystemLayer() *Config {
+	if c == nil {
+		return nil
+	}
+	return c.systemLayer
 }
 
 // Save writes the config to disk atomically.

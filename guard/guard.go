@@ -116,20 +116,20 @@ func checkWith(args []string, current CurrentContextFunc) (Result, string, *conf
 // detection are all injected so the protection decision can be exercised without
 // kubectl or a real pod.
 func checkWithResolvers(args []string, current CurrentContextFunc, nsFor NamespaceForContextFunc, discover ShortNameDiscoverer, inCluster InClusterFunc, serverFor ServerForContextFunc) (Result, string, *config.Config, error) {
-	// Config must be readable; if we cannot tell what is protected we refuse.
-	exists, err := config.Exists()
+	// Config must be readable; if we cannot tell what is protected we refuse. The
+	// decision path loads the EFFECTIVE config: the enforced SYSTEM baseline (if
+	// any) merged most-restrictively under the USER config (issue #86). The merged
+	// config already has the merge + ApplyDefaults applied, and its enforcement
+	// metadata (SystemEnforced / pinned audit sink) travels with it so the audit
+	// writes and env-forbidding downstream honor the floor automatically. When no
+	// system layer exists this is byte-identical to the prior Exists()+Load() path.
+	cfg, exists, err := config.LoadEffective()
 	if err != nil {
-		return Deny, "", nil, fmt.Errorf("cannot read config status: %w", err)
+		return Deny, "", nil, fmt.Errorf("cannot load config: %w", err)
 	}
 	if !exists {
 		return SetupRequired, "", nil, nil
 	}
-
-	cfg, err := config.Load()
-	if err != nil {
-		return Deny, "", nil, fmt.Errorf("cannot load config: %w", err)
-	}
-	cfg.ApplyDefaults()
 
 	// A group/world-writable config is a tamper signal: anyone who can rewrite
 	// ~/.kubectl-guard.yaml can disable protection by emptying the protected lists.

@@ -33,17 +33,20 @@ const ActorEnvVar = "KUBECTL_GUARD_ACTOR"
 
 // Outcome constants for audit entries.
 const (
-	OutcomeAllowed       = "allowed"        // command passed through ungated
-	OutcomeConfirmed     = "confirmed"      // gated command, user confirmed
-	OutcomeAborted       = "aborted"        // gated command, user declined
-	OutcomeBlocked       = "blocked"        // protected resource, refused
-	OutcomeDenied        = "denied"         // fail-closed (config/context error)
-	OutcomeAutoConfirmed = "auto-confirmed" // gated command, auto-approved via --yes/KUBECTL_GUARD_CONFIRM (audited)
-	OutcomeBypassed      = "bypassed"       // guard fully bypassed via KUBECTL_GUARD_BYPASS (audited, discouraged)
-	OutcomeDryRun        = "dry-run"        // state-altering command allowed because --dry-run changes nothing
-	OutcomeRelayed       = "relayed"        // agent-relay mode: emitted needs-confirmation JSON, did not prompt
-	OutcomeApprovedOnce  = "approved-once"  // authenticated one-shot request consumed and executed
-	OutcomeConfigChange  = "config-change"  // a `config` subcommand changed the guard's own configuration
+	OutcomeAllowed              = "allowed"           // command passed through ungated
+	OutcomeConfirmed            = "confirmed"         // gated command, user confirmed
+	OutcomeAborted              = "aborted"           // gated command, user declined
+	OutcomeBlocked              = "blocked"           // protected resource, refused
+	OutcomeDenied               = "denied"            // fail-closed (config/context error)
+	OutcomeAutoConfirmed        = "auto-confirmed"    // gated command, auto-approved via --yes/KUBECTL_GUARD_CONFIRM (audited)
+	OutcomeBypassed             = "bypassed"          // guard fully bypassed via KUBECTL_GUARD_BYPASS (audited, discouraged)
+	OutcomeDryRun               = "dry-run"           // state-altering command allowed because --dry-run changes nothing
+	OutcomeRelayed              = "relayed"           // agent-relay mode: emitted needs-confirmation JSON, did not prompt
+	OutcomeApprovalConsumed     = "approval-consumed" // authenticated one-shot request consumed; execution dispatch follows
+	OutcomeApprovalRejected     = "approval-rejected"
+	OutcomeAuthenticationFailed = "authentication-failed"
+	OutcomeApprovalExecFailed   = "approval-exec-failed"
+	OutcomeConfigChange         = "config-change" // a `config` subcommand changed the guard's own configuration
 )
 
 // AuditEntry is a single line in the audit log.

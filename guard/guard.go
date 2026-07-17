@@ -680,6 +680,12 @@ func ExecKubectl(args []string) error {
 	return execReplace(kubectl, fullArgs, os.Environ())
 }
 
+// ExecKubectlPath replaces this process with an already-resolved kubectl path.
+// Approval flows use this to avoid a second mutable PATH lookup after authentication.
+func ExecKubectlPath(path string, args []string) error {
+	return execReplace(path, append([]string{"kubectl"}, args...), os.Environ())
+}
+
 // RunKubectl runs the REAL kubectl and returns its output. It uses
 // RealKubectlPath so internal lookups don't recurse into a PATH-shadowing shim.
 func RunKubectl(args ...string) ([]byte, error) {

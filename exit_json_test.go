@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -16,6 +17,17 @@ func buildGuardBin(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "kubectl-guard-test")
 	out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	return bin
+}
+
+func buildGuardBinTrustedSudo(t *testing.T, sudoPath string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "kubectl-guard-test")
+	ld := "-X github.com/lockhinator/kubectl-guard/approval.TrustedSudoPath=" + sudoPath + " -X github.com/lockhinator/kubectl-guard/approval.TrustedSudoOwnerUID=" + strconv.Itoa(os.Geteuid())
+	out, err := exec.Command("go", "build", "-ldflags", ld, "-o", bin, ".").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go build failed: %v\n%s", err, out)
 	}

@@ -28,11 +28,13 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
   auto-confirm flag, closing the path where an agent could claim a human had
   approved simply by changing its own command.
 - **Exact-command approval requests** — a gated command creates a cryptographically
-  random, ten-minute request containing a digest of the original argv. Raw argv
-  is not persisted; the stored display command is redacted.
+  random, ten-minute request containing the original argv, its digest, and a
+  snapshot of cluster server, namespace, and kubeconfig. The mode-0600 request
+  is removed on expiry or consumption; all human/audit display remains redacted.
 - **Fresh OS authentication** — the human runs
-  `kubectl-guard approve <id> -- kubectl <exact args>`. The guard verifies the
-  digest and current policy, forces a new sudo/PAM authentication (`-k` prevents
+  `kubectl-guard approve <id>`. The guard loads the bound argv without putting
+  agent-controlled text into the human's shell, verifies the target and current
+  policy, and forces a new sudo/PAM authentication (`-k` prevents
   cached sudo credentials), atomically consumes the request, then executes it.
   On macOS this uses Touch ID when the machine's sudo PAM policy enables
   `pam_tid`, with password fallback; Linux uses its configured PAM modules.
@@ -411,8 +413,8 @@ Now an agent session looks like this:
 # The agent never sees the secret. It's not in the context window.
 
 > kubectl delete deployment api --context=prod-cluster
-{"decision":"needs-confirmation", … "prompt":"… kubectl-guard approve A1B2C3D4E5F6 -- kubectl delete deployment api --context=prod-cluster"}
-# A human authenticates and executes that exact command once.
+{"decision":"needs-confirmation", … "prompt":"… kubectl-guard approve A1B2C3D4E5F60718293A4B5C6D7E8F90"}
+# A human authenticates and executes that reviewed argv once.
 ```
 
 Every attempt — blocked, aborted, or confirmed — is appended to the audit log (`~/.kubectl-guard-audit.log`), so you have a full record of what your agent tried to do.
@@ -421,7 +423,7 @@ Every attempt — blocked, aborted, or confirmed — is appended to the audit lo
 
 Interactive confirmation is useful for a human terminal, but an agent able to
 write stdin could answer it too. **Agent-relay mode** instead creates a
-short-lived request for the exact command and requires fresh OS authentication:
+short-lived request for the reviewed argv and requires fresh OS authentication:
 
 ```bash
 kubectl-guard config confirm-mode agent-relay
@@ -436,16 +438,30 @@ On a command that would normally prompt, the guard does **not** touch stdin.
 Instead it prints a needs-confirmation object on **stderr** and exits `4`:
 
 ```json
-{"decision":"needs-confirmation","reason":"authenticated-approval-required","context":"prod-cluster","command":"delete pod nginx","prompt":"Approve once with OS authentication: kubectl-guard approve A1B2C3D4E5F6 -- kubectl delete pod nginx"}
+{"decision":"needs-confirmation","reason":"authenticated-approval-required","context":"prod-cluster","command":"delete pod nginx","prompt":"Approve once with OS authentication: kubectl-guard approve A1B2C3D4E5F60718293A4B5C6D7E8F90"}
 ```
 
 The agent framework catches exit code `4` and relays the prompt. The human runs
-the displayed `kubectl-guard approve` command. The guard checks that argv still
-matches the request digest, re-evaluates current policy and context, requests a
-fresh PAM authentication, consumes the request, and executes it in that same
-process. There is no approval token to give back to the agent. A request expires
-after ten minutes and cannot be used twice. Plain `--yes` is refused in
+the displayed ID-only `kubectl-guard approve` command. The guard checks the
+stored argv digest, Kubernetes target, kubeconfig, and kubectl executable,
+requests fresh PAM authentication, then repeats every expiry/policy/target/
+executable check before consuming and executing it in that same process. There
+is no approval token to give back to the agent. A request expires
+after ten minutes, is rejected thereafter, is removed when next encountered or
+pruned, and cannot be used twice. Plain `--yes` is refused in
 agent-relay mode.
+
+Agent-relay deliberately rejects mutable local inputs such as `-f`, `-k`,
+`--patch-file`, and `-f -`: argv alone cannot prove which bytes a human reviewed.
+Use a reviewed deployment pipeline or block mode for file-backed changes.
+
+Security boundary: kubectl-guard is an interception and human-presence control,
+not a same-UID process sandbox. The enrollment file records operator intent but
+is not an authentication credential; every approval still requires PAM. An
+agent with unrestricted execution as the human can edit that human's files or
+invoke another kubectl directly. Strong corporate enforcement therefore also
+requires an enforced policy plus a harness/sandbox, separate OS identity, or
+credential broker that prevents bypassing the shim and protects kubeconfig.
 
 A hard **`Blocked`** (protected resource, or `context_mode: block`) is *not*
 relayable — it stays a hard refusal (exit `2`) regardless of confirm mode, so

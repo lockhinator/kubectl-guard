@@ -18,12 +18,12 @@ func runGuardBin(t *testing.T, cfgYAML string, args ...string) (stdout, stderr s
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
-	bin := buildGuardBin(t)
 	home := t.TempDir()
 	writeConfig(t, home, cfgYAML)
 	writeKubeconfig(t, home, "fake-context", nil)
 	kubectlDir := writeFakeKubectl(t)
 	prepareApprovalFixture(t, home, kubectlDir)
+	bin := buildGuardBinTrustedSudo(t, filepath.Join(kubectlDir, "sudo"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

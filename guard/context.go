@@ -230,6 +230,13 @@ func defaultServerForContext(kubeconfig, context string) (string, error) {
 	return cl.Server, nil
 }
 
+// ServerForContext resolves the API server for a named context using the same
+// kubeconfig loading path as policy evaluation. Approval requests bind this
+// identity so a context name cannot be retargeted between request and execution.
+func ServerForContext(kubeconfig, context string) (string, error) {
+	return defaultServerForContext(kubeconfig, context)
+}
+
 // noServerForContext is the test-seam resolver (checkWith): it resolves nothing,
 // so existing tests never touch a kubeconfig for server resolution.
 func noServerForContext(string, string) (string, error) { return "", nil }

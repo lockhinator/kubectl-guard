@@ -27,6 +27,12 @@ func LoadState() (State, error) {
 	if err != nil {
 		return State{}, err
 	}
+	if err := checkSecureFile(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return State{}, nil
+		}
+		return State{}, err
+	}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return State{}, nil
@@ -37,6 +43,12 @@ func LoadState() (State, error) {
 	var s State
 	if err := json.Unmarshal(b, &s); err != nil {
 		return State{}, err
+	}
+	if s.Provider != "sudo-pam" {
+		return State{}, errors.New("invalid approval state provider")
+	}
+	if _, err := time.Parse(time.RFC3339, s.EnabledAt); err != nil {
+		return State{}, errors.New("invalid approval state timestamp")
 	}
 	return s, nil
 }
@@ -52,10 +64,7 @@ func Enable() error {
 		return err
 	}
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0700); err != nil {
+	if err := ensureSecureDir(dir); err != nil {
 		return err
 	}
 	s := State{EnabledAt: time.Now().UTC().Format(time.RFC3339), Provider: "sudo-pam"}

@@ -47,6 +47,12 @@
       <div class="terminal" aria-label="Example kubectl-guard decisions">
         <div class="terminal-head"><span class="dots">● ● ●</span><span>agent · prod-us-east-1</span></div>
         <div class="terminal-body">
+          <div class="dim">HUMAN</div>
+          <div>“Check why checkout is failing in production.”</div>
+          <div class="space"></div>
+          <div class="dim">AGENT</div>
+          <div>“I’ll inspect the deployment and its configuration.”</div>
+          <div class="space"></div>
           <div><span class="prompt">›</span> kubectl get secret stripe-keys -o yaml</div>
           <div class="danger">BLOCKED · protected resource: secret</div><div class="decision danger">EXIT 2</div>
           <div class="space"></div>

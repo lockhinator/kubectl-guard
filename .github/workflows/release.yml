@@ -35,6 +35,10 @@ jobs:
         id: release-please
         with:
           release-type: go
+          # workflow_dispatch can pin an exact release when a deterministic
+          # version is required. Empty on normal pushes, where Conventional
+          # Commits derive the bump (`feat:` after v1.0.0 => v1.1.0).
+          release-as: ${{ inputs.release_as || '' }}
           # While in 0.x, treat `feat:` as a minor bump (0.1.0 -> 0.2.0)
           # instead of escalating to 1.0.0.
           bump-minor-pre-major: true

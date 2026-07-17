@@ -9,18 +9,40 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
 ## Features
 
 - **🔒 Secret protection** — Block all secret access across your entire cluster. Secrets never leave the cluster, so they can never enter LLM context windows or logs.
-- **🚦 Production gating** — Require explicit confirmation for state-altering commands on production contexts **and namespaces**. Type the context/namespace name to confirm — something autonomous agents can't do. Optional hard **block mode** refuses with no prompt.
+- **🚦 Production gating** — Require explicit confirmation for state-altering commands on production contexts **and namespaces**. Humans can confirm interactively; agents use a short-lived, exact-command request backed by fresh OS authentication. Optional hard **block mode** refuses with no prompt.
 - **📋 Comprehensive audit logging** — Every command is logged with timestamps, context, outcome, and *who drove it* (the actor). Full visibility into what your agents (or you) tried to do.
 - **🤖 Agent-native output** — Distinct exit codes (0/1/2/3/4) and a `--json` mode let agent frameworks parse guard decisions programmatically instead of scraping warning text.
 - **🛡️ Hard to bypass** — Honors `--context`/`--kubeconfig`/`--namespace`, denies `--server` (unknown cluster) and optionally `--as` impersonation, and a PATH-shadowing install (`make install-shim`) intercepts `kubectl` even in non-interactive shells and agent subprocesses where an alias can't reach.
 - **🤫 Headless-friendly, fail-closed** — Configure without a TTY via env vars, `config init`, or `--no-prompt`, so CI and agents bootstrap deterministically. An unconfigured headless run **refuses to mutate** rather than silently writing an unprotected config (`KUBECTL_GUARD_BOOTSTRAP`). `--dry-run` commands skip the prompt (no cry-wolf).
-- **🔓 Audited escape hatch** — `--yes`/`KUBECTL_GUARD_CONFIRM` auto-confirms gated commands for automation while still logging them (protected-resource blocks and block mode are never bypassed).
+- **🔐 Authenticated one-shot approval** — agent-relay creates a ten-minute request bound to the exact argv. `kubectl-guard approve` authenticates through the host PAM policy and executes it once; plain `--yes` is rejected in agent-relay mode.
 - **👀 Diff before confirm** — Optionally preview `kubectl diff` before the prompt for apply/create/replace, so a confirmation is informed.
 - **⚡ Drop-in replacement** — Works as a kubectl alias. No changes to your workflows or agent prompts.
 - **🔧 Reliable configuration** — Atomic config writes and concurrent-safe audit logging prevent corruption.
 - **🎯 Smart command classification** — Automatically distinguishes safe reads from dangerous mutations, even with uppercase verbs or plugins.
 
 ## What's New
+
+### v1.1.0 — Authenticated, one-shot agent approvals
+
+- **No self-approval with `--yes`** — agent-relay now rejects the unauthenticated
+  auto-confirm flag, closing the path where an agent could claim a human had
+  approved simply by changing its own command.
+- **Exact-command approval requests** — a gated command creates a cryptographically
+  random, ten-minute request containing a digest of the original argv. Raw argv
+  is not persisted; the stored display command is redacted.
+- **Fresh OS authentication** — the human runs
+  `kubectl-guard approve <id> -- kubectl <exact args>`. The guard verifies the
+  digest and current policy, forces a new sudo/PAM authentication (`-k` prevents
+  cached sudo credentials), atomically consumes the request, then executes it.
+  On macOS this uses Touch ID when the machine's sudo PAM policy enables
+  `pam_tid`, with password fallback; Linux uses its configured PAM modules.
+- **One execution, no bearer token** — approval and execution happen in the same
+  process, so there is no reusable permit for an agent to copy. Requests expire,
+  reject any argv change, and remain consumed even if kubectl subsequently fails
+  to start.
+- **Broker-ready boundary** — OS authentication implements a small provider
+  interface so a future Slack, Teams, or internal approval broker can replace the
+  local authenticator without changing request matching and consumption.
 
 ### v1.0.0 — Team baselines, supply-chain trust & defense-in-depth
 
@@ -87,7 +109,7 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
 - **`--raw` gating** — `kubectl get --raw /api/v1/namespaces/default/secrets/db-creds` read secrets straight past resource protection. `--raw` is now blocked whenever any resource protection is configured (the guard cannot map a literal API path to a resource type); untouched when none is, so `--raw /healthz` still works. `create`/`replace`/`delete --raw` are covered too.
 - **Audit-log secret redaction** — the guard no longer writes secret values into its own audit log, `--json` output, or prompts. Credential flags, `key=value` flags (`--from-literal`/`--env`/…), JSON blobs (`--patch`/`--overrides`), `set env` positionals, and `config set` credential properties are redacted to `***` on every surface, while kubectl still receives the real command.
 - **Secure-default headless bootstrap** — an unconfigured headless first run no longer silently writes an empty (unprotected) config and proceeds. `KUBECTL_GUARD_BOOTSTRAP` selects the posture; the default `deny` refuses state-altering commands and writes nothing, `empty` is the opt-in for intentionally-unprotected CI.
-- **Agent-relay approval flow** — `confirm_mode: agent-relay` (or `KUBECTL_GUARD_AGENT_RELAY=1`) emits a structured `needs-confirmation` object on stderr and exits `4` instead of prompting stdin, so an agent framework can relay the request to its human and re-run with `--yes` once approved. Hard blocks stay hard blocks.
+- **Agent-relay approval flow** — `confirm_mode: agent-relay` (or `KUBECTL_GUARD_AGENT_RELAY=1`) emits a structured `needs-confirmation` object on stderr and exits `4` instead of prompting stdin. In v1.1+, its request is completed through the authenticated, one-shot `kubectl-guard approve` command. Hard blocks stay hard blocks.
 
 ### v0.4.0 — Security completeness
 
@@ -371,10 +393,9 @@ The agent-safe setup is two commands:
 #    so it can never enter the context window.
 kubectl-guard config add-resource secret
 
-# 2. Require typing the context name to confirm any state change on prod —
-#    an autonomous agent cannot satisfy this, so a human must approve.
+# 2. Require an authenticated, one-shot approval for state changes on prod.
 kubectl-guard config add-context 'prod-*'
-kubectl-guard config confirm-mode type-name
+kubectl-guard config confirm-mode agent-relay
 ```
 
 Now an agent session looks like this:
@@ -385,19 +406,17 @@ Now an agent session looks like this:
 # The agent never sees the secret. It's not in the context window.
 
 > kubectl delete deployment api --context=prod-cluster
-⚠️  delete deployment on protected context: prod-cluster
-Type "prod-cluster" to confirm (anything else aborts):
-# An autonomous agent can't type this — a human must.
+{"decision":"needs-confirmation", … "prompt":"… kubectl-guard approve A1B2C3D4E5F6 -- kubectl delete deployment api --context=prod-cluster"}
+# A human authenticates and executes that exact command once.
 ```
 
 Every attempt — blocked, aborted, or confirmed — is appended to the audit log (`~/.kubectl-guard-audit.log`), so you have a full record of what your agent tried to do.
 
 ### Agent-relay: human-in-the-loop *through* the agent
 
-Type-to-confirm correctly blocks an autonomous agent — but it also blocks the
-legitimate case where a human *is* in the loop, reachable through the agent's own
-UI. **Agent-relay mode** turns a gated command into a structured request the
-agent can relay to its human and resume:
+Interactive confirmation is useful for a human terminal, but an agent able to
+write stdin could answer it too. **Agent-relay mode** instead creates a
+short-lived request for the exact command and requires fresh OS authentication:
 
 ```bash
 kubectl-guard config confirm-mode agent-relay
@@ -408,13 +427,16 @@ On a command that would normally prompt, the guard does **not** touch stdin.
 Instead it prints a needs-confirmation object on **stderr** and exits `4`:
 
 ```json
-{"decision":"needs-confirmation","reason":"agent-relay","context":"prod-cluster","command":"delete pod nginx","prompt":"Approve \"delete pod\" on protected context \"prod-cluster\"? Re-run with --yes to proceed."}
+{"decision":"needs-confirmation","reason":"authenticated-approval-required","context":"prod-cluster","command":"delete pod nginx","prompt":"Approve once with OS authentication: kubectl-guard approve A1B2C3D4E5F6 -- kubectl delete pod nginx"}
 ```
 
-The agent framework catches exit code `4` + the JSON, relays `prompt` to its
-human, and — once approved — re-runs the **same command with `--yes`**, which
-runs it (audited as `auto-confirmed`). If the human declines, the agent aborts.
-This makes the guard composable with agent UIs instead of competing with them.
+The agent framework catches exit code `4` and relays the prompt. The human runs
+the displayed `kubectl-guard approve` command. The guard checks that argv still
+matches the request digest, re-evaluates current policy and context, requests a
+fresh PAM authentication, consumes the request, and executes it in that same
+process. There is no approval token to give back to the agent. A request expires
+after ten minutes and cannot be used twice. Plain `--yes` is refused in
+agent-relay mode.
 
 A hard **`Blocked`** (protected resource, or `context_mode: block`) is *not*
 relayable — it stays a hard refusal (exit `2`) regardless of confirm mode, so

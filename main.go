@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lockhinator/kubectl-guard/approval"
 	"github.com/lockhinator/kubectl-guard/config"
 	"github.com/lockhinator/kubectl-guard/guard"
 	"github.com/lockhinator/kubectl-guard/ui"
@@ -136,6 +137,8 @@ func run() error {
 			return runFreeze(false)
 		case "explain":
 			return runExplain(os.Args[2:])
+		case "approve":
+			return runApprove(os.Args[2:], approval.OSAuthenticator{})
 		case "completion", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
 			// `completion <shell>` generates the guard's own completion script;
 			// `__complete`/`__completeNoDesc` are cobra's hidden runtime requests the
@@ -467,6 +470,92 @@ func runExplain(args []string) error {
 		fmt.Printf("resource:  %s\n", res.Resource)
 	}
 	return nil
+}
+
+// runApprove authenticates a human and executes one exact, previously-requested
+// command. It deliberately executes here instead of issuing a token to a later
+// agent process: there is no bearer capability for the agent to steal or replay.
+func runApprove(args []string, auth approval.Authenticator) error {
+	if len(args) == 0 {
+		return errors.New("usage: kubectl-guard approve <request-id> [--reason <why>] -- kubectl <args>")
+	}
+	id := args[0]
+	sep := -1
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep < 0 || sep == len(args)-1 {
+		return errors.New("approval requires the exact command after --")
+	}
+
+	var justification string
+	for i := 1; i < sep; i++ {
+		switch {
+		case args[i] == "--reason" && i+1 < sep:
+			justification = strings.TrimSpace(args[i+1])
+			i++
+		case strings.HasPrefix(args[i], "--reason="):
+			justification = strings.TrimSpace(strings.TrimPrefix(args[i], "--reason="))
+		default:
+			return fmt.Errorf("unknown approve option %q", args[i])
+		}
+	}
+	command := append([]string(nil), args[sep+1:]...)
+	if len(command) > 0 && filepath.Base(command[0]) == "kubectl" {
+		command = command[1:]
+	}
+	if len(command) == 0 {
+		return errors.New("approval command has no kubectl arguments")
+	}
+
+	req, err := approval.Load(id)
+	if err != nil {
+		return err
+	}
+	if err := approval.Verify(req, command); err != nil {
+		return err
+	}
+	result, ctx, cfg, checkErr := guard.Check(command)
+	if checkErr != nil {
+		return fmt.Errorf("rechecking approved command: %w", checkErr)
+	}
+	if result != guard.RequireConfirmation {
+		return fmt.Errorf("request can no longer be approved: current policy decision is %v", result)
+	}
+	if cfg != nil && cfg.RequireJustification && justification == "" {
+		return errors.New("this policy requires --reason \"<why>\" before --")
+	}
+	redacted := guard.RedactArgs(command)
+	display := strings.Join(redacted, " ")
+	if ctx != req.Context {
+		return fmt.Errorf("target context changed from %q to %q; create a new request", req.Context, ctx)
+	}
+
+	ui.PrintWarning("ONE-TIME KUBERNETES APPROVAL")
+	ui.PrintInfo("Request: " + req.ID)
+	ui.PrintInfo("Actor: " + req.Actor)
+	ui.PrintInfo("Command: kubectl " + display)
+	ui.PrintInfo("Context: " + ctx)
+	if req.Reason != "" {
+		ui.PrintInfo("Policy: " + req.Reason + " — " + req.Target)
+	}
+	if justification != "" {
+		ui.PrintInfo("Reason: " + justification)
+	}
+	if err := auth.Authenticate("kubectl " + display); err != nil {
+		return err
+	}
+	if err := approval.Consume(req.ID); err != nil {
+		return err
+	}
+	if cfg != nil {
+		_ = guard.AppendAudit(cfg, guard.AuditEntry{Context: ctx, Command: display, Outcome: guard.OutcomeApprovedOnce, Reason: "approval-request:" + req.ID, Justification: justification})
+	}
+	ui.PrintSuccess("Authenticated. Executing this command once; request " + req.ID + " is now consumed.")
+	return execKubectl(command)
 }
 
 func nonEmpty(s, fallback string) string {
@@ -1405,6 +1494,19 @@ func runGuard(args []string) error {
 		// the audit trail records the bypass. Protected-resource Blocks are NOT
 		// affected by this (they stay a hard block in their own branch).
 		autoConfirm := yesFlag || boolEnv(config.EnvConfirm)
+		agentRelay := (cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay) || boolEnv(config.EnvAgentRelay)
+		if autoConfirm && agentRelay {
+			audit(guard.OutcomeAborted, "unauthenticated-auto-confirm-refused")
+			if jsonMode {
+				jr := guard.JSONResult{Decision: "needs-confirmation", Reason: "authenticated-approval-required", Context: ctx, Command: cmdStr, Prompt: "Plain --yes is disabled in agent-relay mode; create or use a one-shot authenticated approval request."}
+				if b, mErr := json.Marshal(jr); mErr == nil {
+					fmt.Fprintln(os.Stderr, string(b))
+				}
+			} else {
+				ui.PrintWarning("Refusing --yes: agent-relay requires an authenticated, one-shot approval.")
+			}
+			os.Exit(guard.ExitNeedsConfirm)
+		}
 		if autoConfirm {
 			// Justification: a non-interactive approval must carry --reason when
 			// require_justification is on, else fail closed (the command must not run
@@ -1481,28 +1583,29 @@ func runGuard(args []string) error {
 		// Agent-relay mode: instead of prompting stdin, emit a structured
 		// needs-confirmation object (including a human-readable prompt) and exit
 		// with the needs-confirmation code, so an agent framework can relay the
-		// request to its own human and re-run with --yes once approved. This is a
+		// request to its human for an OS-authenticated, exact-command execution. This is a
 		// decision axis independent of --json: it is active whenever the confirm
 		// mode is agent-relay or KUBECTL_GUARD_AGENT_RELAY is set.
-		agentRelay := (cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay) || boolEnv(config.EnvAgentRelay)
 		if agentRelay {
-			rerun := "Re-run with --yes to proceed."
+			req, reqErr := approval.Create(forwarded, cmdStr, ctx, reason, target, guard.CurrentActor(cfg))
+			if reqErr != nil {
+				return fmt.Errorf("creating approval request: %w", reqErr)
+			}
+			run := fmt.Sprintf("kubectl-guard approve %s -- kubectl %s", req.ID, cmdStr)
 			if cfg != nil && cfg.RequireJustification {
-				// The relayed request notes a reason is required so the agent can
-				// collect it from its human before re-running.
-				rerun = "Re-run with --yes --reason \"<why>\" to proceed (a justification is required)."
+				run = fmt.Sprintf("kubectl-guard approve %s --reason \"<why>\" -- kubectl %s", req.ID, cmdStr)
 			}
 			jr := guard.JSONResult{
 				Decision: "needs-confirmation",
-				Reason:   "agent-relay",
+				Reason:   "authenticated-approval-required",
 				Context:  ctx,
 				Command:  cmdStr,
-				Prompt:   fmt.Sprintf("Approve %q on %s %q? %s", cmdDesc, reason, target, rerun),
+				Prompt:   fmt.Sprintf("Approve %q on %s %q once with OS authentication: %s", cmdDesc, reason, target, run),
 			}
 			if b, mErr := json.Marshal(jr); mErr == nil {
 				fmt.Fprintln(os.Stderr, string(b))
 			}
-			audit(guard.OutcomeRelayed, "agent-relay")
+			audit(guard.OutcomeRelayed, "approval-request:"+req.ID)
 			os.Exit(guard.ExitNeedsConfirm)
 		}
 
@@ -3018,6 +3121,9 @@ Usage:
   kubectl-guard explain [--json] -- <kubectl args...>
                                       Preflight: would this be gated, and why?
                                       (runs the decision without kubectl/prompt/audit)
+  kubectl-guard approve <id> [--reason <why>] -- kubectl <args...>
+                                      Authenticate through the host PAM policy
+                                      and execute one exact request once
   kubectl-guard doctor [--json] [--require-interception]
                                       Health check: interception, config,
                                       audit, context resolution, and posture
@@ -3066,7 +3172,8 @@ Protection model:
 
 Guard-only flags (stripped before forwarding to kubectl):
   --json         Emit a structured decision object on stderr for non-allow
-  --yes          Auto-confirm a gated command (audited; block mode not bypassed)
+  --yes          Auto-confirm a gated command (audited; rejected in agent-relay;
+                 block mode is never bypassed)
   --reason <why> Free-text justification recorded on the audit entry for a gated
                  command; required with --yes when require_justification is on
   --no-prompt    Headless: no interactive setup wizard. With no config, the

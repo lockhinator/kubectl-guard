@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ func runGuardBin(t *testing.T, cfgYAML string, args ...string) (stdout, stderr s
 	writeConfig(t, home, cfgYAML)
 	writeKubeconfig(t, home, "fake-context", nil)
 	kubectlDir := writeFakeKubectl(t)
+	prepareApprovalFixture(t, home, kubectlDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -45,6 +47,25 @@ func runGuardBin(t *testing.T, cfgYAML string, args ...string) (stdout, stderr s
 		auditLog = string(data)
 	}
 	return outBuf.String(), errBuf.String(), code, auditLog
+}
+
+// prepareApprovalFixture keeps general integration tests independent of the
+// host's sudo policy. Dedicated approval E2E tests exercise real enrollment and
+// NOPASSWD behavior with their own fixtures.
+func prepareApprovalFixture(t *testing.T, home, tools string) {
+	t.Helper()
+	dir := filepath.Join(home, ".kubectl-guard")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	state := `{"enabled_at":"2026-07-17T00:00:00Z","provider":"sudo-pam"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "approval.json"), []byte(state), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sudo := "#!/bin/sh\ncase \" $* \" in *\" -n \"*) exit 1;; *) exit 0;; esac\n"
+	if err := os.WriteFile(filepath.Join(tools, "sudo"), []byte(sudo), 0700); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestPortForwardUnprotectedContextPassesThroughAndAudited covers the #71

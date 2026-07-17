@@ -26,6 +26,7 @@ func runGuardEnv(t *testing.T, cfgYAML string, extraEnv []string, args ...string
 	home := t.TempDir()
 	writeConfig(t, home, cfgYAML)
 	kubectlDir := writeFakeKubectl(t)
+	prepareApprovalFixture(t, home, kubectlDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

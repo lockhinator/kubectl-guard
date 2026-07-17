@@ -139,6 +139,8 @@ func run() error {
 			return runExplain(os.Args[2:])
 		case "approve":
 			return runApprove(os.Args[2:], approval.OSAuthenticator{})
+		case "approval":
+			return runApprovalCommand(os.Args[2:], approval.OSAuthenticator{})
 		case "completion", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
 			// `completion <shell>` generates the guard's own completion script;
 			// `__complete`/`__completeNoDesc` are cobra's hidden runtime requests the
@@ -328,6 +330,24 @@ func buildDoctorReport(requireInterception bool) doctorReport {
 		add("audit log writable", "ok", auditPath)
 	}
 
+	// Agent-relay authentication must require human presence. If sudo/PAM accepts
+	// validation non-interactively (NOPASSWD), the agent could run `approve`
+	// itself, so both doctor and the approval path fail closed on the same probe.
+	if cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay {
+		enabled, stateErr := approval.Enabled()
+		required, authDetail := approval.HumanPresenceRequired()
+		switch {
+		case stateErr != nil:
+			add("human approval authentication", "fail", "cannot read approval setup: "+stateErr.Error())
+		case !required:
+			add("human approval authentication", "fail", "UNSAFE: "+authDetail+". Disable NOPASSWD for this user or use block mode; authenticated approvals are disabled until fixed")
+		case !enabled:
+			add("human approval authentication", "fail", "NOT CONFIGURED: run 'kubectl-guard approval setup' from a human terminal")
+		default:
+			add("human approval authentication", "ok", authDetail)
+		}
+	}
+
 	// Current context resolvable (fail closed if protected contexts are set).
 	ctx, ctxErr := guard.GetCurrentContext()
 	switch {
@@ -476,6 +496,13 @@ func runExplain(args []string) error {
 // command. It deliberately executes here instead of issuing a token to a later
 // agent process: there is no bearer capability for the agent to steal or replay.
 func runApprove(args []string, auth approval.Authenticator) error {
+	enabled, stateErr := approval.Enabled()
+	if stateErr != nil {
+		return fmt.Errorf("reading approval setup: %w", stateErr)
+	}
+	if !enabled {
+		return errors.New("authenticated approvals are not enabled; run 'kubectl-guard approval setup' from a human terminal")
+	}
 	if len(args) == 0 {
 		return errors.New("usage: kubectl-guard approve <request-id> [--reason <why>] -- kubectl <args>")
 	}
@@ -556,6 +583,46 @@ func runApprove(args []string, auth approval.Authenticator) error {
 	}
 	ui.PrintSuccess("Authenticated. Executing this command once; request " + req.ID + " is now consumed.")
 	return execKubectl(command)
+}
+
+func runApprovalCommand(args []string, auth approval.Authenticator) error {
+	if len(args) != 1 {
+		return errors.New("usage: kubectl-guard approval <setup|status>")
+	}
+	switch args[0] {
+	case "setup":
+		if required, detail := approval.HumanPresenceRequired(); !required {
+			return fmt.Errorf("cannot enable authenticated approvals: %s", detail)
+		}
+		ui.PrintWarning("Enabling one-shot Kubernetes approvals requires fresh human authentication.")
+		if err := auth.Authenticate("enable kubectl-guard authenticated approvals"); err != nil {
+			return err
+		}
+		if err := approval.Enable(); err != nil {
+			return fmt.Errorf("saving approval setup: %w", err)
+		}
+		ui.PrintSuccess("Authenticated approvals ENABLED. Agent-relay requests now require fresh OS authentication and execute once.")
+		return nil
+	case "status":
+		enabled, err := approval.Enabled()
+		if err != nil {
+			return err
+		}
+		required, detail := approval.HumanPresenceRequired()
+		switch {
+		case !required:
+			ui.PrintWarning("Authenticated approvals: UNSAFE — " + detail + ". Agent-relay approval is disabled until fixed.")
+			return nil
+		case !enabled:
+			ui.PrintWarning("Authenticated approvals: NOT CONFIGURED — run 'kubectl-guard approval setup'.")
+			return nil
+		default:
+			ui.PrintSuccess("Authenticated approvals: READY — " + detail)
+			return nil
+		}
+	default:
+		return fmt.Errorf("unknown approval subcommand %q (want setup or status)", args[0])
+	}
 }
 
 func nonEmpty(s, fallback string) string {
@@ -1587,6 +1654,26 @@ func runGuard(args []string) error {
 		// decision axis independent of --json: it is active whenever the confirm
 		// mode is agent-relay or KUBECTL_GUARD_AGENT_RELAY is set.
 		if agentRelay {
+			if required, detail := approval.HumanPresenceRequired(); !required {
+				jr := guard.JSONResult{Decision: "denied", Reason: "approval-authentication-unsafe", Context: ctx, Command: cmdStr, Prompt: "Authenticated approvals are disabled: " + detail}
+				if b, mErr := json.Marshal(jr); mErr == nil {
+					fmt.Fprintln(os.Stderr, string(b))
+				}
+				audit(guard.OutcomeDenied, "approval-authentication-unsafe")
+				os.Exit(guard.ExitDenied)
+			}
+			enabled, setupErr := approval.Enabled()
+			if setupErr != nil {
+				return fmt.Errorf("reading approval setup: %w", setupErr)
+			}
+			if !enabled {
+				jr := guard.JSONResult{Decision: "needs-confirmation", Reason: "approval-not-configured", Context: ctx, Command: cmdStr, Prompt: "Authenticated approvals are not configured. A human must run: kubectl-guard approval setup"}
+				if b, mErr := json.Marshal(jr); mErr == nil {
+					fmt.Fprintln(os.Stderr, string(b))
+				}
+				audit(guard.OutcomeRelayed, "approval-not-configured")
+				os.Exit(guard.ExitNeedsConfirm)
+			}
 			req, reqErr := approval.Create(forwarded, cmdStr, ctx, reason, target, guard.CurrentActor(cfg))
 			if reqErr != nil {
 				return fmt.Errorf("creating approval request: %w", reqErr)
@@ -3124,6 +3211,11 @@ Usage:
   kubectl-guard approve <id> [--reason <why>] -- kubectl <args...>
                                       Authenticate through the host PAM policy
                                       and execute one exact request once
+  kubectl-guard approval setup       Verify human-presence authentication and
+                                      enable one-shot approvals (fails closed
+                                      when sudo/PAM permits NOPASSWD)
+  kubectl-guard approval status      Show approval enrollment and whether the
+                                      authentication policy is safe for agents
   kubectl-guard doctor [--json] [--require-interception]
                                       Health check: interception, config,
                                       audit, context resolution, and posture

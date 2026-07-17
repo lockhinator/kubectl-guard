@@ -36,6 +36,11 @@ A CLI wrapper for kubectl that sits between AI agents (and humans) and your clus
   cached sudo credentials), atomically consumes the request, then executes it.
   On macOS this uses Touch ID when the machine's sudo PAM policy enables
   `pam_tid`, with password fallback; Linux uses its configured PAM modules.
+- **Explicit enrollment + NOPASSWD defense** — approvals start disabled. A human
+  runs `kubectl-guard approval setup`, which first proves non-interactive sudo is
+  rejected and then requires fresh PAM authentication. Passwordless sudo refuses
+  setup and disables request creation and execution. `approval status` and
+  `doctor` surface the problem prominently.
 - **One execution, no bearer token** — approval and execution happen in the same
   process, so there is no reusable permit for an agent to copy. Requests expire,
   reject any argv change, and remain consumed even if kubectl subsequently fails
@@ -421,6 +426,10 @@ short-lived request for the exact command and requires fresh OS authentication:
 ```bash
 kubectl-guard config confirm-mode agent-relay
 # or, per-invocation / per-session:  export KUBECTL_GUARD_AGENT_RELAY=1
+
+# One-time enrollment from a human terminal. This refuses NOPASSWD setups.
+kubectl-guard approval setup
+kubectl-guard approval status
 ```
 
 On a command that would normally prompt, the guard does **not** touch stdin.

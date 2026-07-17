@@ -131,6 +131,8 @@ func run() error {
 			return runGuard(os.Args[1:])
 		case "doctor":
 			return runDoctor(os.Args[2:])
+		case "install-shim":
+			return runInstallShim(os.Args[2:])
 		case "uninstall":
 			return runUninstall(os.Args[2:])
 		case "freeze":
@@ -166,6 +168,178 @@ func run() error {
 
 	// Otherwise, forward to kubectl with protection
 	return runGuard(os.Args[1:])
+}
+
+const shimPathBlockStart = "# >>> kubectl-guard shim >>>"
+const shimPathBlockEnd = "# <<< kubectl-guard shim <<<"
+
+func runInstallShim(args []string) error {
+	defaultDir, err := guard.DefaultShimDir()
+	if err != nil {
+		return err
+	}
+	shimDir, customDir, err := flagValue(args, "--shim-dir")
+	if err != nil {
+		return err
+	}
+	if !customDir {
+		shimDir = defaultDir
+	}
+	rcPath, customRC, err := flagValue(args, "--shell-config")
+	if err != nil {
+		return err
+	}
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--shim-dir" || args[i] == "--shell-config" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(args[i], "--shim-dir=") || strings.HasPrefix(args[i], "--shell-config=") {
+			continue
+		}
+		return fmt.Errorf("unknown install-shim option %q", args[i])
+	}
+	if !customRC {
+		rcPath, err = defaultShellConfig()
+		if err != nil {
+			return err
+		}
+	}
+	if err := installShimFiles(shimDir); err != nil {
+		return err
+	}
+	if err := ensureShimPathLast(rcPath, shimDir); err != nil {
+		return err
+	}
+	ui.PrintSuccess("Installed kubectl-guard and kubectl shim to " + shimDir)
+	ui.PrintSuccess("Updated " + rcPath + " with a managed PATH block at the end, so the shim wins over earlier kubectl entries.")
+	ui.PrintInfo("Start a new shell (or source " + rcPath + "), then run: kubectl-guard doctor --require-interception")
+	return nil
+}
+
+func defaultShellConfig() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	switch filepath.Base(os.Getenv("SHELL")) {
+	case "zsh":
+		return filepath.Join(home, ".zshrc"), nil
+	case "bash":
+		return filepath.Join(home, ".bashrc"), nil
+	default:
+		return filepath.Join(home, ".profile"), nil
+	}
+}
+
+func installShimFiles(shimDir string) error {
+	if err := os.MkdirAll(shimDir, 0755); err != nil {
+		return err
+	}
+	kubectlPath := filepath.Join(shimDir, "kubectl")
+	if info, err := os.Lstat(kubectlPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("refusing to replace non-symlink %s", kubectlPath)
+	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	source, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(shimDir, ".kubectl-guard-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0755); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	guardPath := filepath.Join(shimDir, "kubectl-guard")
+	if err := os.Rename(tmpName, guardPath); err != nil {
+		return err
+	}
+	_ = os.Remove(kubectlPath)
+	return os.Symlink("kubectl-guard", kubectlPath)
+}
+
+func ensureShimPathLast(rcPath, shimDir string) error {
+	if resolved, err := filepath.EvalSymlinks(rcPath); err == nil {
+		rcPath = resolved
+	}
+	data, err := os.ReadFile(rcPath)
+	mode := fs.FileMode(0600)
+	if err == nil {
+		if info, statErr := os.Stat(rcPath); statErr == nil {
+			mode = info.Mode().Perm()
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	cleaned := removeManagedShimBlock(string(data))
+	block := fmt.Sprintf("%s\nexport PATH=%q\n%s\n", shimPathBlockStart, shimDir+":$PATH", shimPathBlockEnd)
+	cleaned = strings.TrimRight(cleaned, "\r\n")
+	if cleaned != "" {
+		cleaned += "\n\n"
+	}
+	if err := os.MkdirAll(filepath.Dir(rcPath), 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(rcPath), ".kubectl-guard-rc-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(cleaned + block); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, rcPath)
+}
+
+func removeManagedShimBlock(s string) string {
+	for {
+		start := strings.Index(s, shimPathBlockStart)
+		if start < 0 {
+			return s
+		}
+		endRel := strings.Index(s[start:], shimPathBlockEnd)
+		if endRel < 0 {
+			return s[:start]
+		}
+		end := start + endRel + len(shimPathBlockEnd)
+		if end < len(s) && s[end] == '\r' {
+			end++
+		}
+		if end < len(s) && s[end] == '\n' {
+			end++
+		}
+		s = s[:start] + s[end:]
+	}
 }
 
 // runDoctor reports whether PATH-shadowing interception is active and where
@@ -2920,6 +3094,11 @@ func newRootCommand() *cobra.Command {
 		RunE:  func(_ *cobra.Command, _ []string) error { return runDoctor(nil) },
 	})
 	root.AddCommand(&cobra.Command{
+		Use:   "install-shim",
+		Short: "Install PATH-shadowing interception and update the shell PATH",
+		RunE:  func(_ *cobra.Command, args []string) error { return runInstallShim(args) },
+	})
+	root.AddCommand(&cobra.Command{
 		Use:   "explain",
 		Short: "Preflight: would a kubectl command be gated, and why?",
 		RunE:  func(_ *cobra.Command, args []string) error { return runExplain(args) },
@@ -3341,6 +3520,9 @@ Usage:
                                       (exit non-zero if any check fails;
                                       --require-interception makes an inactive
                                       PATH-shadow a failure, for CI gating)
+  kubectl-guard install-shim [--shim-dir <dir>] [--shell-config <file>]
+                                      Install the kubectl shim and append a
+                                      managed PATH block so it wins ordering
   kubectl-guard freeze                Global read-only mode: block ALL
                                       state-altering commands (incident switch)
   kubectl-guard unfreeze              Lift read-only mode

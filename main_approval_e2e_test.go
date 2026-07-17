@@ -185,7 +185,7 @@ func TestAuthenticationFailureIsAudited(t *testing.T) {
 	if _, stderr, code := f.run(t, "approval", "setup"); code != 0 {
 		t.Fatalf("setup: %d %s", code, stderr)
 	}
-	_, stderr, code := f.run(t, "--context=prod-cluster", "delete", "pod", "api")
+	_, stderr, _ := f.run(t, "--context=prod-cluster", "delete", "pod", "api")
 	id := regexp.MustCompile(`approve ([A-F0-9]{32})`).FindStringSubmatch(stderr)
 	sudo := "#!/bin/sh\ncase \" $* \" in *\" -n \"*) exit 1;; *\" -K \"*) exit 0;; *) exit 1;; esac\n"
 	if err := os.WriteFile(filepath.Join(f.tools, "sudo"), []byte(sudo), 0700); err != nil {
@@ -243,13 +243,14 @@ func TestApprovalRevalidatesRequestAndExecutableAfterAuthentication(t *testing.T
 			}
 			id := regexp.MustCompile(`approve ([A-F0-9]{32})`).FindStringSubmatch(stderr)
 			var mutate string
-			if mutation == "request" {
+			switch mutation {
+			case "request":
 				path := filepath.Join(f.home, ".kubectl-guard", "approvals", id[1]+".json")
 				mutate = "printf 'tampered' > \"" + path + "\""
-			} else if mutation == "kubectl" {
+			case "kubectl":
 				path := filepath.Join(f.tools, "kubectl")
 				mutate = "printf '#!/bin/sh\\nprintf \\\"ATTACKER\\\\n\\\"\\n' > \"" + path + "\"; chmod 700 \"" + path + "\""
-			} else {
+			default:
 				path := filepath.Join(f.home, ".kubectl-guard.yaml")
 				mutate = "printf '\\ncontext_mode: block\\n' >> \"" + path + "\""
 			}

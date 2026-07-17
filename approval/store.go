@@ -87,7 +87,7 @@ func Create(args []string, command, context, reason, target, actor string, snaps
 		return Request{}, err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 	if err := tmp.Chmod(0600); err != nil {
 		_ = tmp.Close()
 		return Request{}, err
@@ -208,7 +208,7 @@ func Claim(id string) (Request, error) {
 		}
 		return Request{}, err
 	}
-	defer os.Remove(claimed)
+	defer func() { _ = os.Remove(claimed) }()
 	r, err := loadRequestFile(claimed, normalizeID(id), false)
 	if err != nil {
 		return Request{}, err

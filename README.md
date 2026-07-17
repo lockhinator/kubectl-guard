@@ -237,21 +237,28 @@ that execs `kubectl` by name (or by absolute path) in a non-interactive shell
 `kubectl` shim that sits **earlier in `PATH`** than the real kubectl:
 
 ```bash
-make install-shim
+kubectl-guard install-shim
+# From a source checkout, `make install-shim` runs the same installer.
 ```
 
 This installs the guard and a `kubectl` symlink pointing at it under
-`~/.local/share/kubectl-guard/shims/`, then prints the `PATH` line to add to
-your shell config (`~/.zshrc` or `~/.bashrc`):
+`~/.local/share/kubectl-guard/shims/`, then adds an idempotent managed block at
+the **end** of your shell config (`~/.zshrc`, `~/.bashrc`, or `~/.profile`):
 
 ```bash
 export PATH="$HOME/.local/share/kubectl-guard/shims:$PATH"
 ```
 
+Keeping the managed block last is intentional: package managers and shell
+frameworks often prepend `/usr/local/bin` later in the file, which would put the
+real kubectl ahead of the shim and silently disable interception. Re-running
+`install-shim` repairs that ordering without duplicating the block. Use
+`--shell-config <file>` for a nonstandard shell startup file.
+
 Reload your shell, then confirm interception is active:
 
 ```bash
-kubectl-guard doctor
+kubectl-guard doctor --require-interception
 ```
 
 When invoked as `kubectl`, the guard runs its protection logic and `exec`s the

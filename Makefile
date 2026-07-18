@@ -26,17 +26,7 @@ install-local: build
 # agents that exec kubectl by name. The guard detects it is the shim and
 # forwards to the REAL kubectl (skipping itself on PATH).
 install-shim: build
-	@mkdir -p $(SHIM_DIR)
-	install -m 755 $(BINARY) $(SHIM_DIR)/$(BINARY)
-	@ln -sf $(BINARY) $(SHIM_DIR)/kubectl
-	@echo "Installed guard + kubectl shim to $(SHIM_DIR)"
-	@echo ""
-	@echo "The shim intercepts kubectl even in non-interactive shells and agents."
-	@echo "Prepend the shim directory to PATH in your shell config (~/.zshrc or ~/.bashrc):"
-	@echo '  export PATH="$(SHIM_DIR):$$PATH"'
-	@echo ""
-	@echo "Reload your shell, then verify interception is active:"
-	@echo "  kubectl-guard doctor"
+	./$(BINARY) install-shim --shim-dir $(SHIM_DIR)
 
 uninstall:
 	rm -f $(INSTALL_PATH)/$(BINARY)

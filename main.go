@@ -9,13 +9,16 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
+	"github.com/lockhinator/kubectl-guard/approval"
 	"github.com/lockhinator/kubectl-guard/config"
 	"github.com/lockhinator/kubectl-guard/guard"
 	"github.com/lockhinator/kubectl-guard/ui"
@@ -128,6 +131,8 @@ func run() error {
 			return runGuard(os.Args[1:])
 		case "doctor":
 			return runDoctor(os.Args[2:])
+		case "install-shim":
+			return runInstallShim(os.Args[2:])
 		case "uninstall":
 			return runUninstall(os.Args[2:])
 		case "freeze":
@@ -136,6 +141,10 @@ func run() error {
 			return runFreeze(false)
 		case "explain":
 			return runExplain(os.Args[2:])
+		case "approve":
+			return runApprove(os.Args[2:], approval.OSAuthenticator{})
+		case "approval":
+			return runApprovalCommand(os.Args[2:], approval.OSAuthenticator{})
 		case "completion", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
 			// `completion <shell>` generates the guard's own completion script;
 			// `__complete`/`__completeNoDesc` are cobra's hidden runtime requests the
@@ -159,6 +168,178 @@ func run() error {
 
 	// Otherwise, forward to kubectl with protection
 	return runGuard(os.Args[1:])
+}
+
+const shimPathBlockStart = "# >>> kubectl-guard shim >>>"
+const shimPathBlockEnd = "# <<< kubectl-guard shim <<<"
+
+func runInstallShim(args []string) error {
+	defaultDir, err := guard.DefaultShimDir()
+	if err != nil {
+		return err
+	}
+	shimDir, customDir, err := flagValue(args, "--shim-dir")
+	if err != nil {
+		return err
+	}
+	if !customDir {
+		shimDir = defaultDir
+	}
+	rcPath, customRC, err := flagValue(args, "--shell-config")
+	if err != nil {
+		return err
+	}
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--shim-dir" || args[i] == "--shell-config" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(args[i], "--shim-dir=") || strings.HasPrefix(args[i], "--shell-config=") {
+			continue
+		}
+		return fmt.Errorf("unknown install-shim option %q", args[i])
+	}
+	if !customRC {
+		rcPath, err = defaultShellConfig()
+		if err != nil {
+			return err
+		}
+	}
+	if err := installShimFiles(shimDir); err != nil {
+		return err
+	}
+	if err := ensureShimPathLast(rcPath, shimDir); err != nil {
+		return err
+	}
+	ui.PrintSuccess("Installed kubectl-guard and kubectl shim to " + shimDir)
+	ui.PrintSuccess("Updated " + rcPath + " with a managed PATH block at the end, so the shim wins over earlier kubectl entries.")
+	ui.PrintInfo("Start a new shell (or source " + rcPath + "), then run: kubectl-guard doctor --require-interception")
+	return nil
+}
+
+func defaultShellConfig() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	switch filepath.Base(os.Getenv("SHELL")) {
+	case "zsh":
+		return filepath.Join(home, ".zshrc"), nil
+	case "bash":
+		return filepath.Join(home, ".bashrc"), nil
+	default:
+		return filepath.Join(home, ".profile"), nil
+	}
+}
+
+func installShimFiles(shimDir string) error {
+	if err := os.MkdirAll(shimDir, 0755); err != nil {
+		return err
+	}
+	kubectlPath := filepath.Join(shimDir, "kubectl")
+	if info, err := os.Lstat(kubectlPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("refusing to replace non-symlink %s", kubectlPath)
+	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	source, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(shimDir, ".kubectl-guard-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0755); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	guardPath := filepath.Join(shimDir, "kubectl-guard")
+	if err := os.Rename(tmpName, guardPath); err != nil {
+		return err
+	}
+	_ = os.Remove(kubectlPath)
+	return os.Symlink("kubectl-guard", kubectlPath)
+}
+
+func ensureShimPathLast(rcPath, shimDir string) error {
+	if resolved, err := filepath.EvalSymlinks(rcPath); err == nil {
+		rcPath = resolved
+	}
+	data, err := os.ReadFile(rcPath)
+	mode := fs.FileMode(0600)
+	if err == nil {
+		if info, statErr := os.Stat(rcPath); statErr == nil {
+			mode = info.Mode().Perm()
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	cleaned := removeManagedShimBlock(string(data))
+	block := fmt.Sprintf("%s\nexport PATH=%q\n%s\n", shimPathBlockStart, shimDir+":$PATH", shimPathBlockEnd)
+	cleaned = strings.TrimRight(cleaned, "\r\n")
+	if cleaned != "" {
+		cleaned += "\n\n"
+	}
+	if err := os.MkdirAll(filepath.Dir(rcPath), 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(rcPath), ".kubectl-guard-rc-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(cleaned + block); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, rcPath)
+}
+
+func removeManagedShimBlock(s string) string {
+	for {
+		start := strings.Index(s, shimPathBlockStart)
+		if start < 0 {
+			return s
+		}
+		endRel := strings.Index(s[start:], shimPathBlockEnd)
+		if endRel < 0 {
+			return s[:start]
+		}
+		end := start + endRel + len(shimPathBlockEnd)
+		if end < len(s) && s[end] == '\r' {
+			end++
+		}
+		if end < len(s) && s[end] == '\n' {
+			end++
+		}
+		s = s[:start] + s[end:]
+	}
 }
 
 // runDoctor reports whether PATH-shadowing interception is active and where
@@ -325,6 +506,24 @@ func buildDoctorReport(requireInterception bool) doctorReport {
 		add("audit log writable", "ok", auditPath)
 	}
 
+	// Agent-relay authentication must require human presence. If sudo/PAM accepts
+	// validation non-interactively (NOPASSWD), the agent could run `approve`
+	// itself, so both doctor and the approval path fail closed on the same probe.
+	if cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay {
+		enabled, stateErr := approval.Enabled()
+		required, authDetail := approval.HumanPresenceRequired()
+		switch {
+		case stateErr != nil:
+			add("human approval authentication", "fail", "cannot read approval setup: "+stateErr.Error())
+		case !required:
+			add("human approval authentication", "fail", "UNSAFE: "+authDetail+". Disable NOPASSWD for this user or use block mode; authenticated approvals are disabled until fixed")
+		case !enabled:
+			add("human approval authentication", "fail", "NOT CONFIGURED: run 'kubectl-guard approval setup' from a human terminal")
+		default:
+			add("human approval authentication", "ok", authDetail)
+		}
+	}
+
 	// Current context resolvable (fail closed if protected contexts are set).
 	ctx, ctxErr := guard.GetCurrentContext()
 	switch {
@@ -467,6 +666,248 @@ func runExplain(args []string) error {
 		fmt.Printf("resource:  %s\n", res.Resource)
 	}
 	return nil
+}
+
+// runApprove authenticates a human and executes one exact, previously-requested
+// command. It deliberately executes here instead of issuing a token to a later
+// agent process: there is no bearer capability for the agent to steal or replay.
+func runApprove(args []string, auth approval.Authenticator) error {
+	baseCfg, _, _ := config.LoadEffective()
+	auditCtx, auditCommand := "", "approval"
+	auditFailure := func(reason string, cause error) error {
+		if baseCfg != nil {
+			if aerr := guard.AppendAudit(baseCfg, guard.AuditEntry{Context: auditCtx, Command: auditCommand, Outcome: guard.OutcomeApprovalRejected, Reason: reason}); aerr != nil {
+				return fmt.Errorf("%v (also failed to audit approval rejection: %w)", cause, aerr)
+			}
+		}
+		return cause
+	}
+	enabled, stateErr := approval.Enabled()
+	if stateErr != nil {
+		return auditFailure("approval-state-error", fmt.Errorf("reading approval setup: %w", stateErr))
+	}
+	if !enabled {
+		return auditFailure("approval-not-configured", errors.New("authenticated approvals are not enabled; run 'kubectl-guard approval setup' from a human terminal"))
+	}
+	if len(args) == 0 {
+		return errors.New("usage: kubectl-guard approve <request-id> [--reason <why>]")
+	}
+	id := args[0]
+	auditCommand = "approval " + id
+
+	var justification string
+	for i := 1; i < len(args); i++ {
+		switch {
+		case args[i] == "--reason" && i+1 < len(args):
+			justification = strings.TrimSpace(args[i+1])
+			i++
+		case strings.HasPrefix(args[i], "--reason="):
+			justification = strings.TrimSpace(strings.TrimPrefix(args[i], "--reason="))
+		default:
+			return auditFailure("invalid-approval-options", fmt.Errorf("unknown approve option %q", args[i]))
+		}
+	}
+
+	req, err := approval.Load(id)
+	if err != nil {
+		return auditFailure("request-invalid-expired-or-consumed", err)
+	}
+	command := append([]string(nil), req.Args...)
+	auditCommand = strings.Join(guard.RedactArgs(command), " ")
+	result, ctx, cfg, checkErr := guard.Check(command)
+	if checkErr != nil {
+		return auditFailure("policy-recheck-failed", fmt.Errorf("rechecking approved command: %w", checkErr))
+	}
+	baseCfg, auditCtx = cfg, ctx
+	if result != guard.RequireConfirmation {
+		return auditFailure("policy-decision-changed", fmt.Errorf("request can no longer be approved: current policy decision is %v", result))
+	}
+	if cfg != nil && cfg.RequireJustification && justification == "" {
+		return auditFailure("justification-required", errors.New("this policy requires --reason \"<why>\""))
+	}
+	redacted := guard.RedactArgs(command)
+	display := sanitizeTerminal(strings.Join(redacted, " "))
+	snapshot, snapErr := captureApprovalTarget(cfg, command, ctx)
+	if snapErr != nil {
+		return auditFailure("target-recheck-failed", fmt.Errorf("rechecking approval target: %w", snapErr))
+	}
+	if !req.TargetSnapshot.Equal(snapshot) {
+		return auditFailure("approval-target-changed", errors.New("approval target changed since the request (context/server/namespace/kubeconfig); create a new request"))
+	}
+
+	ui.PrintWarning("ONE-TIME KUBERNETES APPROVAL")
+	ui.PrintInfo("Request: " + req.ID)
+	ui.PrintInfo("Actor: " + sanitizeTerminal(req.Actor))
+	ui.PrintInfo("Command: kubectl " + display)
+	ui.PrintInfo("Context: " + sanitizeTerminal(ctx))
+	if req.Reason != "" {
+		ui.PrintInfo("Policy: " + sanitizeTerminal(req.Reason) + " — " + sanitizeTerminal(req.Target))
+	}
+	if justification != "" {
+		ui.PrintInfo("Reason: " + sanitizeTerminal(justification))
+	}
+	if err := auth.Authenticate("kubectl " + display); err != nil {
+		if cfg != nil {
+			if aerr := guard.AppendAudit(cfg, guard.AuditEntry{Context: ctx, Command: display, Outcome: guard.OutcomeAuthenticationFailed, Reason: "approval-request:" + req.ID}); aerr != nil {
+				return fmt.Errorf("%v (also failed to audit authentication failure: %w)", err, aerr)
+			}
+		}
+		return err
+	}
+	// Authentication can block for minutes. Atomically claim and validate expiry
+	// first, then recompute every ambient decision after PAM so request, policy,
+	// target, and executable changes during the prompt fail closed.
+	claimedReq, err := approval.Claim(req.ID)
+	if err != nil {
+		return auditFailure("post-auth-request-invalid-or-expired", err)
+	}
+	if !reflect.DeepEqual(claimedReq, req) {
+		return auditFailure("post-auth-request-changed", errors.New("approval request changed during authentication"))
+	}
+	freshResult, freshCtx, freshCfg, err := guard.Check(command)
+	baseCfg, auditCtx = freshCfg, freshCtx
+	if err != nil || freshResult != guard.RequireConfirmation || freshCtx != ctx {
+		return auditFailure("post-auth-policy-changed", errors.New("approval policy or context changed during authentication"))
+	}
+	freshSnapshot, err := captureApprovalTarget(freshCfg, command, freshCtx)
+	if err != nil || !req.TargetSnapshot.Equal(freshSnapshot) {
+		return auditFailure("post-auth-target-changed", errors.New("approval target or kubectl executable changed during authentication"))
+	}
+	if freshCfg != nil {
+		if err := guard.AppendAudit(freshCfg, guard.AuditEntry{Context: freshCtx, Command: display, Outcome: guard.OutcomeApprovalConsumed, Reason: "approval-request:" + req.ID, Justification: justification}); err != nil {
+			return fmt.Errorf("approval consumed but audit failed; command was not executed: %w", err)
+		}
+	}
+	ui.PrintSuccess("Authenticated. Executing this command once; request " + req.ID + " is now consumed.")
+	if err := guard.ExecKubectlPath(freshSnapshot.KubectlPath, command); err != nil {
+		if freshCfg != nil {
+			if aerr := guard.AppendAudit(freshCfg, guard.AuditEntry{Context: freshCtx, Command: display, Outcome: guard.OutcomeApprovalExecFailed, Reason: err.Error()}); aerr != nil {
+				return fmt.Errorf("kubectl execution failed: %v (also failed to audit execution failure: %w)", err, aerr)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+func sanitizeTerminal(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || unicode.Is(unicode.Cf, r) {
+			if r <= 0xffff {
+				fmt.Fprintf(&b, "\\u%04X", r)
+			} else {
+				fmt.Fprintf(&b, "\\U%08X", r)
+			}
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func captureApprovalTarget(cfg *config.Config, args []string, ctx string) (approval.TargetSnapshot, error) {
+	p := guard.ParseArgs(args)
+	server, err := guard.ServerForContext(p.Kubeconfig, ctx)
+	if err != nil {
+		return approval.TargetSnapshot{}, err
+	}
+	fingerprint, err := approval.KubeconfigFingerprint(p.Kubeconfig)
+	if err != nil {
+		return approval.TargetSnapshot{}, err
+	}
+	kubectlPath, err := guard.RealKubectlPath()
+	if err != nil {
+		return approval.TargetSnapshot{}, err
+	}
+	kubectlPath, err = filepath.Abs(kubectlPath)
+	if err != nil {
+		return approval.TargetSnapshot{}, err
+	}
+	kubectlHash, err := approval.FileSHA256(kubectlPath)
+	if err != nil {
+		return approval.TargetSnapshot{}, err
+	}
+	return approval.TargetSnapshot{Context: ctx, Server: server, Namespace: guard.ResolvedTargetNamespace(cfg, args, ctx), KubeconfigFingerprint: fingerprint, KubectlPath: kubectlPath, KubectlSHA256: kubectlHash}, nil
+}
+
+func unsupportedApprovalInput(args []string) string {
+	verb, resource := guard.ExtractCommand(args)
+	fileFlags := []string{"-f", "--filename", "-k", "--kustomize", "--patch-file", "--from-file", "--from-env-file", "--certificate-authority", "--client-certificate", "--client-key", "--token-file"}
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		for _, flag := range fileFlags {
+			if arg == flag || strings.HasPrefix(arg, flag+"=") || (len(flag) == 2 && strings.HasPrefix(arg, flag) && len(arg) > 2) {
+				return flag
+			}
+		}
+	}
+	if verb == "cp" {
+		return "cp local path"
+	}
+	if verb == "create" && resource == "secret" {
+		for _, arg := range args {
+			if arg == "--" {
+				break
+			}
+			if arg == "--cert" || arg == "--key" || strings.HasPrefix(arg, "--cert=") || strings.HasPrefix(arg, "--key=") {
+				return "secret certificate/key file"
+			}
+		}
+	}
+	if verb == "exec" || verb == "attach" || verb == "run" {
+		for _, arg := range args {
+			if arg == "--" {
+				break
+			}
+			if arg == "-i" || arg == "--stdin" || strings.HasPrefix(arg, "--stdin=") {
+				return "interactive stdin"
+			}
+		}
+	}
+	return ""
+}
+
+func runApprovalCommand(args []string, auth approval.Authenticator) error {
+	if len(args) != 1 {
+		return errors.New("usage: kubectl-guard approval <setup|status>")
+	}
+	switch args[0] {
+	case "setup":
+		if required, detail := approval.HumanPresenceRequired(); !required {
+			return fmt.Errorf("cannot enable authenticated approvals: %s", detail)
+		}
+		ui.PrintWarning("Enabling one-shot Kubernetes approvals requires fresh human authentication.")
+		if err := auth.Authenticate("enable kubectl-guard authenticated approvals"); err != nil {
+			return err
+		}
+		if err := approval.Enable(); err != nil {
+			return fmt.Errorf("saving approval setup: %w", err)
+		}
+		ui.PrintSuccess("Authenticated approvals ENABLED. Agent-relay requests now require fresh OS authentication and execute once.")
+		return nil
+	case "status":
+		enabled, err := approval.Enabled()
+		if err != nil {
+			return err
+		}
+		required, detail := approval.HumanPresenceRequired()
+		switch {
+		case !required:
+			ui.PrintWarning("Authenticated approvals: UNSAFE — " + detail + ". Agent-relay approval is disabled until fixed.")
+			return errors.New("approval authentication is unsafe")
+		case !enabled:
+			ui.PrintWarning("Authenticated approvals: NOT CONFIGURED — run 'kubectl-guard approval setup'.")
+			return errors.New("authenticated approvals are not configured")
+		default:
+			ui.PrintSuccess("Authenticated approvals: READY — " + detail)
+			return nil
+		}
+	default:
+		return fmt.Errorf("unknown approval subcommand %q (want setup or status)", args[0])
+	}
 }
 
 func nonEmpty(s, fallback string) string {
@@ -1405,6 +1846,19 @@ func runGuard(args []string) error {
 		// the audit trail records the bypass. Protected-resource Blocks are NOT
 		// affected by this (they stay a hard block in their own branch).
 		autoConfirm := yesFlag || boolEnv(config.EnvConfirm)
+		agentRelay := (cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay) || boolEnv(config.EnvAgentRelay)
+		if autoConfirm && agentRelay {
+			audit(guard.OutcomeAborted, "unauthenticated-auto-confirm-refused")
+			if jsonMode {
+				jr := guard.JSONResult{Decision: "needs-confirmation", Reason: "authenticated-approval-required", Context: ctx, Command: cmdStr, Prompt: "Plain --yes is disabled in agent-relay mode; create or use a one-shot authenticated approval request."}
+				if b, mErr := json.Marshal(jr); mErr == nil {
+					fmt.Fprintln(os.Stderr, string(b))
+				}
+			} else {
+				ui.PrintWarning("Refusing --yes: agent-relay requires an authenticated, one-shot approval.")
+			}
+			os.Exit(guard.ExitNeedsConfirm)
+		}
 		if autoConfirm {
 			// Justification: a non-interactive approval must carry --reason when
 			// require_justification is on, else fail closed (the command must not run
@@ -1481,28 +1935,57 @@ func runGuard(args []string) error {
 		// Agent-relay mode: instead of prompting stdin, emit a structured
 		// needs-confirmation object (including a human-readable prompt) and exit
 		// with the needs-confirmation code, so an agent framework can relay the
-		// request to its own human and re-run with --yes once approved. This is a
+		// request to its human for an OS-authenticated, exact-command execution. This is a
 		// decision axis independent of --json: it is active whenever the confirm
 		// mode is agent-relay or KUBECTL_GUARD_AGENT_RELAY is set.
-		agentRelay := (cfg != nil && cfg.ConfirmMode == config.ConfirmModeAgentRelay) || boolEnv(config.EnvAgentRelay)
 		if agentRelay {
-			rerun := "Re-run with --yes to proceed."
+			if flag := unsupportedApprovalInput(forwarded); flag != "" {
+				audit(guard.OutcomeDenied, "approval-mutable-input:"+flag)
+				return fmt.Errorf("authenticated one-shot approval does not accept local/stdin input flag %s because mutable input bytes cannot be bound; use block mode or an externally reviewed deployment pipeline", flag)
+			}
+			if required, detail := approval.HumanPresenceRequired(); !required {
+				jr := guard.JSONResult{Decision: "denied", Reason: "approval-authentication-unsafe", Context: ctx, Command: cmdStr, Prompt: "Authenticated approvals are disabled: " + detail}
+				if b, mErr := json.Marshal(jr); mErr == nil {
+					fmt.Fprintln(os.Stderr, string(b))
+				}
+				audit(guard.OutcomeDenied, "approval-authentication-unsafe")
+				os.Exit(guard.ExitDenied)
+			}
+			enabled, setupErr := approval.Enabled()
+			if setupErr != nil {
+				return fmt.Errorf("reading approval setup: %w", setupErr)
+			}
+			if !enabled {
+				jr := guard.JSONResult{Decision: "needs-confirmation", Reason: "approval-not-configured", Context: ctx, Command: cmdStr, Prompt: "Authenticated approvals are not configured. A human must run: kubectl-guard approval setup"}
+				if b, mErr := json.Marshal(jr); mErr == nil {
+					fmt.Fprintln(os.Stderr, string(b))
+				}
+				audit(guard.OutcomeRelayed, "approval-not-configured")
+				os.Exit(guard.ExitNeedsConfirm)
+			}
+			snapshot, snapErr := captureApprovalTarget(cfg, forwarded, ctx)
+			if snapErr != nil {
+				return fmt.Errorf("capturing approval target: %w", snapErr)
+			}
+			req, reqErr := approval.Create(forwarded, cmdStr, ctx, reason, target, guard.CurrentActor(cfg), snapshot)
+			if reqErr != nil {
+				return fmt.Errorf("creating approval request: %w", reqErr)
+			}
+			run := fmt.Sprintf("kubectl-guard approve %s", req.ID)
 			if cfg != nil && cfg.RequireJustification {
-				// The relayed request notes a reason is required so the agent can
-				// collect it from its human before re-running.
-				rerun = "Re-run with --yes --reason \"<why>\" to proceed (a justification is required)."
+				run = fmt.Sprintf("kubectl-guard approve %s --reason \"<why>\"", req.ID)
 			}
 			jr := guard.JSONResult{
 				Decision: "needs-confirmation",
-				Reason:   "agent-relay",
+				Reason:   "authenticated-approval-required",
 				Context:  ctx,
 				Command:  cmdStr,
-				Prompt:   fmt.Sprintf("Approve %q on %s %q? %s", cmdDesc, reason, target, rerun),
+				Prompt:   fmt.Sprintf("Approve %q on %s %q once with OS authentication: %s", cmdDesc, reason, target, run),
 			}
 			if b, mErr := json.Marshal(jr); mErr == nil {
 				fmt.Fprintln(os.Stderr, string(b))
 			}
-			audit(guard.OutcomeRelayed, "agent-relay")
+			audit(guard.OutcomeRelayed, "approval-request:"+req.ID)
 			os.Exit(guard.ExitNeedsConfirm)
 		}
 
@@ -2611,6 +3094,11 @@ func newRootCommand() *cobra.Command {
 		RunE:  func(_ *cobra.Command, _ []string) error { return runDoctor(nil) },
 	})
 	root.AddCommand(&cobra.Command{
+		Use:   "install-shim",
+		Short: "Install PATH-shadowing interception and update the shell PATH",
+		RunE:  func(_ *cobra.Command, args []string) error { return runInstallShim(args) },
+	})
+	root.AddCommand(&cobra.Command{
 		Use:   "explain",
 		Short: "Preflight: would a kubectl command be gated, and why?",
 		RunE:  func(_ *cobra.Command, args []string) error { return runExplain(args) },
@@ -3018,12 +3506,23 @@ Usage:
   kubectl-guard explain [--json] -- <kubectl args...>
                                       Preflight: would this be gated, and why?
                                       (runs the decision without kubectl/prompt/audit)
+  kubectl-guard approve <id> [--reason <why>]
+                                      Authenticate through the host PAM policy
+                                      and execute one exact request once
+  kubectl-guard approval setup       Verify human-presence authentication and
+                                      enable one-shot approvals (fails closed
+                                      when sudo/PAM permits NOPASSWD)
+  kubectl-guard approval status      Show approval enrollment and whether the
+                                      authentication policy is safe for agents
   kubectl-guard doctor [--json] [--require-interception]
                                       Health check: interception, config,
                                       audit, context resolution, and posture
                                       (exit non-zero if any check fails;
                                       --require-interception makes an inactive
                                       PATH-shadow a failure, for CI gating)
+  kubectl-guard install-shim [--shim-dir <dir>] [--shell-config <file>]
+                                      Install the kubectl shim and append a
+                                      managed PATH block so it wins ordering
   kubectl-guard freeze                Global read-only mode: block ALL
                                       state-altering commands (incident switch)
   kubectl-guard unfreeze              Lift read-only mode
@@ -3066,7 +3565,8 @@ Protection model:
 
 Guard-only flags (stripped before forwarding to kubectl):
   --json         Emit a structured decision object on stderr for non-allow
-  --yes          Auto-confirm a gated command (audited; block mode not bypassed)
+  --yes          Auto-confirm a gated command (audited; rejected in agent-relay;
+                 block mode is never bypassed)
   --reason <why> Free-text justification recorded on the audit entry for a gated
                  command; required with --yes when require_justification is on
   --no-prompt    Headless: no interactive setup wizard. With no config, the

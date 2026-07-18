@@ -18,7 +18,8 @@ const (
 	// ConfirmModeAgentRelay does not prompt stdin at all. On a gated command it
 	// emits a structured "needs-confirmation" object on stderr and exits with
 	// the needs-confirmation code, so an agent framework can relay the request
-	// to its own human and re-run with --yes once approved.
+	// to its human. The human completes the exact request once through the
+	// OS-authenticated `kubectl-guard approve` command; plain --yes is rejected.
 	ConfirmModeAgentRelay = "agent-relay"
 )
 

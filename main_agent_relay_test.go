@@ -78,21 +78,24 @@ func TestAgentRelayViaEnvVar(t *testing.T) {
 	}
 }
 
-// TestAgentRelayResumeWithYes is the resume path: after the human approves via
-// the agent, re-running with --yes runs the command (audited as auto-confirmed).
-func TestAgentRelayResumeWithYes(t *testing.T) {
-	stdout, _, code, audit := runGuardBin(t,
+// TestAgentRelayRejectsYes closes the unauthenticated approval bypass: an agent
+// cannot assert that a human approved merely by adding --yes.
+func TestAgentRelayRejectsYes(t *testing.T) {
+	stdout, stderr, code, audit := runGuardBin(t,
 		"protected_contexts:\n  - prod-*\nconfirm_mode: agent-relay\naudit_mode: all\n",
 		"--context=prod-cluster", "--yes", "delete", "pod", "nginx")
 
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0 (--yes resume runs the command)", code)
+	if code != 4 {
+		t.Fatalf("exit code = %d, want 4 (--yes must not authenticate approval)", code)
 	}
-	if !strings.Contains(stdout, "delete") {
-		t.Errorf("expected the command to run, got stdout=%q", stdout)
+	if strings.Contains(stdout, "delete") {
+		t.Errorf("command ran despite unauthenticated --yes, stdout=%q", stdout)
 	}
-	if !strings.Contains(audit, `"outcome":"auto-confirmed"`) {
-		t.Errorf("audit should record auto-confirmed on the resume, got:\n%s", audit)
+	if !strings.Contains(stderr, "authenticated") {
+		t.Errorf("expected authenticated-approval guidance, got stderr=%q", stderr)
+	}
+	if !strings.Contains(audit, `"reason":"unauthenticated-auto-confirm-refused"`) {
+		t.Errorf("audit should record the refused bypass, got:\n%s", audit)
 	}
 }
 

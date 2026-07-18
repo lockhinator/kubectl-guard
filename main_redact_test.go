@@ -6,10 +6,26 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSanitizeTerminalEscapesControlAndBidiCharacters(t *testing.T) {
+	in := "safe\nforged\r\x1b[2J\u009B31m\u202Etxt\u2066end\u200F\u061C\t"
+	got := sanitizeTerminal(in)
+	for _, raw := range []string{"\n", "\r", "\x1b", "\x9b", "\u202E", "\u2066", "\u200F", "\u061C", "\t"} {
+		if strings.Contains(got, raw) {
+			t.Fatalf("sanitized output still contains control %q: %q", raw, got)
+		}
+	}
+	for _, escaped := range []string{`\u000A`, `\u000D`, `\u001B`, `\u009B`, `\u202E`, `\u2066`, `\u200F`, `\u061C`, `\u0009`} {
+		if !strings.Contains(got, escaped) {
+			t.Fatalf("sanitized output missing %s: %q", escaped, got)
+		}
+	}
+}
 
 // theSecret is the cleartext that must never reach the audit log, --json
 // output, or any user-facing message.
@@ -22,10 +38,12 @@ func runGuardEnv(t *testing.T, cfgYAML string, extraEnv []string, args ...string
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
-	bin := buildGuardBin(t)
 	home := t.TempDir()
 	writeConfig(t, home, cfgYAML)
+	writeKubeconfig(t, home, "fake-context", nil)
 	kubectlDir := writeFakeKubectl(t)
+	prepareApprovalFixture(t, home, kubectlDir)
+	bin := buildGuardBinTrustedSudo(t, filepath.Join(kubectlDir, "sudo"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

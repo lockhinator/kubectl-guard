@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/lockhinator/kubectl-guard/compare/v1.1.0...v1.1.1) (2026-07-18)
+
+
+### Bug Fixes
+
+* register sensitive-access config command ([226afdb](https://github.com/lockhinator/kubectl-guard/commit/226afdb6f89deb4c12904ce3df12747eec5a96da))
+* register sensitive-access config command ([d43b7d8](https://github.com/lockhinator/kubectl-guard/commit/d43b7d8746be78dc4d3da8ccd93d9406721eeccf))
+
 ## [1.1.0](https://github.com/lockhinator/kubectl-guard/compare/v1.0.0...v1.1.0) (2026-07-18)
 
 

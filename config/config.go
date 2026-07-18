@@ -1467,6 +1467,15 @@ func (c *Config) SetBlastRadiusMode(mode string) bool {
 	return true
 }
 
+// SetSensitiveAccessMode sets the policy for workload access verbs if valid.
+func (c *Config) SetSensitiveAccessMode(mode string) bool {
+	if !validSensitiveAccessMode(mode) {
+		return false
+	}
+	c.SensitiveAccess = mode
+	return true
+}
+
 // ActorPolicy overrides the global context_mode / namespace_mode for a specific
 // actor (matched by glob). An empty mode field means "inherit the global mode".
 type ActorPolicy struct {

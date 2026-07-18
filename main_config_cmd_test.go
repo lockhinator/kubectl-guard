@@ -175,6 +175,26 @@ func TestConfigCommandsInProc(t *testing.T) {
 	}
 }
 
+// TestConfigSensitiveAccessCommand is the regression for v1.1.0 forwarding
+// `kubectl-guard config sensitive-access block` to `kubectl config` instead of
+// handling it as a guard configuration command.
+func TestConfigSensitiveAccessCommand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KUBECTL_GUARD_CONFIG", "")
+	t.Setenv("KUBECTL_GUARD_AUDIT_LOG", "")
+
+	if !guardConfigSubcommands["sensitive-access"] {
+		t.Fatal("sensitive-access is not registered as a guard config subcommand")
+	}
+	if _, err := runConfigInProc(t, "sensitive-access", "block"); err != nil {
+		t.Fatalf("config sensitive-access block: %v", err)
+	}
+	if got := loadCfg(t).SensitiveAccessMode(); got != config.SensitiveAccessBlock {
+		t.Fatalf("SensitiveAccessMode() = %q, want %q", got, config.SensitiveAccessBlock)
+	}
+}
+
 // mustRun runs a config subcommand in-process and fails the test on error.
 func mustRun(t *testing.T, args ...string) {
 	t.Helper()

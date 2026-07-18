@@ -50,6 +50,7 @@ var guardConfigSubcommands = map[string]bool{
 	"context-mode":          true,
 	"namespace-mode":        true,
 	"blast-radius":          true,
+	"sensitive-access":      true,
 	"sensitive-kind":        true,
 	"add-sensitive-kind":    true,
 	"remove-sensitive-kind": true,
@@ -2566,6 +2567,30 @@ func newConfigCommand() *cobra.Command {
 	})
 
 	rootCmd.AddCommand(&cobra.Command{
+		Use:   "sensitive-access [off|gate|block]",
+		Short: "Show or set gating of workload access verbs on every context",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadOrCreateConfig()
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				ui.PrintInfo("Sensitive access: " + cfg.SensitiveAccessMode())
+				return nil
+			}
+			if !cfg.SetSensitiveAccessMode(args[0]) {
+				return fmt.Errorf("invalid mode %q (want %q, %q, or %q)", args[0], config.SensitiveAccessOff, config.SensitiveAccessGate, config.SensitiveAccessBlock)
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			ui.PrintSuccess("Sensitive access set: " + cfg.SensitiveAccess)
+			return nil
+		},
+	})
+
+	rootCmd.AddCommand(&cobra.Command{
 		Use:   "sensitive-kind [off|confirm|block]",
 		Short: "Show or set gating of state-altering commands on sensitive kinds",
 		Long: "Gate mutations to a configured kind (node, namespace, persistentvolume,\n" +
@@ -3603,6 +3628,9 @@ Config subcommands:
                              Gate wide-scope / bulk mutations (delete --all,
                              apply --prune, a selector or --all-namespaces on a
                              destructive verb, a force delete) on every context
+  sensitive-access [off|gate|block]
+                             Gate or block workload access verbs (exec, cp,
+                             attach, debug, port-forward, proxy) on every context
   actor-policy [<actor> <ctx-mode> [ns-mode] | remove <actor>]
                              Per-actor context/namespace mode overrides (an
                              agent label can be held to block where a human

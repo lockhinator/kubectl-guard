@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.0](https://github.com/lockhinator/kubectl-guard/compare/v1.0.0...v1.1.0) (2026-07-18)
+
+
+### Features
+
+* add authenticated one-shot approvals ([f77be9d](https://github.com/lockhinator/kubectl-guard/commit/f77be9d9a05e995c52aea58e0d88d28e7e25ab3c))
+* add authenticated one-shot approvals for v1.1.0 ([ad65a84](https://github.com/lockhinator/kubectl-guard/commit/ad65a840ebd41e9bc281c93cb9bbe87c652e9473))
+
+
+### Bug Fixes
+
+* ensure kubectl shim wins PATH ordering ([43fced4](https://github.com/lockhinator/kubectl-guard/commit/43fced463ccd05814688a5059d71178c28ae18c6))
+* harden authenticated approval boundary ([6f53e41](https://github.com/lockhinator/kubectl-guard/commit/6f53e4141f4b7b12ced16b2000b4f53be512172a))
+* require human-presence approval setup ([526a874](https://github.com/lockhinator/kubectl-guard/commit/526a87405e43b754ab6fe50f9e96a5785d8580e9))
+
 ## [1.0.0](https://github.com/lockhinator/kubectl-guard/compare/v0.6.0...v1.0.0) (2026-07-11)
 
 

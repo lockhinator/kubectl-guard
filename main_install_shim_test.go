@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/lockhinator/kubectl-guard/guard"
 )
 
 func TestInstallShimRepairsPATHOrderingAndIsIdempotent(t *testing.T) {
@@ -34,7 +32,7 @@ func TestInstallShimRepairsPATHOrderingAndIsIdempotent(t *testing.T) {
 			t.Fatalf("install-shim run %d exit=%d:\n%s", i+1, code, out)
 		}
 	}
-	shimDir, _ := guard.DefaultShimDir()
+	shimDir := filepath.Join(home, ".local", "share", "kubectl-guard", "shims")
 	data, err := os.ReadFile(rc)
 	if err != nil {
 		t.Fatal(err)

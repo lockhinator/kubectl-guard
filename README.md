@@ -1002,6 +1002,7 @@ kubectl-guard config remove-sensitive-kind node
 kubectl-guard config confirm-mode type-name  # Stronger confirmation prompt
 kubectl-guard config context-mode block      # Hard-block state changes on protected contexts
 kubectl-guard config namespace-mode block    # Hard-block state changes on protected namespaces
+kubectl-guard config sensitive-access block  # Block exec/cp/attach/debug/port-forward/proxy everywhere
 kubectl-guard config require-justification on # Require --reason to approve a gated command
 kubectl-guard config redact-output structured # Opt-in structured output redaction
 kubectl-guard config audit-mode all          # Log every command (default)
